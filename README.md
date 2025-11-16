@@ -1,5 +1,32 @@
 > **Note to readers:** MystenLabs is making this codebase production-ready [here](https://github.com/MystenLabs/sui/tree/main/narwhal).
 
+# Requirements
+## Libraries
+1. `Python`
+2. `Rust`
+    - `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+3. `clang`
+    - `sudo apt install clang-20`
+4. `tmux`
+    - `sudo apt install tmux`
+
+## DAS Setup
+1. Contact `das-account@cs.vu.nl` for access (you will get credentials via email)
+2. Nodes need to be accessed from university ip address (e.g. [TU Delft VPN](https://docs.eduvpn.org/client/linux/installation.html))
+3. DAS-5 head node (fileserver) is where the code lives (is edited and compiled)
+4. Program runs on compute nodes, orchestratred from the head node
+5. `/home/<userid>` has limited size, for large data files use the shared storage `/var/scratch/<userid>/`
+6. Configure SSH: `ssh-copy-id` and then `ssh mputnik@fs0.das5.cs.vu.nl`
+7. Useful commands on the head node:
+    - loading prun: `module load prun`
+    - asking for reservation: `preserve -np 3 -t 900` (e.g. asking for 3 nodes for 15 minutes)
+    - checking status: `preserve -llist` or `preserve -long-list`
+    - cancel: `scancel -u $USER`
+    - show all available modules (or software versions) available: `module avail`
+    - show all “loaded” or “active” modules in your current session: `module list`
+    - load a particular software version (or module): `module load <name/version>`
+    - remove a particular software version (or module): `module rm <name/version>`
+
 # Narwhal and Tusk
 
 [![build status](https://img.shields.io/github/actions/workflow/status/asonnino/narwhal/rust.yml?branch=master&logo=github&style=flat-square)](https://github.com/asonnino/narwhal/actions)
