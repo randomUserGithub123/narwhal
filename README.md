@@ -13,6 +13,7 @@
 ## DAS Setup
 1. Contact `das-account@cs.vu.nl` for access (you will get credentials via email)
 2. Nodes need to be accessed from university ip address (e.g. [TU Delft VPN](https://docs.eduvpn.org/client/linux/installation.html))
+    - [eduVPN](https://docs.eduvpn.org/client/linux/installation.html)
 3. DAS-5 head node (fileserver) is where the code lives (is edited and compiled)
 4. Program runs on compute nodes, orchestratred from the head node
 5. `/home/<userid>` has limited size, for large data files use the shared storage `/var/scratch/<userid>/`
@@ -26,6 +27,14 @@
     - show all “loaded” or “active” modules in your current session: `module list`
     - load a particular software version (or module): `module load <name/version>`
     - remove a particular software version (or module): `module rm <name/version>`
+
+## DAS Editing of Code & Compiling
+1. Code changes
+    - Push to Gitlab repository
+    - `git pull` in `/home/mputnik/giulio-msc-thesis-code` in DAS
+    - `rm -rf /var/scratch/mputnik/giulio-msc-thesis-code` in DAS
+    - `cp -r ~/giulio-msc-thesis-code /var/scratch/mputnik/` in DAS
+    - `cd /var/scratch/mputnik/giulio-msc-thesis-code` in DAS
 
 # Narwhal and Tusk
 
