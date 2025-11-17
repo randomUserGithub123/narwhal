@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::collections::{VecDeque, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
@@ -56,6 +57,12 @@ pub enum WorkerPrimaryMessage {
     OthersBatch(Digest, WorkerId),
     /// FEATURE: Worker indicates our tx digest
     OurTxDigest(Digest)
+}
+
+// FEATURE: FIFO of tx digests
+struct TxDigestFIFO {
+    queue: VecDeque<Digest>,
+    seen: HashSet<Digest>,
 }
 
 pub struct Primary;
@@ -111,7 +118,10 @@ impl Primary {
         );
 
         // FEATURE: FIFO of tx digests
-        let fifo_tx_digests: Arc<Mutex<Vec<Digest>>> = Arc::new(Mutex::new(Vec::new()));
+        let fifo_tx_digests = Arc::new(Mutex::new(TxDigestFIFO {
+            queue: VecDeque::new(),
+            seen: HashSet::new(),
+        }));
 
         // Spawn the network receiver listening to messages from our workers.
         let mut address = committee
@@ -255,7 +265,7 @@ impl MessageHandler for PrimaryReceiverHandler {
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
-    fifo_tx_digests: Arc<Mutex<Vec<Digest>>>,
+    fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>,
 }
 
 #[async_trait]
@@ -272,14 +282,17 @@ impl MessageHandler for WorkerReceiverHandler {
                 .send((digest, worker_id))
                 .await
                 .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
-                .tx_others_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
+                self.tx_others_digests
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send workers' digests");
+            },
             WorkerPrimaryMessage::OurTxDigest(tx_digest) => {
                 let mut fifo = self.fifo_tx_digests.lock().await;
-                fifo.push(tx_digest);
+                if fifo.seen.insert(tx_digest.clone()) {
+                    fifo.queue.push_back(tx_digest);
+                }
             }
         }
         Ok(())

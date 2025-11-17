@@ -207,6 +207,9 @@ impl Worker {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
+        // FEATURE: Send tx digest to primary to store in FIFO
+        let tx_primary_clone = tx_primary.clone();
+
         // Receive incoming messages from other workers.
         let mut address = self
             .committee
@@ -220,6 +223,7 @@ impl Worker {
             WorkerReceiverHandler {
                 tx_helper,
                 tx_processor,
+                tx_primary_clone
             },
         );
 
@@ -252,7 +256,7 @@ impl Worker {
 #[derive(Clone)]
 struct TxReceiverHandler {
     tx_batch_maker: Sender<Transaction>,
-    tx_primary_clone: Sender<Vec<u8>>
+    tx_primary_clone: Sender<Transaction>
 }
 
 #[async_trait]
@@ -261,10 +265,6 @@ impl MessageHandler for TxReceiverHandler {
 
         // Send the transaction to the batch maker.
         let tx_bytes = message.to_vec();
-        self.tx_batch_maker
-            .send(tx_bytes.clone())
-            .await
-            .expect("Failed to send transaction");
 
         // FEATURE: Send tx digest to primary to store in FIFO
         let tx_digest = Digest(
@@ -283,6 +283,11 @@ impl MessageHandler for TxReceiverHandler {
             .await
             .expect("Failed to send tx digest");
 
+        self.tx_batch_maker
+            .send(tx_bytes)
+            .await
+            .expect("Failed to send transaction");
+
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;
         Ok(())
@@ -294,6 +299,7 @@ impl MessageHandler for TxReceiverHandler {
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
+    tx_primary_clone: Sender<Transaction>
 }
 
 #[async_trait]
@@ -304,11 +310,34 @@ impl MessageHandler for WorkerReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch"),
+            Ok(WorkerMessage::Batch(other_worker_batch)) => {
+
+                // FEATURE: Send tx digests to primary to store in FIFO
+                for tx in other_worker_batch {
+                    let tx_digest = Digest(
+                        Sha512::digest(&tx)[..32]
+                            .try_into()
+                            .expect("Sha512 output must be at least 32 bytes"),
+                    );
+                    let message = WorkerPrimaryMessage::OurTxDigest(
+                        tx_digest
+                    );
+                    let message = bincode::serialize(&message)
+                        .expect("Failed to serialize our own worker-primary message");
+                    
+                    self.tx_primary_clone
+                        .send(message)
+                        .await
+                        .expect("Failed to send tx digest");
+                }
+
+                self
+                    .tx_processor
+                    .send(serialized.to_vec())
+                    .await
+                    .expect("Failed to send batch");
+
+            },
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))
