@@ -9,12 +9,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
+use ed25519_dalek::Digest as _;
+use ed25519_dalek::Sha512;
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
 use network::{MessageHandler, Receiver, Writer};
-use primary::PrimaryWorkerMessage;
+use primary::{PrimaryWorkerMessage, WorkerPrimaryMessage};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -140,6 +143,9 @@ impl Worker {
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
+        // FEATURE: Send tx digest to primary to store in FIFO
+        let tx_primary_clone = tx_primary.clone();
+
         // We first receive clients' transactions from the network.
         let mut address = self
             .committee
@@ -149,7 +155,10 @@ impl Worker {
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
             address,
-            /* handler */ TxReceiverHandler { tx_batch_maker },
+            /* handler */ TxReceiverHandler { 
+                tx_batch_maker,
+                tx_primary_clone
+            },
         );
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
@@ -243,16 +252,36 @@ impl Worker {
 #[derive(Clone)]
 struct TxReceiverHandler {
     tx_batch_maker: Sender<Transaction>,
+    tx_primary_clone: Sender<Vec<u8>>
 }
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+
         // Send the transaction to the batch maker.
+        let tx_bytes = message.to_vec();
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send(tx_bytes.clone())
             .await
             .expect("Failed to send transaction");
+
+        // FEATURE: Send tx digest to primary to store in FIFO
+        let tx_digest = Digest(
+            Sha512::digest(&tx_bytes)[..32]
+                .try_into()
+                .expect("Sha512 output must be at least 32 bytes"),
+        );
+        let message = WorkerPrimaryMessage::OurTxDigest(
+            tx_digest
+        );
+        let message = bincode::serialize(&message)
+            .expect("Failed to serialize our own worker-primary message");
+        
+        self.tx_primary_clone
+            .send(message)
+            .await
+            .expect("Failed to send tx digest");
 
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;

@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -53,6 +54,8 @@ pub enum WorkerPrimaryMessage {
     OurBatch(Digest, WorkerId),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
+    /// FEATURE: Worker indicates our tx digest
+    OurTxDigest(Digest)
 }
 
 pub struct Primary;
@@ -99,13 +102,16 @@ impl Primary {
             /* handler */
             PrimaryReceiverHandler {
                 tx_primary_messages,
-                tx_cert_requests,
+                tx_cert_requests
             },
         );
         info!(
             "Primary {} listening to primary messages on {}",
             name, address
         );
+
+        // FEATURE: FIFO of tx digests
+        let fifo_tx_digests: Arc<Mutex<Vec<Digest>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Spawn the network receiver listening to messages from our workers.
         let mut address = committee
@@ -119,6 +125,7 @@ impl Primary {
             WorkerReceiverHandler {
                 tx_our_digests,
                 tx_others_digests,
+                fifo_tx_digests
             },
         );
         info!(
@@ -248,6 +255,7 @@ impl MessageHandler for PrimaryReceiverHandler {
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
+    fifo_tx_digests: Arc<Mutex<Vec<Digest>>>,
 }
 
 #[async_trait]
@@ -269,6 +277,10 @@ impl MessageHandler for WorkerReceiverHandler {
                 .send((digest, worker_id))
                 .await
                 .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OurTxDigest(tx_digest) => {
+                let mut fifo = self.fifo_tx_digests.lock().await;
+                fifo.push(tx_digest);
+            }
         }
         Ok(())
     }
