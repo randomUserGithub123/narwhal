@@ -33,7 +33,7 @@ async fn hash_and_store() {
     // Ensure the `Processor` outputs the batch's digest.
     let output = rx_digest.recv().await.unwrap();
     let digest = Digest(
-        Sha512::digest(&serialized).as_slice()[..32]
+        Sha512::digest(&serialized)[..32]
             .try_into()
             .unwrap(),
     );

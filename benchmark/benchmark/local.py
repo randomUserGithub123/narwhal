@@ -2,7 +2,8 @@
 import subprocess
 from math import ceil
 from os.path import basename, splitext
-from time import sleep
+from time import sleep, time
+import random
 
 from benchmark.commands import CommandMaker
 from benchmark.config import (
@@ -41,7 +42,7 @@ class LocalBench:
         except subprocess.SubprocessError as e:
             raise BenchError("Failed to kill testbed", e)
 
-    def run(self, debug=False):
+    def run(self, debug=False, build=True):
         assert isinstance(debug, bool)
         Print.heading("Starting local benchmark")
 
@@ -57,13 +58,16 @@ class LocalBench:
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             sleep(0.5)  # Removing the store may take time.
 
-            # Recompile the latest code.
-            cmd = CommandMaker.compile().split()
-            subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
+            if(
+                build
+            ):
+                # Recompile the latest code.
+                cmd = CommandMaker.compile().split()
+                subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
 
-            # Create alias for the client and nodes binary.
-            cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
-            subprocess.run([cmd], shell=True)
+                # Create alias for the client and nodes binary.
+                cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
+                subprocess.run([cmd], shell=True)
 
             # Generate configuration files.
             keys = []
@@ -80,7 +84,7 @@ class LocalBench:
             self.node_parameters.print(PathMaker.parameters_file())
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
+            workers_addresses = committee.workers_addresses()
             rate_share = ceil(rate / committee.workers())
             for i, addresses in enumerate(workers_addresses):
                 for id, address in addresses:
@@ -93,19 +97,26 @@ class LocalBench:
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)
 
-            # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
+            # FEATURE: 'is_byzantine' primary
+            random.seed(int(time()))
+            byzantine_replica_IDs = random.sample(list(range(committee.size())), int(self.faults))
+
+            # Run the primaries.
+            for i, address in enumerate(committee.primary_addresses()):
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i),
                     PathMaker.parameters_file(),
+                    is_byzantine=(
+                        i in byzantine_replica_IDs
+                    ),
                     debug=debug,
                 )
                 log_file = PathMaker.primary_log_file(i)
                 self._background_run(cmd, log_file)
 
-            # Run the workers (except the faulty ones).
+            # Run the workers.
             for i, addresses in enumerate(workers_addresses):
                 for id, address in addresses:
                     cmd = CommandMaker.run_worker(

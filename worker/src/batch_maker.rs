@@ -122,7 +122,7 @@ impl BatchMaker {
         {
             // NOTE: This is one extra hash that is only needed to print the following log entries.
             let digest = Digest(
-                Sha512::digest(&serialized).as_slice()[..32]
+                Sha512::digest(&serialized)[..32]
                     .try_into()
                     .unwrap(),
             );

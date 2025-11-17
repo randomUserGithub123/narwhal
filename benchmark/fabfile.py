@@ -10,11 +10,11 @@ from benchmark.remote import Bench, BenchError
 
 
 @task
-def local(ctx, debug=True):
+def local(ctx, debug=True, build=False):
     ''' Run benchmarks on localhost '''
     bench_params = {
-        'faults': 0,
-        'nodes': 4,
+        'faults': 2,
+        'nodes': 10,
         'workers': 1,
         'rate': 50_000,
         'tx_size': 512,
@@ -30,7 +30,7 @@ def local(ctx, debug=True):
         'max_batch_delay': 200  # ms
     }
     try:
-        ret = LocalBench(bench_params, node_params).run(debug)
+        ret = LocalBench(bench_params, node_params).run(debug, build)
         print(ret.result())
     except BenchError as e:
         Print.error(e)

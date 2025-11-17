@@ -32,7 +32,10 @@ async fn main() -> Result<()> {
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
-                .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
+                .subcommand(SubCommand::with_name("primary")
+                    .about("Run a single primary")
+                    .args_from_usage("--is_byzantine=<INT> 'Indicates if Byzantine'")
+                )
                 .subcommand(
                     SubCommand::with_name("worker")
                         .about("Run a single worker")
@@ -94,9 +97,16 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
-        ("primary", _) => {
+        ("primary", Some(sub_matches)) => {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+            
+            let is_byzantine = sub_matches
+                .value_of("is_byzantine")
+                .unwrap()
+                .parse::<u8>()     
+                .context("'is_byzantine' must be 0 or 1")? != 0;
+            
             Primary::spawn(
                 keypair,
                 committee.clone(),
