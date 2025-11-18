@@ -115,6 +115,23 @@ impl BatchMaker {
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
+        
+        self.handle_batch(
+            batch,
+            #[cfg(feature = "benchmark")]
+            size,
+            #[cfg(feature = "benchmark")]
+            tx_ids,
+        )
+        .await;
+    }
+
+    async fn handle_batch(
+        &mut self,
+        batch: Vec<Vec<u8>>,
+        #[cfg(feature = "benchmark")] size: usize,
+        #[cfg(feature = "benchmark")] tx_ids: Vec<[u8; 8]>,
+    ) {
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
@@ -154,4 +171,5 @@ impl BatchMaker {
             .await
             .expect("Failed to deliver batch");
     }
+
 }

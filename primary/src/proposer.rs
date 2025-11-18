@@ -32,6 +32,10 @@ pub struct Proposer {
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
 
+    /// FEATURE: Get FIFO for this round
+    tx_proposer_to_primary: Sender<()>,
+    rx_primary_to_proposer: Receiver<Digest>,
+
     /// The current round of the dag.
     round: Round,
     /// Holds the certificates' ids waiting to be included in the next header.
@@ -53,6 +57,8 @@ impl Proposer {
         rx_core: Receiver<(Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId)>,
         tx_core: Sender<Header>,
+        tx_proposer_to_primary: Sender<()>,
+        rx_primary_to_proposer: Receiver<Digest>,
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
@@ -68,6 +74,8 @@ impl Proposer {
                 rx_core,
                 rx_workers,
                 tx_core,
+                tx_proposer_to_primary,
+                rx_primary_to_proposer,
                 round: 1,
                 last_parents: genesis,
                 digests: Vec::with_capacity(2 * header_size),
@@ -79,6 +87,15 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
+
+        // FEATURE: Get FIFO for this round
+        let _ = self.tx_proposer_to_primary.send(()).await;
+        let _fifo_hash = self
+            .rx_primary_to_proposer
+            .recv()
+            .await
+            .expect("Primary did not reply with FIFO hash");
+
         // Make a new header.
         let header = Header::new(
             self.name,

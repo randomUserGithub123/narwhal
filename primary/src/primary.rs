@@ -13,10 +13,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
+use ed25519_dalek::{Digest as _, Sha512};
 use futures::sink::SinkExt as _;
 use log::info;
-use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
+use network::{MessageHandler, Receiver as NetworkReceiver, Writer, SimpleSender};
 use serde::{Deserialize, Serialize};
+use std::convert::TryInto;
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -87,6 +89,63 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
 
+        // FEATURE: FIFO of tx digests
+        let fifo_tx_digests = Arc::new(Mutex::new(TxDigestFIFO {
+            queue: VecDeque::new(),
+            seen: HashSet::new(),
+        }));
+
+        // FEATURE: Get FIFO for this round
+        let (tx_proposer_to_primary, mut rx_proposer_to_primary) = channel(CHANNEL_CAPACITY);
+        let (tx_primary_to_proposer, rx_primary_to_proposer) = channel(CHANNEL_CAPACITY);
+
+        {
+            let fifo = fifo_tx_digests.clone();
+            let tx_back = tx_primary_to_proposer.clone();
+
+            let worker_network = SimpleSender::new();
+
+            tokio::spawn(async move {
+                while let Some(_sig) = rx_proposer_to_primary.recv().await {
+                    
+                    let fifo_vec: Vec<Digest> = {
+                        let mut fifo = fifo.lock().await;
+                        let mut v = Vec::new();
+                        while let Some(d) = fifo.queue.pop_front() {
+                            v.push(d);
+                        }
+                        v
+                    };
+
+                    // TODO: Sending FIFO might be expensive if workers are on same machine (use SHM instead)
+                    // let worker_address = committee
+                    //     .our_workers(&keypair.name)
+                    //     .expect("Our public key or worker id is not in the committee")
+                    //     .iter()
+                    //     .next()
+                    //     .expect("Worker not found for this primary")
+                    //     .primary_to_worker;
+                    // let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
+                    //     .expect("Failed to serialize our own message");
+                    // worker_network
+                    //     .send(worker_address, Bytes::from(bytes))
+                    //     .await;
+
+                    let bytes = bincode::serialize(&fifo_vec)
+                        .expect("failed to serialize fifo_vec for hashing");
+                    let digest = Digest(
+                        Sha512::digest(&bytes)[..32]
+                            .try_into()
+                            .unwrap(),
+                    );
+
+                    if tx_back.send(digest).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
         // Write the parameters to the logs.
         parameters.log();
 
@@ -116,12 +175,6 @@ impl Primary {
             "Primary {} listening to primary messages on {}",
             name, address
         );
-
-        // FEATURE: FIFO of tx digests
-        let fifo_tx_digests = Arc::new(Mutex::new(TxDigestFIFO {
-            queue: VecDeque::new(),
-            seen: HashSet::new(),
-        }));
 
         // Spawn the network receiver listening to messages from our workers.
         let mut address = committee
@@ -212,6 +265,8 @@ impl Primary {
             /* rx_core */ rx_parents,
             /* rx_workers */ rx_our_digests,
             /* tx_core */ tx_headers,
+            tx_proposer_to_primary,
+            rx_primary_to_proposer
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.
