@@ -58,13 +58,13 @@ pub enum WorkerPrimaryMessage {
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
     /// FEATURE: Worker indicates our tx digest
-    OurTxDigest(Digest)
+    OurTxDigest(u64)
 }
 
 // FEATURE: FIFO of tx digests
 struct TxDigestFIFO {
-    queue: VecDeque<Digest>,
-    seen: HashSet<Digest>,
+    queue: VecDeque<u64>,
+    seen: HashSet<u64>,
 }
 
 pub struct Primary;
@@ -111,7 +111,7 @@ impl Primary {
             tokio::spawn(async move {
                 while let Some(_sig) = rx_proposer_to_primary.recv().await {
                     
-                    let fifo_vec: Vec<Digest> = {
+                    let fifo_vec: Vec<u64> = {
                         let mut fifo = fifo.lock().await;
                         let mut v = Vec::new();
                         while let Some(d) = fifo.queue.pop_front() {
@@ -350,16 +350,20 @@ impl MessageHandler for WorkerReceiverHandler {
 
             },
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
+
                 self.tx_others_digests
                     .send((digest, worker_id))
                     .await
                     .expect("Failed to send workers' digests");
+
             },
             WorkerPrimaryMessage::OurTxDigest(tx_digest) => {
+
                 let mut fifo = self.fifo_tx_digests.lock().await;
                 if fifo.seen.insert(tx_digest.clone()) {
                     fifo.queue.push_back(tx_digest);
                 }
+
             }
         }
         Ok(())

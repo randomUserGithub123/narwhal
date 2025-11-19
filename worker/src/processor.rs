@@ -39,23 +39,31 @@ impl Processor {
 
                     let payload = &batch[4..];
 
-                    // let digest = Digest(
-                    //     Sha512::digest(payload)[..32]
-                    //         .try_into()
-                    //         .unwrap(),
-                    // );
+                    let digest = Digest(
+                        Sha512::digest(payload)[..32]
+                            .try_into()
+                            .unwrap(),
+                    );
 
-                    // let mut key = b"FIFO".to_vec();
-                    // key.extend_from_slice(&digest.to_vec());
+                    let mut key = b"FIFO".to_vec();
+                    key.extend_from_slice(&digest.to_vec());
 
-                    // store.write(key, payload.to_vec()).await;
+                    let start_time = std::time::Instant::now();
 
-                    // let message = match own_digest {
-                    //     true => WorkerPrimaryMessage::OurBatch(digest, id),
-                    //     false => WorkerPrimaryMessage::OthersBatch(digest, id),
-                    // };
-                    // let message = bincode::serialize(&message)
-                    //     .expect("Failed to serialize our own worker-primary message");
+                    store.write(key, payload.to_vec()).await;
+
+                    let t1 = start_time.elapsed().as_nanos();
+
+                    log::info!{
+                        "\nt1: {}\nFIFO size: {}", t1, payload.len()
+                    };
+
+                    let message = match own_digest {
+                        true => WorkerPrimaryMessage::OurBatch(digest, id),
+                        false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    };
+                    let message = bincode::serialize(&message)
+                        .expect("Failed to serialize our own worker-primary message");
 
                     // tx_digest
                     //     .send(message)

@@ -7,7 +7,11 @@ from benchmark.utils import PathMaker
 class CommandMaker:
 
     @staticmethod
-    def cleanup():
+    def cleanup(
+        username=None
+    ):
+        if username:
+            return f'rm -r /var/scratch/{username}/.db-* ; rm .*.json ; mkdir -p {PathMaker.results_path()}'
         return (
             f'rm -r .db-* ; rm .*.json ; mkdir -p {PathMaker.results_path()}'
         )

@@ -16,7 +16,7 @@
     - [eduVPN](https://docs.eduvpn.org/client/linux/installation.html)
 3. DAS-5 head node (fileserver) is where the code lives (is edited and compiled)
 4. Program runs on compute nodes, orchestratred from the head node
-5. `/home/<userid>` has limited size, for large data files use the shared storage `/var/scratch/<userid>/`
+5. `/home/<userid>` has limited size, for large data files use the shared storage `/var/scratch/<userid>/` or `/local/<userid>/`
 6. Configure SSH: `ssh-copy-id` and then `ssh mputnik@fs0.das5.cs.vu.nl`
 7. Useful commands on the head node:
     - loading prun: `module load prun`
@@ -32,7 +32,7 @@
 1. Code changes
     - Push to Gitlab repository
     - `git pull` in `/home/mputnik/giulio-msc-thesis-code` in DAS
-    - `rm -rf /var/scratch/mputnik/giulio-msc-thesis-code` in DAS
+    - `rm -rf /var/scratch/mputnik/giulio-msc-thesis-code` in DAS (or `/local/mputnik/...`)
     - `cp -r ~/giulio-msc-thesis-code /var/scratch/mputnik/` in DAS
     - `cd /var/scratch/mputnik/giulio-msc-thesis-code` in DAS
 

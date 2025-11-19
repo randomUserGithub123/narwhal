@@ -20,6 +20,7 @@ use std::error::Error;
 use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
+use xxhash_rust::xxh3::xxh3_64;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -283,11 +284,13 @@ impl MessageHandler for TxReceiverHandler {
         let tx_bytes = message.to_vec();
 
         // FEATURE: Send tx digest to primary to store in FIFO
-        let tx_digest = Digest(
-            Sha512::digest(&tx_bytes)[..32]
-                .try_into()
-                .expect("Sha512 output must be at least 32 bytes"),
-        );
+        let tx_digest = xxh3_64(&tx_bytes);
+        // let tx_digest = Digest(
+        //     Sha512::digest(&tx_bytes)[..32]
+        //         .try_into()
+        //         .expect("Sha512 output must be at least 32 bytes"),
+        // );
+
         let message = WorkerPrimaryMessage::OurTxDigest(
             tx_digest
         );
@@ -341,11 +344,14 @@ impl MessageHandler for WorkerReceiverHandler {
 
                     // FEATURE: Send tx digests to primary to store in FIFO
                     for tx in other_worker_batch {
-                        let tx_digest = Digest(
-                            Sha512::digest(&tx)[..32]
-                                .try_into()
-                                .expect("Sha512 output must be at least 32 bytes"),
-                        );
+
+                        let tx_digest = xxh3_64(&tx);
+                        // let tx_digest = Digest(
+                        //     Sha512::digest(&tx)[..32]
+                        //         .try_into()
+                        //         .expect("Sha512 output must be at least 32 bytes"),
+                        // );
+                        
                         let message = WorkerPrimaryMessage::OurTxDigest(
                             tx_digest
                         );

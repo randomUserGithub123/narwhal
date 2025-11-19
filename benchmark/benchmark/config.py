@@ -1,7 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from json import dump, load
 from collections import OrderedDict
-
+import socket
 
 class ConfigError(Exception):
     pass
@@ -160,6 +160,24 @@ class LocalCommittee(Committee):
         addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
         super().__init__(addresses, port)
 
+class DASCommittee(Committee):
+    def __init__(self, names, port, workers, faults, hostnames):
+        assert isinstance(names, list)
+        assert all(isinstance(x, str) for x in names)
+        assert isinstance(port, int)
+        assert isinstance(workers, int) and workers > 0
+        assert isinstance(faults, int) and faults >= 0
+        
+        node_num = len(names)
+        collocate = len(hostnames) == node_num
+        
+        node_amount = 1 + workers
+        if collocate:
+            addresses = OrderedDict((x, [socket.gethostbyname(hostnames[i])] * node_amount) for i, x in enumerate(names))
+        else:
+            
+            addresses = OrderedDict((x, list(map(socket.gethostbyname, hostnames[i*node_amount:(i+1)*node_amount]))) for i, x in enumerate(names))
+        super().__init__(addresses, port)
 
 class NodeParameters:
     def __init__(self, json):

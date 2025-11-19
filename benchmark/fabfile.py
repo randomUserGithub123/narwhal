@@ -2,6 +2,7 @@
 from fabric import task
 
 from benchmark.local import LocalBench
+from benchmark.das import DASBench
 from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print
 from benchmark.plot import Ploter, PlotError
@@ -10,7 +11,7 @@ from benchmark.remote import Bench, BenchError
 
 
 @task
-def local(ctx, debug=True, build=False):
+def local(ctx, debug=True, build=True):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 2,
@@ -31,6 +32,32 @@ def local(ctx, debug=True, build=False):
     }
     try:
         ret = LocalBench(bench_params, node_params).run(debug, build)
+        print(ret.result())
+    except BenchError as e:
+        Print.error(e)
+
+@task
+def das(ctx, debug=True, build=True, username="mputnik"):
+    ''' Run benchmarks on localhost '''
+    bench_params = {
+        'faults': 2,
+        'nodes': 10,
+        'workers': 1,
+        'rate': 50_000,
+        'tx_size': 512,
+        'duration': 20,
+    }
+    node_params = {
+        'header_size': 1_000,  # bytes
+        'max_header_delay': 200,  # ms
+        'gc_depth': 50,  # rounds
+        'sync_retry_delay': 10_000,  # ms
+        'sync_retry_nodes': 3,  # number of nodes
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 200  # ms
+    }
+    try:
+        ret = DASBench(bench_params, node_params, username).run(debug, build)
         print(ret.result())
     except BenchError as e:
         Print.error(e)
