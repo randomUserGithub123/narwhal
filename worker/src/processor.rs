@@ -34,23 +34,55 @@ impl Processor {
     ) {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
-                // Hash the batch.
-                let digest = Digest(Sha512::digest(&batch)[..32].try_into().unwrap());
 
-                // Store the batch.
-                store.write(digest.to_vec(), batch).await;
+                if batch.starts_with(b"FIFO"){
 
-                // Deliver the batch's digest.
-                let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(digest, id),
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id),
-                };
-                let message = bincode::serialize(&message)
-                    .expect("Failed to serialize our own worker-primary message");
-                tx_digest
-                    .send(message)
-                    .await
-                    .expect("Failed to send digest");
+                    let payload = &batch[4..];
+
+                    // let digest = Digest(
+                    //     Sha512::digest(payload)[..32]
+                    //         .try_into()
+                    //         .unwrap(),
+                    // );
+
+                    // let mut key = b"FIFO".to_vec();
+                    // key.extend_from_slice(&digest.to_vec());
+
+                    // store.write(key, payload.to_vec()).await;
+
+                    // let message = match own_digest {
+                    //     true => WorkerPrimaryMessage::OurBatch(digest, id),
+                    //     false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    // };
+                    // let message = bincode::serialize(&message)
+                    //     .expect("Failed to serialize our own worker-primary message");
+
+                    // tx_digest
+                    //     .send(message)
+                    //     .await
+                    //     .expect("Failed to send digest");
+
+                }else{
+
+                    // Hash the batch.
+                    let digest = Digest(Sha512::digest(&batch)[..32].try_into().unwrap());
+
+                    // Store the batch.
+                    store.write(digest.to_vec(), batch).await;
+
+                    // Deliver the batch's digest.
+                    let message = match own_digest {
+                        true => WorkerPrimaryMessage::OurBatch(digest, id),
+                        false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    };
+                    let message = bincode::serialize(&message)
+                        .expect("Failed to serialize our own worker-primary message");
+                    tx_digest
+                        .send(message)
+                        .await
+                        .expect("Failed to send digest");
+
+                }
             }
         });
     }

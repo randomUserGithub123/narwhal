@@ -74,9 +74,12 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages(tx_batch_maker.clone());
-        worker.handle_clients_transactions(tx_primary.clone(), tx_batch_maker, rx_batch_maker);
+
+        // FEATURE: Get FIFO for this round
+        let (tx_primary_fifo, rx_primary_fifo) = channel(CHANNEL_CAPACITY);
+        
+        worker.handle_primary_messages(tx_primary_fifo);
+        worker.handle_clients_transactions(tx_primary.clone(), rx_primary_fifo);
         worker.handle_workers_messages(tx_primary);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
@@ -105,7 +108,7 @@ impl Worker {
     /// Spawn all tasks responsible to handle messages from our primary.
     fn handle_primary_messages(
         &self,
-        tx_batch_maker: Sender<Transaction>
+        tx_primary_fifo: Sender<Bytes>,
     ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
@@ -121,7 +124,7 @@ impl Worker {
             /* handler */
             PrimaryReceiverHandler { 
                 tx_synchronizer,
-                tx_batch_maker
+                tx_primary_fifo
             },
         );
 
@@ -147,11 +150,11 @@ impl Worker {
     /// Spawn all tasks responsible to handle clients transactions.
     fn handle_clients_transactions(
         &self, 
-        tx_primary: Sender<SerializedBatchDigestMessage>, 
-        tx_batch_maker: Sender<Transaction>,
-        rx_batch_maker: tokio::sync::mpsc::Receiver<Vec<u8>>
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        rx_primary_fifo: tokio::sync::mpsc::Receiver<Bytes>
     ) {
         
+        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
@@ -181,6 +184,7 @@ impl Worker {
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
             /* tx_message */ tx_quorum_waiter,
+            rx_primary_fifo,
             /* workers_addresses */
             self.committee
                 .others_workers(&self.name, &self.id)
@@ -317,46 +321,59 @@ struct WorkerReceiverHandler {
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Deserialize and parse the message.
-        match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(other_worker_batch)) => {
+        let bytes: &[u8] = &serialized;
+        if bytes.starts_with(b"FIFO") {
 
-                // FEATURE: Send tx digests to primary to store in FIFO
-                for tx in other_worker_batch {
-                    let tx_digest = Digest(
-                        Sha512::digest(&tx)[..32]
-                            .try_into()
-                            .expect("Sha512 output must be at least 32 bytes"),
-                    );
-                    let message = WorkerPrimaryMessage::OurTxDigest(
-                        tx_digest
-                    );
-                    let message = bincode::serialize(&message)
-                        .expect("Failed to serialize our own worker-primary message");
-                    
-                    self.tx_primary_clone
-                        .send(message)
-                        .await
-                        .expect("Failed to send tx digest");
-                }
-
-                self
-                    .tx_processor
-                    .send(serialized.to_vec())
-                    .await
-                    .expect("Failed to send batch");
-
-            },
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
-                .tx_helper
-                .send((missing, requestor))
+            self
+                .tx_processor
+                .send(serialized.to_vec())
                 .await
-                .expect("Failed to send batch request"),
-            Err(e) => warn!("Serialization error: {}", e),
+                .expect("Failed to send batch");
+
+        }else{
+            // Deserialize and parse the message.
+            match bincode::deserialize(&serialized) {
+                Ok(WorkerMessage::Batch(other_worker_batch)) => {
+
+                    // FEATURE: Send tx digests to primary to store in FIFO
+                    for tx in other_worker_batch {
+                        let tx_digest = Digest(
+                            Sha512::digest(&tx)[..32]
+                                .try_into()
+                                .expect("Sha512 output must be at least 32 bytes"),
+                        );
+                        let message = WorkerPrimaryMessage::OurTxDigest(
+                            tx_digest
+                        );
+                        let message = bincode::serialize(&message)
+                            .expect("Failed to serialize our own worker-primary message");
+                        
+                        self.tx_primary_clone
+                            .send(message)
+                            .await
+                            .expect("Failed to send tx digest");
+                    }
+
+                    self
+                        .tx_processor
+                        .send(serialized.to_vec())
+                        .await
+                        .expect("Failed to send batch");
+
+                },
+                Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
+                    .tx_helper
+                    .send((missing, requestor))
+                    .await
+                    .expect("Failed to send batch request"),
+                Err(e) => warn!("Serialization error: {}", e),
+            }
         }
+
         Ok(())
     }
 }
@@ -365,7 +382,7 @@ impl MessageHandler for WorkerReceiverHandler {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
-    tx_batch_maker: Sender<Transaction>
+    tx_primary_fifo: Sender<Bytes>
 }
 
 #[async_trait]
@@ -375,15 +392,26 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        // Deserialize the message and send it to the synchronizer.
-        match bincode::deserialize(&serialized) {
-            Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self
-                .tx_synchronizer
-                .send(message)
+        
+        let bytes: &[u8] = &serialized;
+        if bytes.starts_with(b"FIFO") {
+
+            self.tx_primary_fifo
+                .send(serialized)
                 .await
-                .expect("Failed to send transaction"),
+                .expect("FIFO send to BatchMaker failed");
+
+        }else{
+            match bincode::deserialize(&serialized) {
+                Err(e) => error!("Failed to deserialize primary message: {}", e),
+                Ok(message) => self
+                    .tx_synchronizer
+                    .send(message)
+                    .await
+                    .expect("Failed to send transaction"),
+            }
         }
+
         Ok(())
     }
 }

@@ -98,12 +98,15 @@ impl Primary {
         // FEATURE: Get FIFO for this round
         let (tx_proposer_to_primary, mut rx_proposer_to_primary) = channel(CHANNEL_CAPACITY);
         let (tx_primary_to_proposer, rx_primary_to_proposer) = channel(CHANNEL_CAPACITY);
-
+        
         {
             let fifo = fifo_tx_digests.clone();
             let tx_back = tx_primary_to_proposer.clone();
 
-            let worker_network = SimpleSender::new();
+            let mut worker_network = SimpleSender::new();
+
+            let committee_for_task = committee.clone();
+            let name_for_task = keypair.name;
 
             tokio::spawn(async move {
                 while let Some(_sig) = rx_proposer_to_primary.recv().await {
@@ -117,27 +120,32 @@ impl Primary {
                         v
                     };
 
-                    // TODO: Sending FIFO might be expensive if workers are on same machine (use SHM instead)
-                    // let worker_address = committee
-                    //     .our_workers(&keypair.name)
-                    //     .expect("Our public key or worker id is not in the committee")
-                    //     .iter()
-                    //     .next()
-                    //     .expect("Worker not found for this primary")
-                    //     .primary_to_worker;
-                    // let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
-                    //     .expect("Failed to serialize our own message");
-                    // worker_network
-                    //     .send(worker_address, Bytes::from(bytes))
-                    //     .await;
-
-                    let bytes = bincode::serialize(&fifo_vec)
+                    let fifo_vec_bytes = bincode::serialize(&fifo_vec)
                         .expect("failed to serialize fifo_vec for hashing");
+
                     let digest = Digest(
-                        Sha512::digest(&bytes)[..32]
+                        Sha512::digest(&fifo_vec_bytes)[..32]
                             .try_into()
                             .unwrap(),
                     );
+                    
+                    // TODO: Attach round number and node id
+                    let mut fifo_bytes = b"FIFO".to_vec();
+                    fifo_bytes.extend_from_slice(&fifo_vec_bytes);
+        
+
+                    // TODO: Sending FIFO might be expensive if workers are on same machine (use SHM instead)
+                    let worker_address = committee_for_task
+                        .our_workers(&name_for_task)
+                        .expect("Our public key or worker id is not in the committee")
+                        .iter()
+                        .next()
+                        .expect("Worker not found for this primary")
+                        .primary_to_worker;
+                    
+                    worker_network
+                        .send(worker_address, Bytes::from(fifo_bytes))
+                        .await;
 
                     if tx_back.send(digest).await.is_err() {
                         break;
@@ -320,7 +328,7 @@ impl MessageHandler for PrimaryReceiverHandler {
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
-    fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>,
+    fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>
 }
 
 #[async_trait]
@@ -332,11 +340,15 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
-                .tx_our_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
+
+                self
+                    .tx_our_digests
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send workers' digests")
+
+            },
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
                 self.tx_others_digests
                     .send((digest, worker_id))

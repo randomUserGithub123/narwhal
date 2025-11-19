@@ -33,6 +33,10 @@ pub struct BatchMaker {
     rx_transaction: Receiver<Transaction>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
+
+    // FEATURE: Get FIFO for this round
+    rx_primary_fifo: Receiver<Bytes>,
+
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch.
@@ -49,6 +53,7 @@ impl BatchMaker {
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
+        rx_primary_fifo: Receiver<Bytes>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
@@ -57,6 +62,7 @@ impl BatchMaker {
                 max_batch_delay,
                 rx_transaction,
                 tx_message,
+                rx_primary_fifo,
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
@@ -83,6 +89,24 @@ impl BatchMaker {
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
                 },
+
+                Some(fifo_bytes) = self.rx_primary_fifo.recv() => {
+
+                    // Broadcast the batch through the network.
+                    let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+                    let bytes = Bytes::from(fifo_bytes.clone());
+                    let handlers = self.network.broadcast(addresses, bytes).await;
+
+                    // Send the batch through the deliver channel for further processing.
+                    self.tx_message
+                        .send(QuorumWaiterMessage {
+                            batch: fifo_bytes.to_vec(),
+                            handlers: names.into_iter().zip(handlers.into_iter()).collect(),
+                        })
+                        .await
+                        .expect("Failed to deliver batch");
+
+                }
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
