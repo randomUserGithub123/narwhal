@@ -54,9 +54,9 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch(Digest, WorkerId, bool),
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId),
+    OthersBatch(Digest, WorkerId, bool),
     /// FEATURE: Worker indicates our tx digest
     OurTxDigest(u64)
 }
@@ -96,9 +96,11 @@ impl Primary {
         }));
 
         // FEATURE: Get FIFO for this round
-        let (tx_proposer_to_primary, mut rx_proposer_to_primary) = channel(CHANNEL_CAPACITY);
+        let (tx_proposer_to_primary, mut rx_proposer_to_primary) = channel::<u64>(CHANNEL_CAPACITY);
         let (tx_primary_to_proposer, rx_primary_to_proposer) = channel(CHANNEL_CAPACITY);
         
+        let (tx_fifo_reliably_stored, mut rx_fifo_reliably_stored) = channel(CHANNEL_CAPACITY);
+
         {
             let fifo = fifo_tx_digests.clone();
             let tx_back = tx_primary_to_proposer.clone();
@@ -107,9 +109,8 @@ impl Primary {
 
             let committee_for_task = committee.clone();
             let name_for_task = keypair.name;
-
             tokio::spawn(async move {
-                while let Some(_sig) = rx_proposer_to_primary.recv().await {
+                while let Some(round) = rx_proposer_to_primary.recv().await {
                     
                     let fifo_vec: Vec<u64> = {
                         let mut fifo = fifo.lock().await;
@@ -129,8 +130,9 @@ impl Primary {
                             .unwrap(),
                     );
                     
-                    // TODO: Attach round number and node id
                     let mut fifo_bytes = b"FIFO".to_vec();
+                    fifo_bytes.extend_from_slice(&name_for_task.0);
+                    fifo_bytes.extend_from_slice(&round.to_le_bytes());
                     fifo_bytes.extend_from_slice(&fifo_vec_bytes);
         
 
@@ -146,6 +148,9 @@ impl Primary {
                     worker_network
                         .send(worker_address, Bytes::from(fifo_bytes))
                         .await;
+
+                    // Wait for FIFO to be reliably stored
+                    let _ = rx_fifo_reliably_stored.recv().await;
 
                     if tx_back.send(digest).await.is_err() {
                         break;
@@ -196,7 +201,8 @@ impl Primary {
             WorkerReceiverHandler {
                 tx_our_digests,
                 tx_others_digests,
-                fifo_tx_digests
+                fifo_tx_digests,
+                tx_fifo_reliably_stored
             },
         );
         info!(
@@ -328,7 +334,8 @@ impl MessageHandler for PrimaryReceiverHandler {
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
-    fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>
+    fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>,
+    tx_fifo_reliably_stored: Sender<()>
 }
 
 #[async_trait]
@@ -340,16 +347,25 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
 
-                self
-                    .tx_our_digests
-                    .send((digest, worker_id))
-                    .await
-                    .expect("Failed to send workers' digests")
+            WorkerPrimaryMessage::OurBatch(digest, worker_id, is_fifo) => {
+
+                if is_fifo{
+                    let _ = self.tx_fifo_reliably_stored.send(()).await;
+                }else{
+                    self
+                        .tx_our_digests
+                        .send((digest, worker_id))
+                        .await
+                        .expect("Failed to send workers' digests")
+                }
 
             },
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id, is_fifo) => {
+
+                if is_fifo{
+                    // TODO: Do we need to handle this case differently?
+                }
 
                 self.tx_others_digests
                     .send((digest, worker_id))
@@ -365,7 +381,10 @@ impl MessageHandler for WorkerReceiverHandler {
                 }
 
             }
+
         }
+
         Ok(())
+
     }
 }
