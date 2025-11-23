@@ -107,8 +107,13 @@ impl Primary {
 
             let mut worker_network = SimpleSender::new();
 
-            let committee_for_task = committee.clone();
-            let name_for_task = keypair.name;
+            let workers_for_task: Vec<_> = committee
+                .our_workers(&keypair.name)
+                .expect("Our public key or worker id is not in the committee")
+                .into_iter()
+                .collect();
+            let number_of_workers = workers_for_task.len();
+
             tokio::spawn(async move {
                 while let Some(round) = rx_proposer_to_primary.recv().await {
                     
@@ -131,28 +136,23 @@ impl Primary {
                     );
                     
                     let mut fifo_bytes = b"FIFO".to_vec();
-                    fifo_bytes.extend_from_slice(&name_for_task.0);
-                    fifo_bytes.extend_from_slice(&round.to_le_bytes());
                     fifo_bytes.extend_from_slice(&fifo_vec_bytes);
-        
 
                     // TODO: Sending FIFO might be expensive if workers are on same machine (use SHM instead)
-                    let worker_address = committee_for_task
-                        .our_workers(&name_for_task)
-                        .expect("Our public key or worker id is not in the committee")
-                        .iter()
-                        .next()
-                        .expect("Worker not found for this primary")
-                        .primary_to_worker;
-                    
+                    let idx = (round as usize) % number_of_workers;
+                    let worker_address = workers_for_task[idx].primary_to_worker;
+
                     worker_network
                         .send(worker_address, Bytes::from(fifo_bytes))
                         .await;
 
                     // Wait for FIFO to be reliably stored
-                    let _ = rx_fifo_reliably_stored.recv().await;
+                    let worker_id = rx_fifo_reliably_stored
+                        .recv()
+                        .await
+                        .expect("rx_fifo_reliably_stored.recv() should have returned WorkerId");
 
-                    if tx_back.send(digest).await.is_err() {
+                    if tx_back.send((digest, worker_id)).await.is_err() {
                         break;
                     }
                 }
@@ -335,7 +335,7 @@ struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
     fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>,
-    tx_fifo_reliably_stored: Sender<()>
+    tx_fifo_reliably_stored: Sender<WorkerId>
 }
 
 #[async_trait]
@@ -351,7 +351,7 @@ impl MessageHandler for WorkerReceiverHandler {
             WorkerPrimaryMessage::OurBatch(digest, worker_id, is_fifo) => {
 
                 if is_fifo{
-                    let _ = self.tx_fifo_reliably_stored.send(()).await;
+                    let _ = self.tx_fifo_reliably_stored.send(worker_id).await;
                 }else{
                     self
                         .tx_our_digests

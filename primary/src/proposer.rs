@@ -34,7 +34,7 @@ pub struct Proposer {
 
     /// FEATURE: Get FIFO for this round
     tx_proposer_to_primary: Sender<u64>,
-    rx_primary_to_proposer: Receiver<Digest>,
+    rx_primary_to_proposer: Receiver<(Digest, WorkerId)>,
 
     /// The current round of the dag.
     round: Round,
@@ -58,7 +58,7 @@ impl Proposer {
         rx_workers: Receiver<(Digest, WorkerId)>,
         tx_core: Sender<Header>,
         tx_proposer_to_primary: Sender<u64>,
-        rx_primary_to_proposer: Receiver<Digest>,
+        rx_primary_to_proposer: Receiver<(Digest, WorkerId)>,
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
@@ -88,19 +88,13 @@ impl Proposer {
 
     async fn make_header(&mut self) {
 
-        // let start_time = std::time::Instant::now();
-
         // FEATURE: Get FIFO for this round
         let _ = self.tx_proposer_to_primary.send(self.round).await;
-        let fifo_hash = self
+        let (fifo_hash, worker_id) = self
             .rx_primary_to_proposer
             .recv()
             .await
             .expect("Primary did not reply with FIFO hash");
-
-        // log::info!{
-        //     "\nFIFO hash is : {}\nTIME diff is: {}", fifo_hash, start_time.elapsed().as_nanos()
-        // };
 
         // Make a new header.
         let header = Header::new(
@@ -108,6 +102,7 @@ impl Proposer {
             self.round,
             self.digests.drain(..).collect(),
             self.last_parents.drain(..).collect(),
+            (fifo_hash, worker_id),
             &mut self.signature_service,
         )
         .await;

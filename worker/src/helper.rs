@@ -7,6 +7,8 @@ use network::SimpleSender;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
+use crate::{worker::WorkerMessage, batch_maker::Batch};
+
 #[cfg(test)]
 #[path = "tests/helper_tests.rs"]
 pub mod helper_tests;
@@ -61,7 +63,17 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
+                    Ok(Some(data)) => {
+                        if data.starts_with(b"FIFO"){
+                            self.network
+                                .send(address, Bytes::from(data))
+                                .await;
+                        }else{
+                            let batch: Batch = bincode::deserialize(&data).expect("Could not deserialize stored batch");
+                            let message = bincode::serialize(&WorkerMessage::Batch(batch)).expect("Could not serialize worker message with batch");
+                            self.network.send(address, Bytes::from(message)).await;
+                        }
+                    },
                     Ok(None) => (),
                     Err(e) => error!("{}", e),
                 }

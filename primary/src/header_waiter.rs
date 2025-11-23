@@ -229,6 +229,7 @@ impl HeaderWaiter {
                         for x in header.payload.keys() {
                             let _ = self.batch_requests.remove(x);
                         }
+                        let _ = self.batch_requests.remove(&header.fifo.0);
                         for x in &header.parents {
                             let _ = self.parent_requests.remove(x);
                         }

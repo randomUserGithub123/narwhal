@@ -16,6 +16,7 @@ pub struct Header {
     pub round: Round,
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
+    pub fifo: (Digest, WorkerId),
     pub id: Digest,
     pub signature: Signature,
 }
@@ -26,6 +27,7 @@ impl Header {
         round: Round,
         payload: BTreeMap<Digest, WorkerId>,
         parents: BTreeSet<Digest>,
+        fifo: (Digest, WorkerId),
         signature_service: &mut SignatureService,
     ) -> Self {
         let header = Self {
@@ -33,6 +35,7 @@ impl Header {
             round,
             payload,
             parents,
+            fifo,
             id: Digest::default(),
             signature: Signature::default(),
         };
@@ -60,6 +63,10 @@ impl Header {
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
+        committee
+            .worker(&self.author, &self.fifo.1)
+            .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
+
         // Check the signature.
         self.signature
             .verify(&self.id, &self.author)
@@ -79,6 +86,8 @@ impl Hash for Header {
         for x in &self.parents {
             hasher.update(x);
         }
+        hasher.update(&self.fifo.0);
+        hasher.update(self.fifo.1.to_le_bytes());
         Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }

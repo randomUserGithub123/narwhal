@@ -37,23 +37,16 @@ impl Processor {
 
                 if batch.starts_with(b"FIFO"){
 
-                    // b"FIFO" || PublicKey.BYTES || RoundNumber.BYTES
-                    assert!(
-                        batch.len() >= 4 + 32 + 8
-                    );
-
-                    let fifo_vec_bytes = &batch[4 + 32 + 8 ..];
+                    let fifo_vec_bytes = &batch[4 ..];
                     let digest = Digest(
                         Sha512::digest(fifo_vec_bytes)[..32]
                             .try_into()
                             .unwrap(),
                     );
 
-                    let key = [&batch[.. 4 + 32 + 8], digest.as_ref()].concat();
-
                     let message = match own_digest {
-                        true => WorkerPrimaryMessage::OurBatch(digest, id, true),
-                        false => WorkerPrimaryMessage::OthersBatch(digest, id, true),
+                        true => WorkerPrimaryMessage::OurBatch(digest.clone(), id, true),
+                        false => WorkerPrimaryMessage::OthersBatch(digest.clone(), id, true),
                     };
                     let message = bincode::serialize(&message)
                         .expect("Failed to serialize our own worker-primary message");
@@ -63,7 +56,7 @@ impl Processor {
                         .await
                         .expect("Failed to send digest");
 
-                    store.write(key, fifo_vec_bytes.to_vec()).await;
+                    store.write(digest.to_vec(), batch).await;
 
                 }else{
 

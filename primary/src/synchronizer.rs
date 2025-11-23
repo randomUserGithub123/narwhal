@@ -72,6 +72,11 @@ impl Synchronizer {
             }
         }
 
+        let key = [header.fifo.0.as_ref(), &header.fifo.1.to_le_bytes()].concat();
+        if self.store.read(key).await?.is_none() {
+            missing.insert(header.fifo.0.clone(), header.fifo.1);
+        }
+
         if missing.is_empty() {
             return Ok(false);
         }
