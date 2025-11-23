@@ -37,32 +37,19 @@ impl Processor {
 
                 if batch.starts_with(b"FIFO"){
 
+                    // b"FIFO" || PublicKey.BYTES || RoundNumber.BYTES
                     assert!(
                         batch.len() >= 4 + 32 + 8
                     );
 
-                    let payload = &batch[4..];
-
-                    let pk_bytes: [u8; 32] = payload[0..32]
-                        .try_into()
-                        .expect("pk slice must be 32 bytes");
-
-                    let round_bytes: [u8; 8] = payload[32..40]
-                        .try_into()
-                        .expect("round slice must be 8 bytes");
-                    let round = u64::from_le_bytes(round_bytes);
-
-                    let fifo_vec_bytes = &payload[40..];
+                    let fifo_vec_bytes = &batch[4 + 32 + 8 ..];
                     let digest = Digest(
                         Sha512::digest(fifo_vec_bytes)[..32]
                             .try_into()
                             .unwrap(),
                     );
 
-                    let mut key = b"FIFO".to_vec();
-                    key.extend_from_slice(&pk_bytes);
-                    key.extend_from_slice(&round.to_le_bytes());
-                    key.extend_from_slice(&digest.to_vec());
+                    let key = [&batch[.. 4 + 32 + 8], digest.as_ref()].concat();
 
                     let message = match own_digest {
                         true => WorkerPrimaryMessage::OurBatch(digest, id, true),
@@ -76,7 +63,7 @@ impl Processor {
                         .await
                         .expect("Failed to send digest");
 
-                    store.write(key, payload.to_vec()).await;
+                    store.write(key, fifo_vec_bytes.to_vec()).await;
 
                 }else{
 
