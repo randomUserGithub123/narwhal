@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc::Receiver;
 
 use petgraph::stable_graph::StableDiGraph;
@@ -30,12 +30,14 @@ pub struct GlobalOrder {
     n: u32,
     f: u32,
     gamma: f64,
+
+    pending: VecDeque<Certificate>,
 }
 
 impl GlobalOrder {
     pub fn spawn(store: Store, rx_certificates: Receiver<Certificate>) {
-        let n = 10;
-        let f = 2;
+        let n = 5;
+        let f = 1;
         let gamma = 1.0;
         tokio::spawn(async move {
             Self { 
@@ -44,40 +46,41 @@ impl GlobalOrder {
                 rounds: HashMap::new(),
                 n,
                 f,
-                gamma
+                gamma,
+                pending: VecDeque::new(),
             }.run().await;
         });
     }
 
     async fn run(&mut self) {
+
         while let Some(certificate) = self.rx_certificates.recv().await {
-            let fifo_digest: Digest = certificate.header.fifo.0;
-            let round: u64 = certificate.header.round;
-            let author: crypto::PublicKey = certificate.header.author;
 
-            match self.store.read(fifo_digest.to_vec()).await {
-                Ok(Some(fifo_bytes)) => {
+            let mut to_process = Vec::new();
+            to_process.push(certificate);
+            to_process.extend(self.pending.drain(..));
 
-                    log::info!(
-                        "FIFO bytes digest {}",
-                        fifo_digest
-                    );
+            for cert in to_process {
 
-                    let fifo_vec: Vec<u64> = bincode::deserialize(&fifo_bytes)
-                        .expect("Failed to deserialize FIFO bytes");
+                let fifo_digest: Digest = cert.header.fifo.0.clone();
+                let round: u64 = cert.header.round;
+                let author: crypto::PublicKey = cert.header.author;
 
-                    // self.process_certificate(round, author, fifo_vec);
-                }
-                Ok(None) => {
-                    log::info!(
-                        "FIFO bytes not yet available for digest {} – will skip this certificate for now",
-                        fifo_digest
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("FIFO store.read failed for {}: {}", fifo_digest, e);
-                    continue;
+                match self.store.read(fifo_digest.to_vec()).await {
+                    Ok(Some(fifo_bytes)) => {
+
+                        let fifo_vec: Vec<u64> = bincode::deserialize(&fifo_bytes)
+                            .expect("Failed to deserialize FIFO bytes");
+
+                        // self.process_certificate(round, author, fifo_vec);
+                    }
+                    Ok(None) => {
+                        self.pending.push_back(cert);
+                    }
+                    Err(e) => {
+                        log::error!("FIFO store.read failed for {}: {}", fifo_digest, e);
+                        self.pending.push_back(cert);
+                    }
                 }
             }
     
@@ -98,21 +101,18 @@ impl GlobalOrder {
         let threshold = (self.n as f64 * (1.0 - self.gamma) + self.f as f64 + 1.0).ceil() as u32;
         let quorum = (self.n - self.f) as usize;
         
-        // Track whether we just reached quorum in this call
         let mut reached_quorum = false;
 
         {
-            // 2) Borrow RoundState in its own block
+            
             let rs = self.round_state(round);
 
             rs.seen_authors.insert(author);
 
-            // ensure nodes exist
             for &tx in &fifo {
                 Self::get_or_insert_node(rs, tx);
             }
 
-            // For each ordered pair tx_i < tx_j
             for i in 0..fifo.len() {
                 for j in (i + 1)..fifo.len() {
                     let a = fifo[i];
@@ -142,11 +142,10 @@ impl GlobalOrder {
             if rs.seen_authors.len() >= quorum {
                 reached_quorum = true;
             }
-        } // <-- rs (&mut RoundState) is dropped here
+        }
 
-        // 3) Now it is safe to immutably borrow self again
         if reached_quorum {
-            // let _ = self.compute_order_for_round(round);
+            let _ = self.compute_order_for_round(round);
         }
 
     }
@@ -172,10 +171,8 @@ impl GlobalOrder {
     fn compute_order_for_round(&self, round: u64) -> Option<Vec<TxId>> {
         let rs = self.rounds.get(&round)?;
 
-        // Clone the graph because `condensation` takes ownership.
         let g = rs.graph.clone();
 
-        // Node weights become Vec<TxId>.
         let condensed = condensation(g, true);
 
         let topo = toposort(&condensed, None).ok()?;
