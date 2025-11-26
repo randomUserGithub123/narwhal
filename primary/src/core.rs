@@ -50,6 +50,8 @@ pub struct Core {
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     tx_proposer: Sender<(Vec<Digest>, Round)>,
 
+    tx_global_order: Sender<Certificate>,
+
     /// The last garbage collected round.
     gc_round: Round,
     /// The authors of the last voted headers.
@@ -84,6 +86,7 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
+        tx_global_order: Sender<Certificate>
     ) {
         tokio::spawn(async move {
             Self {
@@ -100,6 +103,7 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
+                tx_global_order,
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
@@ -294,12 +298,22 @@ impl Core {
 
         // Send it to the consensus layer.
         let id = certificate.header.id.clone();
+
+        // FEATURE: Global Order Graph
+        if let Err(e) = self.tx_global_order.send(certificate.clone()).await {
+            warn!(
+                "Failed to deliver certificate {} to the consensus: {}",
+                id, e
+            );
+        }
+
         if let Err(e) = self.tx_consensus.send(certificate).await {
             warn!(
                 "Failed to deliver certificate {} to the consensus: {}",
                 id, e
             );
         }
+
         Ok(())
     }
 

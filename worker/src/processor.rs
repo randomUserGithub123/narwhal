@@ -46,7 +46,7 @@ impl Processor {
 
                     let message = match own_digest {
                         true => WorkerPrimaryMessage::OurBatch(digest.clone(), id, true),
-                        false => WorkerPrimaryMessage::OthersBatch(digest.clone(), id, true),
+                        false => WorkerPrimaryMessage::OthersBatch(digest.clone(), id, true, fifo_vec_bytes.to_vec()),
                     };
                     let message = bincode::serialize(&message)
                         .expect("Failed to serialize our own worker-primary message");
@@ -67,7 +67,7 @@ impl Processor {
                     // Deliver the batch's digest.
                     let message = match own_digest {
                         true => WorkerPrimaryMessage::OurBatch(digest, id, false),
-                        false => WorkerPrimaryMessage::OthersBatch(digest, id, false),
+                        false => WorkerPrimaryMessage::OthersBatch(digest, id, false, Vec::default()),
                     };
                     let message = bincode::serialize(&message)
                         .expect("Failed to serialize our own worker-primary message");

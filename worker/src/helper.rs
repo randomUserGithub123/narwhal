@@ -64,15 +64,9 @@ impl Helper {
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
                     Ok(Some(data)) => {
-                        if data.starts_with(b"FIFO"){
-                            self.network
-                                .send(address, Bytes::from(data))
-                                .await;
-                        }else{
-                            let batch: Batch = bincode::deserialize(&data).expect("Could not deserialize stored batch");
-                            let message = bincode::serialize(&WorkerMessage::Batch(batch)).expect("Could not serialize worker message with batch");
-                            self.network.send(address, Bytes::from(message)).await;
-                        }
+                        self.network
+                            .send(address, Bytes::from(data))
+                            .await;
                     },
                     Ok(None) => (),
                     Err(e) => error!("{}", e),

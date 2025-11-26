@@ -9,6 +9,7 @@ use crate::messages::{Certificate, Header, Vote};
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
+use crate::global_order::GlobalOrder;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
@@ -56,7 +57,7 @@ pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
     OurBatch(Digest, WorkerId, bool),
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId, bool),
+    OthersBatch(Digest, WorkerId, bool, Vec<u8>),
     /// FEATURE: Worker indicates our tx digest
     OurTxDigest(u64)
 }
@@ -100,6 +101,11 @@ impl Primary {
         let (tx_primary_to_proposer, rx_primary_to_proposer) = channel(CHANNEL_CAPACITY);
         
         let (tx_fifo_reliably_stored, mut rx_fifo_reliably_stored) = channel(CHANNEL_CAPACITY);
+
+        // FEATURE: Global Order Graph
+        let (tx_global_order, rx_global_order) = channel(CHANNEL_CAPACITY);
+
+        let mut store_for_task = store.clone();
 
         {
             let fifo = fifo_tx_digests.clone();
@@ -146,15 +152,18 @@ impl Primary {
                         .send(worker_address, Bytes::from(fifo_bytes))
                         .await;
 
+                    store_for_task.write(digest.to_vec(), fifo_vec_bytes).await;
+
                     // Wait for FIFO to be reliably stored
                     let worker_id = rx_fifo_reliably_stored
                         .recv()
                         .await
                         .expect("rx_fifo_reliably_stored.recv() should have returned WorkerId");
 
-                    if tx_back.send((digest, worker_id)).await.is_err() {
+                    if tx_back.send((digest.clone(), worker_id)).await.is_err() {
                         break;
                     }
+
                 }
             });
         }
@@ -237,6 +246,7 @@ impl Primary {
             /* rx_proposer */ rx_headers,
             tx_consensus,
             /* tx_proposer */ tx_parents,
+            tx_global_order
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
@@ -244,6 +254,9 @@ impl Primary {
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
+
+        // FEATURE: Global Order Graph
+        GlobalOrder::spawn(store.clone(), /* rx_workers */ rx_global_order);
 
         // Whenever the `Synchronizer` does not manage to validate a header due to missing parent certificates of
         // batch digests, it commands the `HeaderWaiter` to synchronizer with other nodes, wait for their reply, and
@@ -333,7 +346,7 @@ impl MessageHandler for PrimaryReceiverHandler {
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId)>,
-    tx_others_digests: Sender<(Digest, WorkerId)>,
+    tx_others_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
     fifo_tx_digests: Arc<Mutex<TxDigestFIFO>>,
     tx_fifo_reliably_stored: Sender<WorkerId>
 }
@@ -361,14 +374,14 @@ impl MessageHandler for WorkerReceiverHandler {
                 }
 
             },
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id, is_fifo) => {
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id, is_fifo, fifo_bytes) => {
 
                 if is_fifo{
                     // TODO: Do we need to handle this case differently?
                 }
 
                 self.tx_others_digests
-                    .send((digest, worker_id))
+                    .send((digest, worker_id, fifo_bytes))
                     .await
                     .expect("Failed to send workers' digests");
 
