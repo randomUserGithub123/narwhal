@@ -6,7 +6,7 @@ from math import ceil
 from os.path import basename, splitext
 from time import sleep, time as time_func
 from random import choice, randrange, shuffle
-import random
+import random, traceback
 
 from benchmark.commands import CommandMaker
 from benchmark.config import (
@@ -50,15 +50,18 @@ class DASBench:
         subprocess.Popen(process, shell=True)
 
     def _kill_nodes(self):
+        try:
+            hosts = self._get_hostnames()
+            cmd = CommandMaker.cleanup(self.username)
 
-        hosts = self._get_hostnames()
-        cmd = CommandMaker.cleanup(self.username)
-
-        for host in hosts:
-            print(f"Cleaning up {host}")
-            self._background_run(cmd, "/dev/null", host)
-        sleep(5)
-        self.preserve_manager.kill_reservation("LAST")
+            for host in hosts:
+                print(f"Cleaning up {host}")
+                self._background_run(cmd, "/dev/null", host)
+            sleep(5)
+            self.preserve_manager.kill_reservation("LAST")
+        except Exception as e:
+            print(e)
+            print(traceback.format_exc())
     
     def _preserve_machines(self):
         # we need one machine per node (primary and workers are colocated) and 1 per 4 clients (which is nodes*workers)
