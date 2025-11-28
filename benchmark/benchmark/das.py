@@ -5,6 +5,7 @@ from math import ceil
 from os.path import basename, splitext
 from time import sleep
 from random import choice, randrange
+import traceback
 
 from benchmark.commands import CommandMaker
 from benchmark.config import (
@@ -48,13 +49,18 @@ class DASBench:
         subprocess.Popen(process, shell=True)
 
     def _kill_nodes(self):
-        hosts = self._get_hostnames()
-        cmd = CommandMaker.cleanup()
+        try:
+            hosts = self._get_hostnames()
+            cmd = CommandMaker.cleanup()
 
-        for host in hosts:
-            self._background_run(cmd, "/dev/null", host)
+            for host in hosts:
+                self._background_run(cmd, "/dev/null", host)
 
-        self.preserve_manager.kill_reservation("LAST")
+            self.preserve_manager.kill_reservation("LAST")
+        except Exception as e:
+            print(
+                f"""Exception : {str(e)}\nTraceback: {traceback.format_exc()}"""
+            )
     
     def _preserve_machines(self):
         # we need one machine per node (primary and workers are colocated) and 1 per 4 clients (which is nodes*workers)
@@ -86,7 +92,7 @@ class DASBench:
         Print.heading("Starting DAS benchmark")
 
         # Kill any previous testbed.
-        # self._kill_nodes()
+        self._kill_nodes()
 
         try:
             Print.info("Setting up testbed...")
@@ -161,7 +167,7 @@ class DASBench:
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
-                    PathMaker.db_path(i),
+                    PathMaker.db_path(i, username=self.username),
                     PathMaker.parameters_file(),
                     debug=debug,
                 )
@@ -175,7 +181,7 @@ class DASBench:
                     cmd = CommandMaker.run_worker(
                         PathMaker.key_file(i),
                         PathMaker.committee_file(),
-                        PathMaker.db_path(i, id),
+                        PathMaker.db_path(i, id, username=self.username),
                         PathMaker.parameters_file(),
                         id,  # The worker's id.
                         debug=debug,
@@ -189,7 +195,7 @@ class DASBench:
             sleep(self.duration)
             self._kill_nodes()
 
-            sleep(3)
+            sleep(5)
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")
