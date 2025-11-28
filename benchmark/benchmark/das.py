@@ -93,7 +93,7 @@ class DASBench:
             nodes, rate = self.nodes[0], self.rate[0]
 
             # Cleanup all files.
-            cmd = f"{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}"
+            cmd = f"{CommandMaker.clean_logs()} ; {CommandMaker.cleanup(self.username)}"
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             sleep(0.5)  # Removing the store may take time.
 
@@ -197,6 +197,9 @@ class DASBench:
                 PathMaker.logs_path(),
                 faults=self.faults,
             )
+
+            cmd = f"{CommandMaker.cleanup(username=self.username)}"
+            subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
             return log_values
         except (subprocess.SubprocessError, ParseError) as e:
