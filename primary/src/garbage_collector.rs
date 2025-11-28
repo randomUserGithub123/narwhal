@@ -1,6 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::Certificate;
 use crate::primary::PrimaryWorkerMessage;
+use crate::Round;
+
 use bytes::Bytes;
 use config::Committee;
 use crypto::PublicKey;
@@ -8,7 +10,7 @@ use network::SimpleSender;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Receives the highest round reached by consensus and update it for all tasks.
 pub struct GarbageCollector {
@@ -20,17 +22,22 @@ pub struct GarbageCollector {
     addresses: Vec<SocketAddr>,
     /// A network sender to notify our workers of cleanup events.
     network: SimpleSender,
+    /// Send back rounds that we successfully committed, firtst value is when it was committed, second round is the certificate round of proposal
+    tx_committed_own_headers: Sender<Round>,
+    /// Ourselves
+    us: PublicKey,
 }
 
 impl GarbageCollector {
     pub fn spawn(
-        name: &PublicKey,
+        name: PublicKey,
         committee: &Committee,
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<Certificate>,
+        tx_committed_own_headers: Sender<Round>,
     ) {
         let addresses = committee
-            .our_workers(name)
+            .our_workers(&name)
             .expect("Our public key or worker id is not in the committee")
             .iter()
             .map(|x| x.primary_to_worker)
@@ -42,6 +49,8 @@ impl GarbageCollector {
                 rx_consensus,
                 addresses,
                 network: SimpleSender::new(),
+                tx_committed_own_headers,
+                us: name,
             }
             .run()
             .await;
@@ -51,7 +60,6 @@ impl GarbageCollector {
     async fn run(&mut self) {
         let mut last_committed_round = 0;
         while let Some(certificate) = self.rx_consensus.recv().await {
-            // TODO [issue #9]: Re-include batch digests that have not been sequenced into our next block.
 
             let round = certificate.round();
             if round > last_committed_round {
@@ -67,6 +75,15 @@ impl GarbageCollector {
                     .broadcast(self.addresses.clone(), Bytes::from(bytes))
                     .await;
             }
+
+            // Report rounds in which we have our block committed
+            if certificate.header.author == self.us {
+                self.tx_committed_own_headers
+                    .send(round)
+                    .await
+                    .expect("Could not send own committed round back");
+            }
+
         }
     }
 }

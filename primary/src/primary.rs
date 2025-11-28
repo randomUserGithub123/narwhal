@@ -77,6 +77,9 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
 
+        // Re-injection
+        let (tx_committed_own_headers, rx_committed_own_headers) = channel(CHANNEL_CAPACITY);
+
         // Write the parameters to the logs.
         parameters.log();
 
@@ -156,7 +159,7 @@ impl Primary {
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_consensus);
+        GarbageCollector::spawn(name, &committee, consensus_round.clone(), rx_consensus, tx_committed_own_headers);
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
@@ -195,6 +198,7 @@ impl Primary {
             /* rx_core */ rx_parents,
             /* rx_workers */ rx_our_digests,
             /* tx_core */ tx_headers,
+            rx_committed_own_headers
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.

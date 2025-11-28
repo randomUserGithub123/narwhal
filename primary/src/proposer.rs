@@ -4,9 +4,8 @@ use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::debug;
-#[cfg(feature = "benchmark")]
-use log::info;
+use log::{debug, info};
+use std::collections::{BTreeMap, VecDeque};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -37,9 +36,18 @@ pub struct Proposer {
     /// Holds the certificates' ids waiting to be included in the next header.
     last_parents: Vec<Digest>,
     /// Holds the batches' digests waiting to be included in the next header.
-    digests: Vec<(Digest, WorkerId)>,
+    digests: VecDeque<(Digest, WorkerId)>,
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
+
+    /// Holds the map of proposed previous round headers and their digest messages, to ensure that
+    /// all batches' digest included will eventually be re-sent.
+    proposed_headers: BTreeMap<Round, (Header, VecDeque<(Digest, WorkerId)>)>,
+    /// Committed headers channel on which we get updates on which of
+    /// our own headers have been committed.
+    rx_committed_own_headers: Receiver<Round>,
+    /// The round of the maximum own header we committed
+    max_committed_header: Round,
 }
 
 impl Proposer {
@@ -53,6 +61,7 @@ impl Proposer {
         rx_core: Receiver<(Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId)>,
         tx_core: Sender<Header>,
+        rx_committed_own_headers: Receiver<Round>,
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
@@ -70,8 +79,11 @@ impl Proposer {
                 tx_core,
                 round: 1,
                 last_parents: genesis,
-                digests: Vec::with_capacity(2 * header_size),
+                digests: VecDeque::with_capacity(2 * header_size),
                 payload_size: 0,
+                proposed_headers: BTreeMap::new(),
+                rx_committed_own_headers,
+                max_committed_header: 0,
             }
             .run()
             .await;
@@ -79,11 +91,14 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
+
+        let header_digests: VecDeque<_> = self.digests.drain(..).collect();
+
         // Make a new header.
         let header = Header::new(
             self.name,
             self.round,
-            self.digests.drain(..).collect(),
+            header_digests.iter().cloned().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
         )
@@ -95,6 +110,9 @@ impl Proposer {
             // NOTE: This log entry is used to compute performance.
             info!("Created {} -> {:?}", header, digest);
         }
+
+        self.proposed_headers
+            .insert(self.round, (header.clone(), header_digests));
 
         // Send the new header to the `Core` that will broadcast and process it.
         self.tx_core
@@ -144,8 +162,61 @@ impl Proposer {
                 }
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
                     self.payload_size += digest.size();
-                    self.digests.push((digest, worker_id));
+                    self.digests.push_back((digest, worker_id));
                 }
+                Some(round) = self.rx_committed_own_headers.recv() => {
+                    debug!("Committed own header, round={}, header_round={}", self.round, round);
+
+                    // Remove committed headers from the list of pending
+                    self.max_committed_header = self.max_committed_header.max(round);
+                    let Some(_) = self.proposed_headers.remove(&round) else {
+                        info!("Own committed header not found at round {round}, probably because of restarts.");
+                        // There can still be later committed headers in proposed_headers.
+                        continue;
+                    };
+
+
+                    // Now for any round below the current commit round we re-insert
+                    // the batches into the digests we need to send, effectively re-sending
+                    // them in FIFO order.
+                    // Oldest to newest payloads.
+                    let mut digests_to_resend = VecDeque::new();
+                    // Oldest to newest rounds.
+                    let mut retransmit_rounds = Vec::new();
+
+                    // Iterate in order of rounds of our own headers.
+                    for (header_round, (_, included_digests)) in &mut self.proposed_headers {
+                        // Stop once we have processed headers at and below last committed round.
+                        if *header_round > self.max_committed_header  {
+                            break;
+                        }
+                        // Add payloads from oldest to newest.
+                        digests_to_resend.append(included_digests);
+                        retransmit_rounds.push(*header_round);
+                    }
+
+                    if !retransmit_rounds.is_empty() {
+                        let num_to_resend = digests_to_resend.len();
+                        // Since all of digests_to_resend are roughly newer than self.digests,
+                        // prepend digests_to_resend to the digests for the next header.
+                        digests_to_resend.append(&mut self.digests);
+                        self.digests = digests_to_resend;
+
+                        // Now delete the headers with batches we re-transmit
+                        for round in &retransmit_rounds {
+                            self.proposed_headers.remove(round);
+                        }
+
+                        debug!(
+                            "Retransmit {} batches in undelivered headers {:?} at commit round {:?}, remaining headers {}",
+                            num_to_resend,
+                            retransmit_rounds,
+                            self.round,
+                            self.proposed_headers.len()
+                        );
+
+                    }
+                },
                 () = &mut timer => {
                     // Nothing to do.
                 }
