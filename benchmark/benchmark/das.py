@@ -33,6 +33,7 @@ class DASBench:
         self.preserve_manager = PreserveManager(username)
         self.username = username
         self._wd = os.getcwd()
+        self._hostnames = None
 
     def __getattr__(self, attr):
         return getattr(self.bench_parameters, attr)
