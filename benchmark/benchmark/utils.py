@@ -63,6 +63,15 @@ class PathMaker:
     @staticmethod
     def results_path():
         return 'results'
+    
+    @staticmethod
+    def local_result_file(
+        faults, workers, nodes
+    ):
+        return join(
+            PathMaker.results_path(),
+            f"local-{faults}-{workers}-{nodes}.txt",
+        )
 
     @staticmethod
     def result_file(faults, nodes, workers, collocate, rate, tx_size):

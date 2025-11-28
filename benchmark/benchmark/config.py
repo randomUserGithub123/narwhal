@@ -2,6 +2,7 @@
 from json import dump, load
 from collections import OrderedDict
 
+import socket
 
 class ConfigError(Exception):
     pass
@@ -42,7 +43,7 @@ class Committee:
         }
     '''
 
-    def __init__(self, addresses, base_port):
+    def __init__(self, addresses, base_port, attack_types=None):
         ''' The `addresses` field looks as follows:
             { 
                 "name": ["host", "host", ...],
@@ -62,6 +63,8 @@ class Committee:
 
         port = base_port
         self.json = {'authorities': OrderedDict()}
+
+        counter = 0
         for name, hosts in addresses.items():
             host = hosts.pop(0)
             primary_addr = {
@@ -84,6 +87,13 @@ class Committee:
                 'primary': primary_addr,
                 'workers': workers_addr
             }
+
+            if(
+                attack_types != None
+            ):
+                self.json['authorities'][name]["attack_type"] = attack_types[counter]
+
+            counter += 1
 
     def primary_addresses(self, faults=0):
         ''' Returns an ordered list of primaries' addresses. '''
@@ -160,6 +170,23 @@ class LocalCommittee(Committee):
         addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
         super().__init__(addresses, port)
 
+class DASCommittee(Committee):
+    def __init__(self, names, port, workers, faults, hostnames):
+        assert isinstance(names, list)
+        assert all(isinstance(x, str) for x in names)
+        assert isinstance(port, int)
+        assert isinstance(workers, int) and workers > 0
+        assert isinstance(faults, int) and faults >= 0
+        # assert isinstance(attack_type, int) and attack_type <= 3
+        node_num = len(names)
+        collocate = len(hostnames) == node_num
+        node_amount = workers + 1
+        if collocate:
+            addresses = OrderedDict((x, [socket.gethostbyname(hostnames[i])] * node_amount) for i, x in enumerate(names))
+        else:
+            addresses = OrderedDict((x, list(map(socket.gethostbyname, hostnames[i*node_amount:(i+1)*node_amount]))) for i, x in enumerate(names))
+
+        super().__init__(addresses, port)
 
 class NodeParameters:
     def __init__(self, json):
