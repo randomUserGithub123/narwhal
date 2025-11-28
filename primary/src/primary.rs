@@ -132,6 +132,10 @@ impl Primary {
                         v
                     };
 
+                    info!(
+                        "FIFO SIZE : {}", fifo_vec.len()
+                    );
+
                     let fifo_vec_bytes = bincode::serialize(&fifo_vec)
                         .expect("failed to serialize fifo_vec for hashing");
 
@@ -256,7 +260,7 @@ impl Primary {
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
 
         // FEATURE: Global Order Graph
-        GlobalOrder::spawn(store.clone(), /* rx_workers */ rx_global_order);
+        // GlobalOrder::spawn(store.clone(), /* rx_workers */ rx_global_order);
 
         // Whenever the `Synchronizer` does not manage to validate a header due to missing parent certificates of
         // batch digests, it commands the `HeaderWaiter` to synchronizer with other nodes, wait for their reply, and

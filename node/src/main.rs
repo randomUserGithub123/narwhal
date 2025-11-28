@@ -10,6 +10,7 @@ use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::Worker;
+use primary::global_order::GlobalOrder;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -91,8 +92,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
-    // Channels the sequence of certificates.
-    let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
+    let (tx_analyzer, rx_analyzer) = channel(CHANNEL_CAPACITY);
 
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
@@ -100,6 +100,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         ("primary", Some(sub_matches)) => {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+            // Channels the sequence of certificates.
+            let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
             
             let is_byzantine = sub_matches
                 .value_of("is_byzantine")
@@ -111,17 +113,25 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 keypair,
                 committee.clone(),
                 parameters.clone(),
-                store,
+                store.clone(),
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
             Consensus::spawn(
-                committee,
+                committee.clone(),
                 parameters.gc_depth,
                 /* rx_primary */ rx_new_certificates,
                 /* tx_primary */ tx_feedback,
                 tx_output,
             );
+
+            // FEATURE: Global Order Graph
+            GlobalOrder::spawn(
+                committee,
+                store, 
+                /* rx_workers */ rx_output
+            );
+
         }
 
         // Spawn a single worker.
@@ -137,7 +147,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     }
 
     // Analyze the consensus' output.
-    analyze(rx_output).await;
+    analyze(rx_analyzer).await;
 
     // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();

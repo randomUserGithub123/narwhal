@@ -74,7 +74,7 @@ pub struct Consensus {
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     tx_primary: Sender<Certificate>,
     /// Outputs the sequence of ordered certificates to the application layer.
-    tx_output: Sender<Certificate>,
+    tx_output: Sender<(Certificate, Certificate)>,
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
@@ -86,7 +86,7 @@ impl Consensus {
         gc_depth: Round,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
-        tx_output: Sender<Certificate>,
+        tx_output: Sender<(Certificate, Certificate)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -158,7 +158,8 @@ impl Consensus {
 
             // Get an ordered list of past leaders that are linked to the current leader.
             debug!("Leader {:?} has enough support", leader);
-            let mut sequence = Vec::new();
+
+            // let mut sequence = Vec::new();
             for leader in self.order_leaders(leader, &state).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                 for x in self.order_dag(leader, &state) {
@@ -166,7 +167,27 @@ impl Consensus {
                     state.update(&x, self.gc_depth);
 
                     // Add the certificate to the sequence.
-                    sequence.push(x);
+                    // sequence.push(x);
+
+                    #[cfg(not(feature = "benchmark"))]
+                    info!("Committed {}", x.header);
+
+                    #[cfg(feature = "benchmark")]
+                    for digest in x.header.payload.keys() {
+                        // NOTE: This log entry is used to compute performance.
+                        info!("Committed {} -> {:?}", x.header, digest);
+                    }
+
+                    self.tx_primary
+                        .send(x.clone())
+                        .await
+                        .expect("Failed to send certificate to primary");
+
+                    self.tx_output
+                        .send((leader.clone(), x))
+                        .await
+                        .expect("Failed to output certificate");
+                    
                 }
             }
 
@@ -177,26 +198,26 @@ impl Consensus {
                 }
             }
 
-            // Output the sequence in the right order.
-            for certificate in sequence {
-                #[cfg(not(feature = "benchmark"))]
-                info!("Committed {}", certificate.header);
+            // // Output the sequence in the right order.
+            // for certificate in sequence {
+            //     #[cfg(not(feature = "benchmark"))]
+            //     info!("Committed {}", certificate.header);
 
-                #[cfg(feature = "benchmark")]
-                for digest in certificate.header.payload.keys() {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", certificate.header, digest);
-                }
+            //     #[cfg(feature = "benchmark")]
+            //     for digest in certificate.header.payload.keys() {
+            //         // NOTE: This log entry is used to compute performance.
+            //         info!("Committed {} -> {:?}", certificate.header, digest);
+            //     }
 
-                self.tx_primary
-                    .send(certificate.clone())
-                    .await
-                    .expect("Failed to send certificate to primary");
+            //     self.tx_primary
+            //         .send(certificate.clone())
+            //         .await
+            //         .expect("Failed to send certificate to primary");
 
-                if let Err(e) = self.tx_output.send(certificate).await {
-                    warn!("Failed to output certificate: {}", e);
-                }
-            }
+            //     if let Err(e) = self.tx_output.send(certificate).await {
+            //         warn!("Failed to output certificate: {}", e);
+            //     }
+            // }
         }
     }
 

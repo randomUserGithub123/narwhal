@@ -19,6 +19,7 @@ log = "0.4.11"
 async-recursion = "0.3.2"
 async-trait = "0.1.50"
 petgraph = "0.8.3"
+nohash-hasher = "0.2.0"
 
 crypto = { path = "../crypto" }
 store = { path = "../store" }

@@ -300,12 +300,12 @@ impl Core {
         let id = certificate.header.id.clone();
 
         // FEATURE: Global Order Graph
-        if let Err(e) = self.tx_global_order.send(certificate.clone()).await {
-            warn!(
-                "Failed to deliver certificate {} to the consensus: {}",
-                id, e
-            );
-        }
+        // if let Err(e) = self.tx_global_order.send(certificate.clone()).await {
+        //     warn!(
+        //         "Failed to deliver certificate {} to the consensus: {}",
+        //         id, e
+        //     );
+        // }
 
         if let Err(e) = self.tx_consensus.send(certificate).await {
             warn!(
