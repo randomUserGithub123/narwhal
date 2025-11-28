@@ -87,7 +87,7 @@ class DASBench:
             return self._hostnames
         return []
 
-    def run(self, debug=False, flamegraph=False, console=False, build=True):
+    def run(self, debug=False, console=False, build=True):
         assert isinstance(debug, bool)
         Print.heading("Starting DAS benchmark")
 

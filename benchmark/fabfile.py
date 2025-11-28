@@ -38,20 +38,16 @@ def local(ctx, debug=True):
         Print.error(e)
 
 @task
-def das(ctx, debug=True, flamegraph=False, console=False, build=True, username="mputnik"):
-    for ff, wks, nds, rs in [
-        (0, 1, 4, 3),
-        (0, 1, 10, 3),
+def das(ctx, debug=True, console=False, build=True, username="mputnik"):
+    for faults, workers_per_node, nodes, runs in [
+        (0, 1, 4, 1),
+        (0, 1, 10, 1),
     ]:
         """Run benchmarks on DAS5"""
-        runs = rs
-        faults = ff
-        workers = wks
-        nodes = nds
         bench_params = {
-            'faults': 0,
-            'nodes': 4,
-            'workers': 1,
+            'faults': faults,
+            'nodes': nodes,
+            'workers': workers_per_node,
             'rate': 50_000,
             'tx_size': 512,
             'duration': 60,
@@ -71,12 +67,12 @@ def das(ctx, debug=True, flamegraph=False, console=False, build=True, username="
         try:
             filename = PathMaker.local_result_file(
                 faults,
-                workers,
+                workers_per_node,
                 nodes,
             )
             for i in range(runs):
                 print(f"DAS run {i}\n")
-                ret = DASBench(bench_params, node_params, username).run(debug, flamegraph, console, build)
+                ret = DASBench(bench_params, node_params, username).run(debug, console, build)
                 print(ret.result())
                 ret.print(filename)
                 
