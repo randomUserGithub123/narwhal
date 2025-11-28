@@ -81,7 +81,7 @@ class LocalBench:
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(self.faults)
-            rate_share = ceil(rate / committee.workers())
+            rate_share = ceil(rate / (committee.workers() * committee.size()))
 
             ### Default Narwhal Approach : 
             # for i, addresses in enumerate(workers_addresses):
