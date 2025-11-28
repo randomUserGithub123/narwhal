@@ -7,18 +7,22 @@ use env_logger::Env;
 use futures::future::join_all;
 use futures::sink::SinkExt as _;
 use log::{info, warn};
+use rand::seq::SliceRandom;
 use rand::Rng;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+const TIMEOUT: u64 = 60_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
         .about("Benchmark client for Narwhal and Tusk.")
-        .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
+        .args_from_usage("<ADDRS> 'The network addresses of the nodes where to send txs, comma separated with no spaces'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
@@ -29,11 +33,12 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    let target = matches
-        .value_of("ADDR")
+    let targets = matches
+        .value_of("ADDRS")
         .unwrap()
-        .parse::<SocketAddr>()
-        .context("Invalid socket address format")?;
+        .split(",")
+        .filter_map(|s| s.parse::<SocketAddr>().ok())
+        .collect::<Vec<_>>();
     let size = matches
         .value_of("size")
         .unwrap()
@@ -47,12 +52,11 @@ async fn main() -> Result<()> {
     let nodes = matches
         .values_of("nodes")
         .unwrap_or_default()
-        .into_iter()
         .map(|x| x.parse::<SocketAddr>())
         .collect::<Result<Vec<_>, _>>()
         .context("Invalid socket address format")?;
 
-    info!("Node address: {}", target);
+    info!("Node addresses: {:?}", targets);
 
     // NOTE: This log entry is used to compute performance.
     info!("Transactions size: {} B", size);
@@ -61,7 +65,7 @@ async fn main() -> Result<()> {
     info!("Transactions rate: {} tx/s", rate);
 
     let client = Client {
-        target,
+        targets,
         size,
         rate,
         nodes,
@@ -75,7 +79,7 @@ async fn main() -> Result<()> {
 }
 
 struct Client {
-    target: SocketAddr,
+    targets: Vec<SocketAddr>,
     size: usize,
     rate: u64,
     nodes: Vec<SocketAddr>,
@@ -83,7 +87,7 @@ struct Client {
 
 impl Client {
     pub async fn send(&self) -> Result<()> {
-        const PRECISION: u64 = 20; // Sample precision.
+        const PRECISION: u64 = 1; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
         // The transaction size must be at least 16 bytes to ensure all txs are different.
@@ -93,17 +97,27 @@ impl Client {
             ));
         }
 
-        // Connect to the mempool.
-        let stream = TcpStream::connect(self.target)
-            .await
-            .context(format!("failed to connect to {}", self.target))?;
+        // let n = self.targets.len();
+
+        let futures = self.targets.iter().map(|target| async move {
+            TcpStream::connect(target).await.expect("Could not connect")
+        });
+
+        let streams = join_all(futures).await;
 
         // Submit all transactions.
+        let mut rng = rand::thread_rng();
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
-        let mut counter = 0;
-        let mut r = rand::thread_rng().gen();
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+        let starting_counter: u64 = rng.gen();
+        let mut counter = starting_counter; // counter is also random as we send transactions to multiple workers
+        let mut r: u64 = rng.gen();
+        let mut transports = Vec::with_capacity(streams.len());
+
+        for stream in streams {
+            let transport = Framed::new(stream, LengthDelimitedCodec::new());
+            transports.push(transport);
+        }
         let interval = interval(Duration::from_millis(BURST_DURATION));
         tokio::pin!(interval);
 
@@ -115,7 +129,7 @@ impl Client {
             let now = Instant::now();
 
             for x in 0..burst {
-                if x == counter % burst {
+                if x == (counter - starting_counter) % burst {
                     // NOTE: This log entry is used to compute performance.
                     info!("Sending sample transaction {}", counter);
 
@@ -129,9 +143,32 @@ impl Client {
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
-                if let Err(e) = transport.send(bytes).await {
-                    warn!("Failed to send transaction: {}", e);
-                    break 'main;
+                transports.shuffle(&mut rng);
+                for transport in &mut transports {
+                    let dst_addr = {
+                        if let Ok(a) = transport.get_ref().peer_addr() {
+                            a
+                        } else {
+                            break 'main;
+                        }
+                    };
+                    //info!("Sending tx from {}", src_addr);
+                    let result = timeout(Duration::from_millis(TIMEOUT), async {
+                        if let Err(e) = transport.send(bytes.clone()).await {
+                            warn!("Failed to send transaction: {}", e);
+                            // break 'main;
+
+                            // we do not want to stop in case of error as we send to multiple workers anyway
+                        }
+                        "Done sending"
+                    })
+                    .await;
+                    match result {
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!("Sending timed out from {} after {}", dst_addr, err);
+                        }
+                    }
                 }
             }
             if now.elapsed().as_millis() > BURST_DURATION as u128 {

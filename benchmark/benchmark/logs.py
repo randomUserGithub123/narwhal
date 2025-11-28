@@ -5,6 +5,7 @@ from multiprocessing import Pool
 from os.path import join
 from re import findall, search
 from statistics import mean
+from collections import defaultdict
 
 from benchmark.utils import Print
 
@@ -38,6 +39,13 @@ class LogParser:
             = zip(*results)
         self.misses = sum(misses)
 
+        # self.sent_samples is a tuple of dictionaries. each element is for one client
+        # each dictionary has sample_tx id -> timestamp, used for throughput/latencies
+
+        self.all_sent_samples = {}
+        for d in self.sent_samples:
+            self.all_sent_samples.update(d)
+
         # Parse the primaries logs.
         try:
             with Pool() as p:
@@ -47,6 +55,9 @@ class LogParser:
         proposals, commits, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
+
+        # self.proposals stores for each batch the creation time of the block containing it
+        # self.commits has the earliest commit time for each batch
 
         # Parse the workers logs.
         try:
@@ -59,6 +70,13 @@ class LogParser:
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
+        # self.received_samples is a tuple, for each worker it contains the batch in which it placed a specific sample transaction
+        # transactions maybe duplicated and may not be in every worker
+
+        self.all_received_samples = self._merge_dicts(self.received_samples)
+
+        self._avg_redundancy() # this saves it into self.avg_redundancy
+
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
 
@@ -67,6 +85,14 @@ class LogParser:
             Print.warn(
                 f'Clients missed their target rate {self.misses:,} time(s)'
             )
+
+    def _merge_dicts(self, input):
+        merged_dict = defaultdict(list)
+        for d in input:
+            for k, v in d.items():
+                merged_dict[k].append(v)
+        
+        return dict(merged_dict)
 
     def _merge_results(self, input):
         # Keep the earliest timestamp.
@@ -78,7 +104,7 @@ class LogParser:
         return merged
 
     def _parse_clients(self, log):
-        if search(r'Error', log) is not None:
+        if search(r"(?:panicked|Error)", log) is not None:
             raise ParseError('Client(s) panicked')
 
         size = int(search(r'Transactions size: (\d+)', log).group(1))
@@ -157,7 +183,9 @@ class LogParser:
             return 0, 0, 0
         start, end = min(self.proposals.values()), max(self.commits.values())
         duration = end - start
-        bytes = sum(self.sizes.values())
+        # this is all bytes, but does not consider redundancy. we compute on average how many times is each sample transaction repeated and divide by that
+        bytes = sum(self.sizes.values()) / self.avg_redundancy
+
         bps = bytes / duration
         tps = bps / self.size[0]
         return tps, bps, duration
@@ -171,21 +199,37 @@ class LogParser:
             return 0, 0, 0
         start, end = min(self.start), max(self.commits.values())
         duration = end - start
-        bytes = sum(self.sizes.values())
+        # this is all bytes, but does not consider redundancy. we compute on average how many times is each sample transaction repeated and divide by that
+        bytes = sum(self.sizes.values()) / self.avg_redundancy
+
         bps = bytes / duration
         tps = bps / self.size[0]
         return tps, bps, duration
 
     def _end_to_end_latency(self):
         latency = []
-        for sent, received in zip(self.sent_samples, self.received_samples):
-            for tx_id, batch_id in received.items():
+        for tx_id, batches_ids in self.all_received_samples.items():
+            min_time = None
+            assert tx_id in self.all_sent_samples
+            start = self.all_sent_samples[tx_id]
+
+            for batch_id in batches_ids:
                 if batch_id in self.commits:
-                    assert tx_id in sent  # We receive txs that we sent.
-                    start = sent[tx_id]
                     end = self.commits[batch_id]
-                    latency += [end-start]
+                    min_time = min(min_time, end-start) if min_time else end-start # get first committed batch
+
+            if min_time:
+                latency.append(min_time)
+
         return mean(latency) if latency else 0
+    
+    def _avg_redundancy(self):
+        # basically each transaction is in one batch per primary, as we send transactions to one worker per primary
+        # compute mean of lens of self.all_received_samples
+        
+        lengths = [len(batches) for batches in self.all_received_samples.values()]
+        
+        self.avg_redundancy = mean(lengths)
 
     def result(self):
         header_size = self.configs[0]['header_size']
@@ -224,6 +268,7 @@ class LogParser:
             f' Max batch delay: {max_batch_delay:,} ms\n'
             '\n'
             ' + RESULTS:\n'
+            f' Average Redundancy: Transactions are in {round(self.avg_redundancy, 2)} batches\n'
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
             f' Consensus latency: {round(consensus_latency):,} ms\n'
