@@ -81,11 +81,18 @@ class LocalBench:
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(self.faults)
-            rate_share = ceil(rate / (committee.workers() * committee.size()))
 
-            ### Default Narwhal Approach : 
+            # ### Default Narwhal Approach : 
+
+            # # Exclude OF_worker as clients do not send txs to it
+            # rate_share = ceil(rate / (committee.workers() - committee.size()))
+
             # for i, addresses in enumerate(workers_addresses):
             #     for id, address in addresses:
+            #         if(
+            #             int(id) == 0 # Clients do not send txs to OF_worker
+            #         ):
+            #             continue
             #         cmd = CommandMaker.run_client(
             #             address,
             #             self.tx_size,
@@ -103,9 +110,12 @@ class LocalBench:
                 []
             )  # list of lists, contains addressess of each worker each client should connect to
 
+            # Exclude OF_worker as clients do not send txs to it
+            rate_share = ceil(rate / ((committee.workers() - committee.size()) * committee.size()))
+
             # For each client, choose one worker id. communicate with all workers with that id
-            for c_id in range(committee.workers()):
-                worker_id = c_id % self.workers
+            for c_id in range(committee.workers() - committee.size()):
+                worker_id = (c_id % (self.workers - 1)) + 1
                 workers = []
                 for addresses in workers_addresses:
                     for w_id, w_address in addresses:

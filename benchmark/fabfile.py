@@ -17,7 +17,7 @@ def local(ctx, debug=True):
     bench_params = {
         'faults': 0,
         'nodes': 4,
-        'workers': 1,
+        'workers': 2,
         'rate': 50_000,
         'tx_size': 512,
         'duration': 20,
@@ -29,8 +29,13 @@ def local(ctx, debug=True):
         'sync_retry_delay': 10_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
-        'max_batch_delay': 200  # ms
+        'max_batch_delay': 200,  # ms
+        "LO_size": 500, # number of entries in LocalOrder queue
+        "LO_max_delay": 200, # ms
     }
+
+    assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
+
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
         print(ret.result())
@@ -40,8 +45,8 @@ def local(ctx, debug=True):
 @task
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for faults, workers_per_node, nodes, runs in [
-        (0, 1, 4, 1),
-        (0, 1, 10, 1),
+        (0, 2, 4, 1),
+        (0, 2, 10, 1),
     ]:
         """Run benchmarks on DAS5"""
         bench_params = {
@@ -61,7 +66,12 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 500_000,  # bytes
             "max_batch_delay": 200,  # ms
+            "LO_size": 500, # number of entries in LocalOrder queue
+            "LO_max_delay": 200, # ms
         }
+
+        assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
+
         if console:
             os.system('export RUSTFLAGS="--cfg tokio_unstable"')
         try:
