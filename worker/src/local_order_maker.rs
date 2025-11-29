@@ -1,21 +1,16 @@
+use crate::batch_maker::Batch;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use crypto::{Digest, PublicKey};
-#[cfg(feature = "benchmark")]
-use ed25519_dalek::{Digest as _, Sha512};
-#[cfg(feature = "benchmark")]
-use log::info;
 use network::ReliableSender;
-#[cfg(feature = "benchmark")]
-use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use std::collections::{VecDeque, HashSet};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
-pub type LocalOrder = VecDeque<Digest>;
+pub type LocalOrder = VecDeque<Vec<u8>>;
 
 /// Assemble clients tx_digests into LocalOrder.
 pub struct LocalOrderMaker {
@@ -27,6 +22,9 @@ pub struct LocalOrderMaker {
     rx_tx_digests: Receiver<Digest>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
+
+    tx_local_orders: Sender<Batch>,
+
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current LocalOrder.
@@ -46,6 +44,7 @@ impl LocalOrderMaker {
         max_lo_delay: u64,
         rx_tx_digests: Receiver<Digest>,
         tx_message: Sender<QuorumWaiterMessage>,
+        tx_local_orders: Sender<Batch>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
@@ -54,6 +53,7 @@ impl LocalOrderMaker {
                 max_lo_delay,
                 rx_tx_digests,
                 tx_message,
+                tx_local_orders,
                 workers_addresses,
                 current_local_order: LocalOrder::with_capacity(lo_size * 2),
                 seen_tx_digests: HashSet::new(),
@@ -75,7 +75,7 @@ impl LocalOrderMaker {
                 Some(tx_digest) = self.rx_tx_digests.recv() => {
                     if self.seen_tx_digests.insert(tx_digest.clone()) {
                         self.current_lo_size += 1;
-                        self.current_local_order.push_back(tx_digest);
+                        self.current_local_order.push_back(tx_digest.to_vec());
                         if self.current_lo_size >= self.lo_size {
                             self.seal().await;
                             timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_lo_delay));
@@ -97,33 +97,35 @@ impl LocalOrderMaker {
         }
     }
 
-    /// Seal and broadcast the current batch.
+    /// Seal and broadcast the current LocalOrder.
     async fn seal(&mut self) {
 
-        // Serialize the batch.
+        // Serialize the local order.
         self.current_lo_size = 0;
         let local_order: Vec<_> = self.current_local_order.drain(..).collect();
 
-        log::info!(
-            "LocalOrder : {:?}", local_order
-        );
+        // Send to global_order.rs
+        self.tx_local_orders
+            .send(local_order.clone())
+            .await
+            .expect("Failed to send LocalOrder");
 
-        // let message = WorkerMessage::Batch(batch);
-        // let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
+        let message = WorkerMessage::Batch(local_order);
+        let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
-        // // Broadcast the batch through the network.
-        // let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
-        // let bytes = Bytes::from(serialized.clone());
-        // let handlers = self.network.broadcast(addresses, bytes).await;
+        // Broadcast the LocalOrder through the network.
+        let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+        let bytes = Bytes::from(serialized.clone());
+        let handlers = self.network.broadcast(addresses, bytes).await;
 
-        // // Send the batch through the deliver channel for further processing.
-        // self.tx_message
-        //     .send(QuorumWaiterMessage {
-        //         batch: serialized,
-        //         handlers: names.into_iter().zip(handlers.into_iter()).collect(),
-        //     })
-        //     .await
-        //     .expect("Failed to deliver batch");
+        // Send the batch through the deliver channel for further processing.
+        self.tx_message
+            .send(QuorumWaiterMessage {
+                batch: serialized,
+                handlers: names.into_iter().zip(handlers.into_iter()).collect(),
+            })
+            .await
+            .expect("Failed to deliver batch");
 
     }
 }

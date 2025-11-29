@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::global_order::GlobalOrder;
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
@@ -229,6 +230,7 @@ impl Worker {
 
         let (tx_processor_transaction, rx_processor_transaction) = channel(CHANNEL_CAPACITY);
         let (tx_tx_digests, rx_tx_digests) = channel(CHANNEL_CAPACITY);
+        let (tx_local_orders, rx_local_orders) = channel(CHANNEL_CAPACITY);
 
         let own_worker_id = self.id;
         let of_worker_address = self.committee
@@ -251,7 +253,8 @@ impl Worker {
                 tx_helper,
                 tx_processor,
                 tx_processor_transaction,
-                tx_tx_digests
+                tx_tx_digests,
+                tx_local_orders: tx_local_orders.clone()
             },
         );
 
@@ -276,17 +279,22 @@ impl Worker {
         );
 
         if own_worker_id == 0 {
+            
             LocalOrderMaker::spawn(
                 self.parameters.lo_size, 
                 self.parameters.lo_max_delay, 
                 rx_tx_digests, 
                 tx_quorum_waiter, 
+                tx_local_orders,
                 self.committee
                     .others_workers(&self.name, &self.id)
                     .iter()
                     .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                     .collect(),
             );
+
+            GlobalOrder::spawn(rx_local_orders);
+
         }
 
         info!(
@@ -332,7 +340,8 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tx_processor_transaction: Sender<Transaction>,
-    tx_tx_digests: Sender<Digest>
+    tx_tx_digests: Sender<Digest>,
+    tx_local_orders: Sender<Batch>
 }
 
 #[async_trait]
@@ -362,6 +371,12 @@ impl MessageHandler for WorkerReceiverHandler {
                             .await
                             .expect("Failed to send tx");
                     }
+                }else{
+                    // Send to global_order.rs
+                    self.tx_local_orders
+                        .send(batch)
+                        .await
+                        .expect("Failed to send LocalOrder");
                 }
 
                 self
@@ -369,6 +384,7 @@ impl MessageHandler for WorkerReceiverHandler {
                     .send(serialized.to_vec())
                     .await
                     .expect("Failed to send batch");
+                
             },
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper

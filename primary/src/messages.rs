@@ -15,6 +15,7 @@ pub struct Header {
     pub author: PublicKey,
     pub round: Round,
     pub payload: BTreeMap<Digest, WorkerId>,
+    pub local_orderings: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
     pub id: Digest,
     pub signature: Signature,
@@ -25,6 +26,7 @@ impl Header {
         author: PublicKey,
         round: Round,
         payload: BTreeMap<Digest, WorkerId>,
+        local_orderings: BTreeMap<Digest, WorkerId>,
         parents: BTreeSet<Digest>,
         signature_service: &mut SignatureService,
     ) -> Self {
@@ -32,6 +34,7 @@ impl Header {
             author,
             round,
             payload,
+            local_orderings,
             parents,
             id: Digest::default(),
             signature: Signature::default(),
@@ -59,6 +62,11 @@ impl Header {
                 .worker(&self.author, &worker_id)
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
+        for worker_id in self.local_orderings.values() {
+            committee
+                .worker(&self.author, &worker_id)
+                .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
+        }
 
         // Check the signature.
         self.signature
@@ -73,6 +81,10 @@ impl Hash for Header {
         hasher.update(&self.author);
         hasher.update(self.round.to_le_bytes());
         for (x, y) in &self.payload {
+            hasher.update(x);
+            hasher.update(y.to_le_bytes());
+        }
+        for (x, y) in &self.local_orderings {
             hasher.update(x);
             hasher.update(y.to_le_bytes());
         }

@@ -99,6 +99,7 @@ impl Proposer {
             self.name,
             self.round,
             header_digests.iter().cloned().collect(),
+            VecDeque::new().iter().cloned().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
         )

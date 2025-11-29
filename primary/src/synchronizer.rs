@@ -71,6 +71,12 @@ impl Synchronizer {
                 missing.insert(digest.clone(), *worker_id);
             }
         }
+        for (digest, worker_id) in header.local_orderings.iter() {
+            let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
+            if self.store.read(key).await?.is_none() {
+                missing.insert(digest.clone(), *worker_id);
+            }
+        }
 
         if missing.is_empty() {
             return Ok(false);

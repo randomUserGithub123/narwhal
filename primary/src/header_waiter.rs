@@ -229,6 +229,9 @@ impl HeaderWaiter {
                         for x in header.payload.keys() {
                             let _ = self.batch_requests.remove(x);
                         }
+                        for x in header.local_orderings.keys() {
+                            let _ = self.batch_requests.remove(x);
+                        }
                         for x in &header.parents {
                             let _ = self.parent_requests.remove(x);
                         }

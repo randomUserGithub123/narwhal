@@ -263,11 +263,17 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
-                .tx_our_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
+                if worker_id != 0 {
+                    self
+                        .tx_our_digests
+                        .send((digest, worker_id))
+                        .await
+                        .expect("Failed to send workers' digests")
+                }else{
+                    // TODO: We need to fill in the Header with this LocalOrder
+                }
+            },
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
                 .tx_others_digests
                 .send((digest, worker_id))

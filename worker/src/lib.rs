@@ -7,6 +7,7 @@ mod quorum_waiter;
 mod synchronizer;
 mod worker;
 mod local_order_maker;
+mod global_order;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]
