@@ -95,20 +95,18 @@ class Committee:
 
             counter += 1
 
-    def primary_addresses(self, faults=0):
+    def primary_addresses(self):
         ''' Returns an ordered list of primaries' addresses. '''
-        assert faults < self.size()
         addresses = []
-        good_nodes = self.size() - faults
+        good_nodes = self.size()
         for authority in list(self.json['authorities'].values())[:good_nodes]:
             addresses += [authority['primary']['primary_to_primary']]
         return addresses
 
-    def workers_addresses(self, faults=0):
+    def workers_addresses(self):
         ''' Returns an ordered list of list of workers' addresses. '''
-        assert faults < self.size()
         addresses = []
-        good_nodes = self.size() - faults
+        good_nodes = self.size()
         for authority in list(self.json['authorities'].values())[:good_nodes]:
             authority_addresses = []
             for id, worker in authority['workers'].items():
@@ -201,11 +199,15 @@ class NodeParameters:
             inputs += [json['max_batch_delay']]
             inputs += [json['lo_size']]
             inputs += [json['lo_max_delay']]
+            inputs += [json['faults']]
         except KeyError as e:
             raise ConfigError(f'Malformed parameters: missing key {e}')
 
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
+        
+        if not isinstance(json['gamma'], float):
+            raise ConfigError('Invalid parameters type: gamma')
 
         self.json = json
 

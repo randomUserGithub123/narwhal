@@ -15,8 +15,8 @@ from benchmark.das import DASBench
 def local(ctx, debug=True):
     ''' Run benchmarks on localhost '''
     bench_params = {
-        'faults': 0,
-        'nodes': 4,
+        'faults': 1,
+        'nodes': 5,
         'workers': 2,
         'rate': 50_000,
         'tx_size': 512,
@@ -32,9 +32,21 @@ def local(ctx, debug=True):
         'max_batch_delay': 200,  # ms
         "lo_size": 500, # number of entries in LocalOrder queue
         "lo_max_delay": 200, # ms
+        "gamma": 1.0, # batch-OF parameter
     }
 
+    node_params.update(
+        {
+            "faults": bench_params["faults"]
+        }
+    )
+
     assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
+    assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+    assert bench_params['nodes'] > (
+        (4 * node_params['faults']) /
+        (2 * node_params['gamma'] - 1)
+    )
 
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
@@ -45,8 +57,8 @@ def local(ctx, debug=True):
 @task
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for faults, workers_per_node, nodes, runs in [
-        (0, 2, 4, 1),
-        (0, 2, 10, 1),
+        (1, 2, 5, 1),
+        (1, 2, 9, 1),
     ]:
         """Run benchmarks on DAS5"""
         bench_params = {
@@ -68,9 +80,21 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "max_batch_delay": 200,  # ms
             "lo_size": 500, # number of entries in LocalOrder queue
             "lo_max_delay": 200, # ms
+            "gamma": 1.0, # batch-OF parameter
         }
 
+        node_params.update(
+            {
+                "faults": bench_params["faults"]
+            }
+        )
+
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
+        assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+        assert bench_params['nodes'] > (
+            (4 * node_params['faults']) /
+            (2 * node_params['gamma'] - 1)
+        )
 
         if console:
             os.system('export RUSTFLAGS="--cfg tokio_unstable"')

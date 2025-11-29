@@ -62,17 +62,17 @@ impl GlobalOrder {
             
             let start_time = std::time::Instant::now();
 
-            let indices: Vec<usize> = local_order
-                .into_iter()
-                .map(|digest| self.index_for_digest(digest))
-                .collect();
+            // let indices: Vec<usize> = local_order
+            //     .into_iter()
+            //     .map(|digest| self.index_for_digest(digest))
+            //     .collect();
 
-            for (pos, &i) in indices.iter().enumerate() {
-                self.vertex_status[i] += 1;
-                for &j in &indices[pos + 1..] {
-                    self.weight_matrix[i][j] += 1;
-                }
-            }
+            // for (pos, &i) in indices.iter().enumerate() {
+            //     self.vertex_status[i] += 1;
+            //     for &j in &indices[pos + 1..] {
+            //         self.weight_matrix[i][j] += 1;
+            //     }
+            // }
 
             log::info!(
                 "TIME IT TOOK : {}", start_time.elapsed().as_nanos()

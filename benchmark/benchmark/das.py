@@ -4,7 +4,7 @@ import datetime
 from math import ceil
 from os.path import basename, splitext
 from time import sleep
-from random import choice, randrange
+from random import choice, randrange, sample
 import traceback
 
 from benchmark.commands import CommandMaker
@@ -145,7 +145,7 @@ class DASBench:
             self.node_parameters.print(PathMaker.parameters_file())
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
+            workers_addresses = committee.workers_addresses()
             
             # ### Default Narwhal Approach : 
 
@@ -205,20 +205,27 @@ class DASBench:
                 print(f"Launching client on {clients_hostnames[i // 4]}")
                 self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
-            # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
+            # Run the primaries.
+            faulty_node_ids = sample(
+                list(range(0, nodes)),
+                self.faults
+            )
+            for i, address in enumerate(committee.primary_addresses()):
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i, username=self.username),
                     PathMaker.parameters_file(),
+                    is_byzantine=int(
+                        i in faulty_node_ids
+                    ),
                     debug=debug,
                 )
                 log_file = PathMaker.primary_log_file(i)
                 print(f"Launching primary on {address}")
                 self._background_run(cmd, log_file, address.split(":")[0])
 
-            # Run the workers (except the faulty ones).
+            # Run the workers.
             for i, addresses in enumerate(workers_addresses):
                 for id, address in addresses:
                     cmd = CommandMaker.run_worker(
@@ -227,6 +234,9 @@ class DASBench:
                         PathMaker.db_path(i, id, username=self.username),
                         PathMaker.parameters_file(),
                         id,  # The worker's id.
+                        is_byzantine=int(
+                            i in faulty_node_ids
+                        ),
                         debug=debug,
                     )
                     log_file = PathMaker.worker_log_file(i, id)

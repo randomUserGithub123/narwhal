@@ -53,6 +53,10 @@ pub struct Worker {
     parameters: Parameters,
     /// The persistent storage.
     store: Store,
+
+    /// Byzantine boolean
+    is_byzantine: bool
+
 }
 
 impl Worker {
@@ -62,6 +66,7 @@ impl Worker {
         committee: Committee,
         parameters: Parameters,
         store: Store,
+        is_byzantine: bool
     ) {
         // Define a worker instance.
         let worker = Self {
@@ -70,6 +75,7 @@ impl Worker {
             committee,
             parameters,
             store,
+            is_byzantine
         };
 
         // Spawn all worker tasks.
@@ -108,6 +114,8 @@ impl Worker {
     fn handle_primary_messages(&self) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
+        let is_byzantine = self.is_byzantine;
+
         // Receive incoming messages from our primary.
         let mut address = self
             .committee
@@ -118,7 +126,10 @@ impl Worker {
         Receiver::spawn(
             address,
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer },
+            PrimaryReceiverHandler { 
+                is_byzantine,
+                tx_synchronizer 
+            },
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -158,6 +169,8 @@ impl Worker {
             .expect("OF_worker address exists")
             .worker_to_worker;
 
+        let is_byzantine = self.is_byzantine;
+
         // We first receive clients' transactions from the network.
         let mut address = self
             .committee
@@ -168,6 +181,7 @@ impl Worker {
         Receiver::spawn(
             address,
             /* handler */ TxReceiverHandler { 
+                is_byzantine,
                 own_worker_id,
                 tx_batch_maker,
             },
@@ -238,6 +252,8 @@ impl Worker {
             .expect("OF_worker address exists")
             .worker_to_worker;
 
+        let is_byzantine = self.is_byzantine;
+
         // Receive incoming messages from other workers.
         let mut address = self
             .committee
@@ -249,6 +265,7 @@ impl Worker {
             address,
             /* handler */
             WorkerReceiverHandler {
+                is_byzantine,
                 own_worker_id,
                 tx_helper,
                 tx_processor,
@@ -307,6 +324,7 @@ impl Worker {
 /// Defines how the network receiver handles incoming transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
+    is_byzantine: bool,
     own_worker_id: WorkerId,
     tx_batch_maker: Sender<Transaction>,
 }
@@ -315,16 +333,16 @@ struct TxReceiverHandler {
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         
-        if self.own_worker_id == 0{
-            
-        }else{
+        if !self.is_byzantine{
+            if self.own_worker_id != 0{
 
-            // Send the transaction to the batch maker.
-            self.tx_batch_maker
-                .send(message.to_vec())
-                .await
-                .expect("Failed to send transaction");
+                // Send the transaction to the batch maker.
+                self.tx_batch_maker
+                    .send(message.to_vec())
+                    .await
+                    .expect("Failed to send transaction");
 
+            }
         }
 
         // Give the change to schedule other tasks.
@@ -336,6 +354,7 @@ impl MessageHandler for TxReceiverHandler {
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
+    is_byzantine: bool,
     own_worker_id: WorkerId,
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
@@ -348,50 +367,52 @@ struct WorkerReceiverHandler {
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
 
-        // Reply with an ACK.
-        let _ = writer.send(Bytes::from("Ack")).await;
+        if !self.is_byzantine{
+            // Reply with an ACK.
+            let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Deserialize and parse the message.
-        match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::TxDigest(tx_digest)) => {
+            // Deserialize and parse the message.
+            match bincode::deserialize(&serialized) {
+                Ok(WorkerMessage::TxDigest(tx_digest)) => {
 
-                self.tx_tx_digests
-                    .send(tx_digest)
-                    .await
-                    .expect("Failed to send tx digest")
-
-            },
-            Ok(WorkerMessage::Batch(batch)) => {
-
-                if self.own_worker_id != 0 {
-                    for tx in batch{
-                        self
-                            .tx_processor_transaction
-                            .send(tx)
-                            .await
-                            .expect("Failed to send tx");
-                    }
-                }else{
-                    // Send to global_order.rs
-                    self.tx_local_orders
-                        .send(batch)
+                    self.tx_tx_digests
+                        .send(tx_digest)
                         .await
-                        .expect("Failed to send LocalOrder");
-                }
+                        .expect("Failed to send tx digest")
 
-                self
-                    .tx_processor
-                    .send(serialized.to_vec())
+                },
+                Ok(WorkerMessage::Batch(batch)) => {
+
+                    if self.own_worker_id != 0 {
+                        for tx in batch{
+                            self
+                                .tx_processor_transaction
+                                .send(tx)
+                                .await
+                                .expect("Failed to send tx");
+                        }
+                    }else{
+                        // Send to global_order.rs
+                        self.tx_local_orders
+                            .send(batch)
+                            .await
+                            .expect("Failed to send LocalOrder");
+                    }
+
+                    self
+                        .tx_processor
+                        .send(serialized.to_vec())
+                        .await
+                        .expect("Failed to send batch");
+                    
+                },
+                Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
+                    .tx_helper
+                    .send((missing, requestor))
                     .await
-                    .expect("Failed to send batch");
-                
-            },
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
-                .tx_helper
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send batch request"),
-            Err(e) => warn!("Serialization error: {}", e),
+                    .expect("Failed to send batch request"),
+                Err(e) => warn!("Serialization error: {}", e),
+            }
         }
 
         Ok(())
@@ -401,6 +422,7 @@ impl MessageHandler for WorkerReceiverHandler {
 /// Defines how the network receiver handles incoming primary messages.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
+    is_byzantine: bool,
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
 }
 
@@ -411,15 +433,19 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        // Deserialize the message and send it to the synchronizer.
-        match bincode::deserialize(&serialized) {
-            Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self
-                .tx_synchronizer
-                .send(message)
-                .await
-                .expect("Failed to send transaction"),
+        
+        if !self.is_byzantine{
+            // Deserialize the message and send it to the synchronizer.
+            match bincode::deserialize(&serialized) {
+                Err(e) => error!("Failed to deserialize primary message: {}", e),
+                Ok(message) => self
+                    .tx_synchronizer
+                    .send(message)
+                    .await
+                    .expect("Failed to send transaction"),
+            }
         }
+
         Ok(())
     }
 }

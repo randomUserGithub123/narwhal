@@ -82,6 +82,10 @@ pub struct Parameters {
 
     pub lo_size: usize,
     pub lo_max_delay: u64,
+
+    pub gamma: f64,
+    pub faults: u64
+
 }
 
 impl Default for Parameters {
@@ -95,7 +99,9 @@ impl Default for Parameters {
             batch_size: 500_000,
             max_batch_delay: 100,
             lo_size: 500,
-            lo_max_delay: 100
+            lo_max_delay: 100,
+            gamma: 1.0,
+            faults: 1
         }
     }
 }
@@ -113,6 +119,8 @@ impl Parameters {
         info!("Max batch delay set to {} ms", self.max_batch_delay);
         info!("LocalOrder size set to {} B", self.lo_size);
         info!("Max LocalOrder delay set to {} ms", self.lo_max_delay);
+        info!("Gamma set to {}", self.gamma);
+        info!("Node faults set to {}", self.faults);
     }
 }
 

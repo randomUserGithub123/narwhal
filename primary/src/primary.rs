@@ -65,6 +65,7 @@ impl Primary {
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
+        is_byzantine: bool
     ) {
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
@@ -101,6 +102,7 @@ impl Primary {
             address,
             /* handler */
             PrimaryReceiverHandler {
+                is_byzantine,
                 tx_primary_messages,
                 tx_cert_requests,
             },
@@ -220,6 +222,7 @@ impl Primary {
 /// Defines how the network receiver handles incoming primary messages.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
+    is_byzantine: bool,
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
 }
@@ -227,22 +230,26 @@ struct PrimaryReceiverHandler {
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        // Reply with an ACK.
-        let _ = writer.send(Bytes::from("Ack")).await;
+        
+        if !self.is_byzantine{
+            // Reply with an ACK.
+            let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            PrimaryMessage::CertificatesRequest(missing, requestor) => self
-                .tx_cert_requests
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send primary message"),
-            request => self
-                .tx_primary_messages
-                .send(request)
-                .await
-                .expect("Failed to send certificate"),
+            // Deserialize and parse the message.
+            match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
+                PrimaryMessage::CertificatesRequest(missing, requestor) => self
+                    .tx_cert_requests
+                    .send((missing, requestor))
+                    .await
+                    .expect("Failed to send primary message"),
+                request => self
+                    .tx_primary_messages
+                    .send(request)
+                    .await
+                    .expect("Failed to send certificate"),
+            }
         }
+
         Ok(())
     }
 }
