@@ -10,6 +10,8 @@ async fn hash_and_store() {
     let (tx_batch, rx_batch) = channel(1);
     let (tx_digest, mut rx_digest) = channel(1);
 
+    let (_tx_processor_transaction, rx_processor_transaction) = channel(1);
+
     // Create a new test store.
     let path = ".db_test_hash_and_store";
     let _ = fs::remove_dir_all(path);
@@ -23,6 +25,8 @@ async fn hash_and_store() {
         rx_batch,
         tx_digest,
         /* own_batch */ true,
+        rx_processor_transaction,
+        "127.0.0.1:0".parse().unwrap()
     );
 
     // Send a batch to the `Processor`.

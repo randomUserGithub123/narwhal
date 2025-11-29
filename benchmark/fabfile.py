@@ -30,8 +30,8 @@ def local(ctx, debug=True):
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 200,  # ms
-        "LO_size": 500, # number of entries in LocalOrder queue
-        "LO_max_delay": 200, # ms
+        "lo_size": 500, # number of entries in LocalOrder queue
+        "lo_max_delay": 200, # ms
     }
 
     assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
@@ -66,8 +66,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 500_000,  # bytes
             "max_batch_delay": 200,  # ms
-            "LO_size": 500, # number of entries in LocalOrder queue
-            "LO_max_delay": 200, # ms
+            "lo_size": 500, # number of entries in LocalOrder queue
+            "lo_max_delay": 200, # ms
         }
 
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF

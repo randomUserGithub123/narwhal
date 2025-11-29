@@ -2,15 +2,13 @@
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
-#[cfg(feature = "benchmark")]
 use crypto::Digest;
 use crypto::PublicKey;
-#[cfg(feature = "benchmark")]
 use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
-#[cfg(feature = "benchmark")]
+use network::SimpleSender;
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -41,6 +39,8 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
+    /// Our OF_Worker address
+    of_worker_address: SocketAddr
 }
 
 impl BatchMaker {
@@ -50,6 +50,7 @@ impl BatchMaker {
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        of_worker_address: SocketAddr
     ) {
         tokio::spawn(async move {
             Self {
@@ -61,6 +62,7 @@ impl BatchMaker {
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
+                of_worker_address
             }
             .run()
             .await;
@@ -72,10 +74,24 @@ impl BatchMaker {
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
 
+        let mut simple_network = SimpleSender::new();
+
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
+
+                    // Send to OF_worker to store in LocalOrder queue
+                    let tx_digest = Digest(
+                        Sha512::digest(&transaction)[..32]
+                            .try_into()
+                            .expect("Sha512 output must be at least 32 bytes"),
+                    );
+                    let message = WorkerMessage::TxDigest(tx_digest);
+                    let serialized = bincode::serialize(&message)
+                        .expect("Failed to serialize our own tx digest");
+                    simple_network.send(self.of_worker_address, Bytes::from(serialized)).await;
+
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {

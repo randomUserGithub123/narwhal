@@ -16,6 +16,7 @@ async fn make_batch() {
         rx_transaction,
         tx_message,
         /* workers_addresses */ dummy_addresses,
+        "127.0.0.1:0".parse().unwrap()
     );
 
     // Send enough transactions to seal a batch.
@@ -44,6 +45,7 @@ async fn batch_timeout() {
         rx_transaction,
         tx_message,
         /* workers_addresses */ dummy_addresses,
+        "127.0.0.1:0".parse().unwrap()
     );
 
     // Do not send enough transactions to seal a batch..
