@@ -146,21 +146,54 @@ class DASBench:
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(self.faults)
+            rate_share = ceil(rate / (committee.workers() * committee.size()))
+            
+            ### Default Narwhal Approach : 
+            # counter = 0
+            # for i, addresses in enumerate(workers_addresses):
+            #     for id, address in addresses:
+            #         cmd = CommandMaker.run_client(
+            #             address,
+            #             self.tx_size,
+            #             rate_share,
+            #             [x for y in workers_addresses for _, x in y],
+            #         )
+            #         log_file = PathMaker.client_log_file(i, id)
+            #         print(f"Launching client on {clients_hostnames[counter // 4]}")
+            #         self._background_run(cmd, log_file, clients_hostnames[counter // 4])
+            #         counter += 1
 
-            rate_share = ceil(rate / committee.workers())
-            counter = 0
-            for i, addresses in enumerate(workers_addresses):
-                for id, address in addresses:
-                    cmd = CommandMaker.run_client(
-                        address,
-                        self.tx_size,
-                        rate_share,
-                        [x for y in workers_addresses for _, x in y],
-                    )
-                    log_file = PathMaker.client_log_file(i, id)
-                    print(f"Launching client on {clients_hostnames[counter // 4]}")
-                    self._background_run(cmd, log_file, clients_hostnames[counter // 4])
-                    counter += 1
+            ### Giulio Approach :
+            # current method has 1 client per worker, which means multiple clients per primary, but one primary per client
+            # we want 2f+1 primaries per client, so we can send to one worker of each primary
+            # assuming each node has the same amount of workers, we will spawn W*N clients and each of them communicates with N workers
+
+            clients_workers_addresses = (
+                []
+            )  # list of lists, contains addressess of each worker each client should connect to
+
+            # For each client, choose one worker id. communicate with all workers with that id
+            for c_id in range(committee.workers()):
+                worker_id = c_id % self.workers
+                workers = []
+                for addresses in workers_addresses:
+                    for w_id, w_address in addresses:
+                        if w_id == worker_id:
+                            workers.append(w_address)
+                            break
+                clients_workers_addresses.append((f"{worker_id}", workers))
+            
+            for i, (id, worker_list) in enumerate(clients_workers_addresses):
+                addresses = ",".join(worker_list)
+                cmd = CommandMaker.run_client(
+                    addresses,
+                    self.tx_size,
+                    rate_share,
+                    worker_list,
+                )
+                log_file = PathMaker.client_log_file(i, id)
+                print(f"Launching client on {clients_hostnames[i // 4]}")
+                self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
             # Run the primaries (except the faulty ones).
             for i, address in enumerate(committee.primary_addresses(self.faults)):
