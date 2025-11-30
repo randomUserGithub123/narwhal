@@ -19,7 +19,7 @@ async fn wait_for_quorum() {
     QuorumWaiter::spawn(committee.clone(), /* stake */ 1, rx_message, tx_batch);
 
     // Make a batch.
-    let message = WorkerMessage::Batch(batch());
+    let message = WorkerMessage::Batch(PublicKey([0xff; 32]), batch());
     let serialized = bincode::serialize(&message).unwrap();
     let expected = Bytes::from(serialized.clone());
 

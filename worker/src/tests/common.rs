@@ -95,7 +95,7 @@ pub fn batch() -> Batch {
 
 // Fixture
 pub fn serialized_batch() -> Vec<u8> {
-    let message = WorkerMessage::Batch(batch());
+    let message = WorkerMessage::Batch(PublicKey([0xff; 32]), batch());
     bincode::serialize(&message).unwrap()
 }
 

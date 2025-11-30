@@ -64,10 +64,11 @@ pub struct Core {
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// A network sender to send the batches to the other workers.
     network: ReliableSender,
-    /// A network sender to send to OF_worker.
-    simple_network: SimpleSender,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
+
+    tx_header_arrival: Sender<(Round, Digest, Vec<Digest>)>,
+
 }
 
 impl Core {
@@ -86,6 +87,7 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
+        tx_header_arrival: Sender<(Round, Digest, Vec<Digest>)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -109,8 +111,8 @@ impl Core {
                 votes_aggregator: VotesAggregator::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
-                simple_network: SimpleSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
+                tx_header_arrival,
             }
             .run()
             .await;
@@ -180,24 +182,11 @@ impl Core {
             return Ok(());
         }
 
-        let of_worker_address = self.committee
-            .worker(&self.name, &0)
-            .expect("OF_worker address exists")
-            .primary_to_worker;
-
-        let message = PrimaryWorkerMessage::NewHeader(
-            header.id.clone(),
-            header.author,
-            header.round,
-            header.local_orderings
-                .keys()
-                .cloned()
-                .collect(),
-            false
-        );
-        let serialized = bincode::serialize(&message)
-            .expect("Failed to serialize our own NewHeader message");
-        self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
+        // Send to GC to be sent to OF_worker
+        self.tx_header_arrival
+            .send((header.round, header.id.clone(), header.local_orderings.keys().cloned().collect()))
+            .await
+            .expect("Failed to forward local_orderings to GC");
 
         // Store the header.
         let bytes = bincode::serialize(header).expect("Failed to serialize header");

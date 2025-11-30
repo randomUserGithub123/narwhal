@@ -72,7 +72,7 @@ pub struct Consensus {
     /// if it already sent us its whole history.
     rx_primary: Receiver<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    tx_primary: Sender<Certificate>,
+    tx_primary: Sender<(Certificate, bool)>,
     /// Outputs the sequence of ordered certificates to the application layer.
     tx_output: Sender<Certificate>,
 
@@ -85,7 +85,7 @@ impl Consensus {
         committee: Committee,
         gc_depth: Round,
         rx_primary: Receiver<Certificate>,
-        tx_primary: Sender<Certificate>,
+        tx_primary: Sender<(Certificate, bool)>,
         tx_output: Sender<Certificate>,
     ) {
         tokio::spawn(async move {
@@ -158,15 +158,29 @@ impl Consensus {
 
             // Get an ordered list of past leaders that are linked to the current leader.
             debug!("Leader {:?} has enough support", leader);
-            let mut sequence = Vec::new();
             for leader in self.order_leaders(leader, &state).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                 for x in self.order_dag(leader, &state) {
                     // Update and clean up internal state.
                     state.update(&x, self.gc_depth);
 
-                    // Add the certificate to the sequence.
-                    sequence.push(x);
+                    #[cfg(not(feature = "benchmark"))]
+                    info!("Committed {}", x.header);
+
+                    #[cfg(feature = "benchmark")]
+                    for digest in x.header.payload.keys() {
+                        // NOTE: This log entry is used to compute performance.
+                        info!("Committed {} -> {:?}", x.header, digest);
+                    }
+
+                    self.tx_primary
+                        .send((x.clone(), leader.header.id == x.header.id))
+                        .await
+                        .expect("Failed to send certificate to primary");
+
+                    if let Err(e) = self.tx_output.send(x).await {
+                        warn!("Failed to output certificate: {}", e);
+                    }
                 }
             }
 
@@ -177,26 +191,6 @@ impl Consensus {
                 }
             }
 
-            // Output the sequence in the right order.
-            for certificate in sequence {
-                #[cfg(not(feature = "benchmark"))]
-                info!("Committed {}", certificate.header);
-
-                #[cfg(feature = "benchmark")]
-                for digest in certificate.header.payload.keys() {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", certificate.header, digest);
-                }
-
-                self.tx_primary
-                    .send(certificate.clone())
-                    .await
-                    .expect("Failed to send certificate to primary");
-
-                if let Err(e) = self.tx_output.send(certificate).await {
-                    warn!("Failed to output certificate: {}", e);
-                }
-            }
         }
     }
 

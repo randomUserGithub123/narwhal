@@ -40,7 +40,10 @@ pub struct BatchMaker {
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
     /// Our OF_Worker address
-    of_worker_address: SocketAddr
+    of_worker_address: SocketAddr,
+
+    our_public_key: PublicKey
+    
 }
 
 impl BatchMaker {
@@ -50,7 +53,8 @@ impl BatchMaker {
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
-        of_worker_address: SocketAddr
+        of_worker_address: SocketAddr,
+        our_public_key: PublicKey,
     ) {
         tokio::spawn(async move {
             Self {
@@ -62,7 +66,8 @@ impl BatchMaker {
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
-                of_worker_address
+                of_worker_address,
+                our_public_key
             }
             .run()
             .await;
@@ -131,7 +136,7 @@ impl BatchMaker {
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
-        let message = WorkerMessage::Batch(batch);
+        let message = WorkerMessage::Batch(self.our_public_key, batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         // NOTE: This is one extra hash that is only needed to print the following log entries.

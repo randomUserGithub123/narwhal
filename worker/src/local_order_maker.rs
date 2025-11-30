@@ -25,7 +25,7 @@ pub struct LocalOrderMaker {
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
 
-    tx_local_orders: Sender<(Digest, Batch)>,
+    tx_local_orders: Sender<(PublicKey, Digest, Batch)>,
 
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -38,6 +38,9 @@ pub struct LocalOrderMaker {
     current_lo_size: usize,
     /// A network sender to broadcast the LocalOrders to the other workers.
     network: ReliableSender,
+
+    our_public_key: PublicKey,
+
 }
 
 impl LocalOrderMaker {
@@ -46,8 +49,9 @@ impl LocalOrderMaker {
         max_lo_delay: u64,
         rx_tx_digests: Receiver<Digest>,
         tx_message: Sender<QuorumWaiterMessage>,
-        tx_local_orders: Sender<(Digest, Batch)>,
+        tx_local_orders: Sender<(PublicKey, Digest, Batch)>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        our_public_key: PublicKey,
     ) {
         tokio::spawn(async move {
             Self {
@@ -61,6 +65,7 @@ impl LocalOrderMaker {
                 seen_tx_digests: HashSet::new(),
                 current_lo_size: 0,
                 network: ReliableSender::new(),
+                our_public_key,
             }
             .run()
             .await;
@@ -106,7 +111,7 @@ impl LocalOrderMaker {
         self.current_lo_size = 0;
         let local_order: Vec<_> = self.current_local_order.drain(..).collect();
 
-        let message = WorkerMessage::Batch(local_order.clone());
+        let message = WorkerMessage::Batch(self.our_public_key, local_order.clone());
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         // NOTE: This is one extra hash that is only needed to print the following log entries.
@@ -118,7 +123,7 @@ impl LocalOrderMaker {
 
         // Send to global_order.rs
         self.tx_local_orders
-            .send((digest.clone(), local_order))
+            .send((self.our_public_key, digest.clone(), local_order))
             .await
             .expect("Failed to send LocalOrder");
 

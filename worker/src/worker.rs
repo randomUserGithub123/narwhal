@@ -41,7 +41,7 @@ pub type SerializedBatchDigestMessage = Vec<u8>;
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
     TxDigest(Digest),
-    Batch(Batch),
+    Batch(PublicKey, Batch),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
@@ -205,7 +205,8 @@ impl Worker {
                     .iter()
                     .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                     .collect(),
-                of_worker_address
+                of_worker_address,
+                self.name
             );
         }
 
@@ -311,6 +312,7 @@ impl Worker {
                     .iter()
                     .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                     .collect(),
+                self.name
             );
 
             GlobalOrder::spawn(rx_local_orders);
@@ -363,7 +365,7 @@ struct WorkerReceiverHandler {
     tx_processor: Sender<(Digest, SerializedBatchMessage)>,
     tx_processor_transaction: Sender<Transaction>,
     tx_tx_digests: Sender<Digest>,
-    tx_local_orders: Sender<(Digest, Batch)>
+    tx_local_orders: Sender<(PublicKey, Digest, Batch)>
 }
 
 #[async_trait]
@@ -384,7 +386,7 @@ impl MessageHandler for WorkerReceiverHandler {
                         .expect("Failed to send tx digest")
 
                 },
-                Ok(WorkerMessage::Batch(batch)) => {
+                Ok(WorkerMessage::Batch(author, batch)) => {
 
                     let digest = Digest(Sha512::digest(&serialized)[..32].try_into().unwrap());
 
@@ -398,8 +400,9 @@ impl MessageHandler for WorkerReceiverHandler {
                         }
                     }else{
                         // Send to global_order.rs
+
                         self.tx_local_orders
-                            .send((digest.clone(), batch))
+                            .send((author, digest.clone(), batch))
                             .await
                             .expect("Failed to send LocalOrder");
                     }

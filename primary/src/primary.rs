@@ -67,7 +67,7 @@ impl Primary {
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<Certificate>,
-        rx_consensus: Receiver<Certificate>,
+        rx_consensus: Receiver<(Certificate, bool)>,
         is_byzantine: bool
     ) {
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
@@ -83,6 +83,8 @@ impl Primary {
 
         // Re-injection
         let (tx_committed_own_headers, rx_committed_own_headers) = channel(CHANNEL_CAPACITY);
+
+        let (tx_header_arrival, rx_header_arrival) = channel(CHANNEL_CAPACITY);
 
         // Write the parameters to the logs.
         parameters.log();
@@ -161,10 +163,11 @@ impl Primary {
             /* rx_proposer */ rx_headers,
             tx_consensus,
             /* tx_proposer */ tx_parents,
+            tx_header_arrival
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(name, &committee, consensus_round.clone(), rx_consensus, tx_committed_own_headers);
+        GarbageCollector::spawn(name, &committee, consensus_round.clone(), rx_consensus, tx_committed_own_headers, rx_header_arrival);
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
