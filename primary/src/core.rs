@@ -2,7 +2,7 @@
 use crate::aggregators::{CertificatesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote};
-use crate::primary::{PrimaryMessage, Round};
+use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, Round};
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -10,7 +10,7 @@ use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, warn};
-use network::{CancelHandler, ReliableSender};
+use network::{CancelHandler, ReliableSender, SimpleSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,6 +64,8 @@ pub struct Core {
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// A network sender to send the batches to the other workers.
     network: ReliableSender,
+    /// A network sender to send to OF_worker.
+    simple_network: SimpleSender,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 }
@@ -107,6 +109,7 @@ impl Core {
                 votes_aggregator: VotesAggregator::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
+                simple_network: SimpleSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
@@ -176,6 +179,25 @@ impl Core {
             debug!("Processing of {} suspended: missing payload", header);
             return Ok(());
         }
+
+        let of_worker_address = self.committee
+            .worker(&self.name, &0)
+            .expect("OF_worker address exists")
+            .primary_to_worker;
+
+        let message = PrimaryWorkerMessage::NewHeader(
+            header.id.clone(),
+            header.author,
+            header.round,
+            header.local_orderings
+                .keys()
+                .cloned()
+                .collect(),
+            false
+        );
+        let serialized = bincode::serialize(&message)
+            .expect("Failed to serialize our own NewHeader message");
+        self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
 
         // Store the header.
         let bytes = bincode::serialize(header).expect("Failed to serialize header");
@@ -273,6 +295,25 @@ impl Core {
             );
             return Ok(());
         }
+
+        // let of_worker_address = self.committee
+        //     .worker(&self.name, &0)
+        //     .expect("OF_worker address exists")
+        //     .primary_to_worker;
+
+        // let message = PrimaryWorkerMessage::NewHeader(
+        //     certificate.header.id.clone(),
+        //     certificate.header.author,
+        //     certificate.header.round,
+        //     certificate.header.local_orderings
+        //         .keys()
+        //         .cloned()
+        //         .collect(),
+        //     false
+        // );
+        // let serialized = bincode::serialize(&message)
+        //     .expect("Failed to serialize our own NewHeader message");
+        // self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
 
         // Store the certificate.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
@@ -385,7 +426,9 @@ impl Core {
                 Some(certificate) = self.rx_certificate_waiter.recv() => self.process_certificate(certificate).await,
 
                 // We also receive here our new headers created by the `Proposer`.
-                Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
+                Some(header) = self.rx_proposer.recv() => {
+                    self.process_own_header(header).await
+                },
             };
             match result {
                 Ok(()) => (),

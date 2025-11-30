@@ -4,6 +4,8 @@ use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use crypto::{Digest, PublicKey};
+use ed25519_dalek::{Digest as _, Sha512};
+use std::convert::TryInto as _;
 use network::ReliableSender;
 use std::net::SocketAddr;
 use std::collections::{VecDeque, HashSet};
@@ -23,7 +25,7 @@ pub struct LocalOrderMaker {
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
 
-    tx_local_orders: Sender<Batch>,
+    tx_local_orders: Sender<(Digest, Batch)>,
 
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -44,7 +46,7 @@ impl LocalOrderMaker {
         max_lo_delay: u64,
         rx_tx_digests: Receiver<Digest>,
         tx_message: Sender<QuorumWaiterMessage>,
-        tx_local_orders: Sender<Batch>,
+        tx_local_orders: Sender<(Digest, Batch)>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
@@ -104,14 +106,21 @@ impl LocalOrderMaker {
         self.current_lo_size = 0;
         let local_order: Vec<_> = self.current_local_order.drain(..).collect();
 
+        let message = WorkerMessage::Batch(local_order.clone());
+        let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
+
+        // NOTE: This is one extra hash that is only needed to print the following log entries.
+        let digest = Digest(
+            Sha512::digest(&serialized)[..32]
+                .try_into()
+                .unwrap(),
+        );
+
         // Send to global_order.rs
         self.tx_local_orders
-            .send(local_order.clone())
+            .send((digest.clone(), local_order))
             .await
             .expect("Failed to send LocalOrder");
-
-        let message = WorkerMessage::Batch(local_order);
-        let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         // Broadcast the LocalOrder through the network.
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
@@ -121,6 +130,7 @@ impl LocalOrderMaker {
         // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
+                digest: digest,
                 batch: serialized,
                 handlers: names.into_iter().zip(handlers.into_iter()).collect(),
             })

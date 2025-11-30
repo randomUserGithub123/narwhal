@@ -32,7 +32,7 @@ async fn hash_and_store() {
     // Send a batch to the `Processor`.
     let message = WorkerMessage::Batch(batch());
     let serialized = bincode::serialize(&message).unwrap();
-    tx_batch.send(serialized.clone()).await.unwrap();
+    tx_batch.send((Digest([0xff; 32]), serialized.clone())).await.unwrap();
 
     // Ensure the `Processor` outputs the batch's digest.
     let output = rx_digest.recv().await.unwrap();

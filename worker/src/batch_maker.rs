@@ -134,14 +134,15 @@ impl BatchMaker {
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
+        // NOTE: This is one extra hash that is only needed to print the following log entries.
+        let digest = Digest(
+            Sha512::digest(&serialized)[..32]
+                .try_into()
+                .unwrap(),
+        );
+
         #[cfg(feature = "benchmark")]
         {
-            // NOTE: This is one extra hash that is only needed to print the following log entries.
-            let digest = Digest(
-                Sha512::digest(&serialized)[..32]
-                    .try_into()
-                    .unwrap(),
-            );
 
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.
@@ -164,6 +165,7 @@ impl BatchMaker {
         // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
+                digest: digest,
                 batch: serialized,
                 handlers: names.into_iter().zip(handlers.into_iter()).collect(),
             })

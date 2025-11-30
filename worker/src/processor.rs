@@ -30,7 +30,7 @@ impl Processor {
         // The persistent storage.
         mut store: Store,
         // Input channel to receive batches.
-        mut rx_batch: Receiver<SerializedBatchMessage>,
+        mut rx_batch: Receiver<(Digest, SerializedBatchDigestMessage)>,
         // Output channel to send out batches' digests.
         tx_digest: Sender<SerializedBatchDigestMessage>,
         // Whether we are processing our own batches or the batches of other nodes.
@@ -47,9 +47,7 @@ impl Processor {
             loop {
                 tokio::select! {
 
-                    Some(batch) = rx_batch.recv() => {
-                        // Hash the batch.
-                        let digest = Digest(Sha512::digest(&batch)[..32].try_into().unwrap());
+                    Some((digest, batch)) = rx_batch.recv() => {    
 
                         // Store the batch.
                         store.write(digest.to_vec(), batch).await;

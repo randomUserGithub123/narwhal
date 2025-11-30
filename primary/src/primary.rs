@@ -44,6 +44,9 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Round),
+
+    NewHeader(Digest, PublicKey, Round, Vec<Digest>, bool)
+
 }
 
 /// The messages sent by the workers to their primary.
@@ -271,15 +274,11 @@ impl MessageHandler for WorkerReceiverHandler {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
             WorkerPrimaryMessage::OurBatch(digest, worker_id) => {
-                if worker_id != 0 {
-                    self
-                        .tx_our_digests
-                        .send((digest, worker_id))
-                        .await
-                        .expect("Failed to send workers' digests")
-                }else{
-                    // TODO: We need to fill in the Header with this LocalOrder
-                }
+                self
+                    .tx_our_digests
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send workers' digests");
             },
             WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
                 .tx_others_digests

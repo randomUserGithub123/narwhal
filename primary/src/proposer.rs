@@ -36,13 +36,17 @@ pub struct Proposer {
     /// Holds the certificates' ids waiting to be included in the next header.
     last_parents: Vec<Digest>,
     /// Holds the batches' digests waiting to be included in the next header.
-    digests: VecDeque<(Digest, WorkerId)>,
+    batch_digests: VecDeque<(Digest, WorkerId)>,
+
+    /// Holds the LocalOrder' digests waiting to be included in the next header.
+    local_order_digests: VecDeque<(Digest, WorkerId)>,
+
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
 
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
-    proposed_headers: BTreeMap<Round, (Header, VecDeque<(Digest, WorkerId)>)>,
+    proposed_headers: BTreeMap<Round, (Header, VecDeque<(Digest, WorkerId)>, VecDeque<(Digest, WorkerId)>)>,
     /// Committed headers channel on which we get updates on which of
     /// our own headers have been committed.
     rx_committed_own_headers: Receiver<Round>,
@@ -79,7 +83,8 @@ impl Proposer {
                 tx_core,
                 round: 1,
                 last_parents: genesis,
-                digests: VecDeque::with_capacity(2 * header_size),
+                batch_digests: VecDeque::with_capacity(2 * header_size),
+                local_order_digests: VecDeque::with_capacity(2 * header_size),
                 payload_size: 0,
                 proposed_headers: BTreeMap::new(),
                 rx_committed_own_headers,
@@ -92,14 +97,15 @@ impl Proposer {
 
     async fn make_header(&mut self) {
 
-        let header_digests: VecDeque<_> = self.digests.drain(..).collect();
+        let header_batch_digests: VecDeque<_> = self.batch_digests.drain(..).collect();
+        let header_local_order_digests: VecDeque<_> = self.local_order_digests.drain(..).collect();
 
         // Make a new header.
         let header = Header::new(
             self.name,
             self.round,
-            header_digests.iter().cloned().collect(),
-            VecDeque::new().iter().cloned().collect(),
+            header_batch_digests.iter().cloned().collect(),
+            header_local_order_digests.iter().cloned().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
         )
@@ -113,7 +119,7 @@ impl Proposer {
         }
 
         self.proposed_headers
-            .insert(self.round, (header.clone(), header_digests));
+            .insert(self.round, (header.clone(), header_batch_digests, header_local_order_digests));
 
         // Send the new header to the `Core` that will broadcast and process it.
         self.tx_core
@@ -163,7 +169,11 @@ impl Proposer {
                 }
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
                     self.payload_size += digest.size();
-                    self.digests.push_back((digest, worker_id));
+                    if worker_id == 0 {
+                        self.local_order_digests.push_back((digest, worker_id));
+                    }else{
+                        self.batch_digests.push_back((digest, worker_id));
+                    }
                 }
                 Some(round) = self.rx_committed_own_headers.recv() => {
                     debug!("Committed own header, round={}, header_round={}", self.round, round);
@@ -181,27 +191,32 @@ impl Proposer {
                     // the batches into the digests we need to send, effectively re-sending
                     // them in FIFO order.
                     // Oldest to newest payloads.
-                    let mut digests_to_resend = VecDeque::new();
+                    let mut batch_digests_to_resend = VecDeque::new();
+                    let mut local_order_digests_to_resend = VecDeque::new();
                     // Oldest to newest rounds.
                     let mut retransmit_rounds = Vec::new();
 
                     // Iterate in order of rounds of our own headers.
-                    for (header_round, (_, included_digests)) in &mut self.proposed_headers {
+                    for (header_round, (_, batch_included_digests, local_order_included_digests)) in &mut self.proposed_headers {
                         // Stop once we have processed headers at and below last committed round.
                         if *header_round > self.max_committed_header  {
                             break;
                         }
                         // Add payloads from oldest to newest.
-                        digests_to_resend.append(included_digests);
+                        batch_digests_to_resend.append(batch_included_digests);
+                        local_order_digests_to_resend.append(local_order_included_digests);
                         retransmit_rounds.push(*header_round);
                     }
 
                     if !retransmit_rounds.is_empty() {
-                        let num_to_resend = digests_to_resend.len();
+                        let num_to_resend = batch_digests_to_resend.len();
                         // Since all of digests_to_resend are roughly newer than self.digests,
                         // prepend digests_to_resend to the digests for the next header.
-                        digests_to_resend.append(&mut self.digests);
-                        self.digests = digests_to_resend;
+                        batch_digests_to_resend.append(&mut self.batch_digests);
+                        self.batch_digests = batch_digests_to_resend;
+
+                        local_order_digests_to_resend.append(&mut self.local_order_digests);
+                        self.local_order_digests = local_order_digests_to_resend;
 
                         // Now delete the headers with batches we re-transmit
                         for round in &retransmit_rounds {

@@ -6,6 +6,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use network::CancelHandler;
 use tokio::sync::mpsc::{Receiver, Sender};
+use crypto::Digest;
 
 #[cfg(test)]
 #[path = "tests/quorum_waiter_tests.rs"]
@@ -13,6 +14,9 @@ pub mod quorum_waiter_tests;
 
 #[derive(Debug)]
 pub struct QuorumWaiterMessage {
+
+    pub digest: Digest,
+
     /// A serialized `WorkerMessage::Batch` message.
     pub batch: SerializedBatchMessage,
     /// The cancel handlers to receive the acknowledgements of our broadcast.
@@ -28,7 +32,7 @@ pub struct QuorumWaiter {
     /// Input Channel to receive commands.
     rx_message: Receiver<QuorumWaiterMessage>,
     /// Channel to deliver batches for which we have enough acknowledgements.
-    tx_batch: Sender<SerializedBatchMessage>,
+    tx_batch: Sender<(Digest, SerializedBatchMessage)>,
 }
 
 impl QuorumWaiter {
@@ -37,7 +41,7 @@ impl QuorumWaiter {
         committee: Committee,
         stake: Stake,
         rx_message: Receiver<QuorumWaiterMessage>,
-        tx_batch: Sender<Vec<u8>>,
+        tx_batch: Sender<(Digest, Vec<u8>)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -59,7 +63,7 @@ impl QuorumWaiter {
 
     /// Main loop.
     async fn run(&mut self) {
-        while let Some(QuorumWaiterMessage { batch, handlers }) = self.rx_message.recv().await {
+        while let Some(QuorumWaiterMessage { digest, batch, handlers }) = self.rx_message.recv().await {
             let mut wait_for_quorum: FuturesUnordered<_> = handlers
                 .into_iter()
                 .map(|(name, handler)| {
@@ -76,7 +80,7 @@ impl QuorumWaiter {
                 total_stake += stake;
                 if total_stake >= self.committee.quorum_threshold() {
                     self.tx_batch
-                        .send(batch)
+                        .send((digest, batch))
                         .await
                         .expect("Failed to deliver batch");
                     break;

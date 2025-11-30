@@ -173,6 +173,9 @@ impl Synchronizer {
                             }
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
+                    },
+                    PrimaryWorkerMessage::NewHeader(..) => {
+                        // Does not bother us, only global_order.rs
                     }
                 },
 

@@ -11,6 +11,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
+use ed25519_dalek::Digest as _;
+use ed25519_dalek::Sha512;
+use std::convert::TryInto;
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
 use network::{MessageHandler, Receiver, Writer};
@@ -357,10 +360,10 @@ struct WorkerReceiverHandler {
     is_byzantine: bool,
     own_worker_id: WorkerId,
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
-    tx_processor: Sender<SerializedBatchMessage>,
+    tx_processor: Sender<(Digest, SerializedBatchMessage)>,
     tx_processor_transaction: Sender<Transaction>,
     tx_tx_digests: Sender<Digest>,
-    tx_local_orders: Sender<Batch>
+    tx_local_orders: Sender<(Digest, Batch)>
 }
 
 #[async_trait]
@@ -383,6 +386,8 @@ impl MessageHandler for WorkerReceiverHandler {
                 },
                 Ok(WorkerMessage::Batch(batch)) => {
 
+                    let digest = Digest(Sha512::digest(&serialized)[..32].try_into().unwrap());
+
                     if self.own_worker_id != 0 {
                         for tx in batch{
                             self
@@ -394,14 +399,14 @@ impl MessageHandler for WorkerReceiverHandler {
                     }else{
                         // Send to global_order.rs
                         self.tx_local_orders
-                            .send(batch)
+                            .send((digest.clone(), batch))
                             .await
                             .expect("Failed to send LocalOrder");
                     }
 
                     self
                         .tx_processor
-                        .send(serialized.to_vec())
+                        .send((digest, serialized.to_vec()))
                         .await
                         .expect("Failed to send batch");
                     
@@ -438,6 +443,9 @@ impl MessageHandler for PrimaryReceiverHandler {
             // Deserialize the message and send it to the synchronizer.
             match bincode::deserialize(&serialized) {
                 Err(e) => error!("Failed to deserialize primary message: {}", e),
+                Ok(PrimaryWorkerMessage::NewHeader(header_id, author, round, local_order_digests, is_certificate)) => {
+                    // TODO: Update global_order.rs
+                },
                 Ok(message) => self
                     .tx_synchronizer
                     .send(message)

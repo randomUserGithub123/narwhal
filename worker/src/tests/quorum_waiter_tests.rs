@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::future::try_join_all;
 use network::ReliableSender;
 use tokio::sync::mpsc::channel;
+use crypto::Digest;
 
 #[tokio::test]
 async fn wait_for_quorum() {
@@ -40,6 +41,7 @@ async fn wait_for_quorum() {
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let message = QuorumWaiterMessage {
+        digest: Digest([0xff; 32]),
         batch: serialized.clone(),
         handlers: names.into_iter().zip(handlers.into_iter()).collect(),
     };
@@ -47,7 +49,7 @@ async fn wait_for_quorum() {
 
     // Wait for the `QuorumWaiter` to gather enough acknowledgements and output the batch.
     let output = rx_batch.recv().await.unwrap();
-    assert_eq!(output, serialized);
+    assert_eq!(output.1, serialized);
 
     // Ensure the other listeners correctly received the batch.
     assert!(try_join_all(listener_handles).await.is_ok());
