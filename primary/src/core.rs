@@ -67,7 +67,8 @@ pub struct Core {
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 
-    tx_header_arrival: Sender<(Round, Digest, Vec<Digest>)>,
+    tx_header_arrival: Sender<(Round, PublicKey, Digest, Vec<Digest>)>,
+    simple_network: SimpleSender
 
 }
 
@@ -87,7 +88,7 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
-        tx_header_arrival: Sender<(Round, Digest, Vec<Digest>)>,
+        tx_header_arrival: Sender<(Round, PublicKey, Digest, Vec<Digest>)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -113,6 +114,7 @@ impl Core {
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 tx_header_arrival,
+                simple_network: SimpleSender::new(),
             }
             .run()
             .await;
@@ -182,9 +184,29 @@ impl Core {
             return Ok(());
         }
 
+        if header.local_orderings.len() > 0 {
+            // Send to OF_Worker
+            let of_worker_address = self.committee
+                .worker(&self.name, &0)
+                .expect("OF_worker address exists")
+                .primary_to_worker;
+
+            let message = PrimaryWorkerMessage::NewHeader(
+                header.author,
+                header.round,
+                header.local_orderings
+                    .keys()
+                    .cloned()
+                    .collect(),
+            );
+            let serialized = bincode::serialize(&message)
+                .expect("Failed to serialize our own NewHeader message");
+            self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
+        }
+
         // Send to GC to be sent to OF_worker
         self.tx_header_arrival
-            .send((header.round, header.id.clone(), header.local_orderings.keys().cloned().collect()))
+            .send((header.round, header.author, header.id.clone(), header.local_orderings.keys().cloned().collect()))
             .await
             .expect("Failed to forward local_orderings to GC");
 
@@ -284,25 +306,6 @@ impl Core {
             );
             return Ok(());
         }
-
-        // let of_worker_address = self.committee
-        //     .worker(&self.name, &0)
-        //     .expect("OF_worker address exists")
-        //     .primary_to_worker;
-
-        // let message = PrimaryWorkerMessage::NewHeader(
-        //     certificate.header.id.clone(),
-        //     certificate.header.author,
-        //     certificate.header.round,
-        //     certificate.header.local_orderings
-        //         .keys()
-        //         .cloned()
-        //         .collect(),
-        //     false
-        // );
-        // let serialized = bincode::serialize(&message)
-        //     .expect("Failed to serialize our own NewHeader message");
-        // self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
 
         // Store the certificate.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");

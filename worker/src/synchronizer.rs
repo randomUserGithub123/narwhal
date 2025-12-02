@@ -176,6 +176,9 @@ impl Synchronizer {
                     },
                     PrimaryWorkerMessage::NewHeader(..) => {
                         // Does not bother us, only global_order.rs
+                    },
+                    PrimaryWorkerMessage::CommittedSubDag(..) => {
+                        // Does not bother us, only global_order.rs
                     }
                 },
 

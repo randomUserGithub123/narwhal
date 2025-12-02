@@ -45,7 +45,8 @@ pub enum PrimaryWorkerMessage {
     /// The primary indicates a round update.
     Cleanup(Round),
 
-    NewHeader(Digest, PublicKey, Round, Vec<Digest>, bool)
+    NewHeader(PublicKey, Round, Vec<Digest>),
+    CommittedSubDag(Vec<(Round, Vec<PublicKey>)>),
 
 }
 

@@ -31,9 +31,11 @@ pub struct GarbageCollector {
     /// A network sender to send to OF_worker.
     simple_network: SimpleSender,
     header_to_local_orders: HashMap<Digest, (Round, Vec<Digest>)>,
-    rx_header_arrival: Receiver<(Round, Digest, Vec<Digest>)>,
+    rx_header_arrival: Receiver<(Round, PublicKey, Digest, Vec<Digest>)>,
     committed_headers_without_local_orders: HashSet<Digest>,
     of_worker_address: SocketAddr,
+
+    current_subdag: HashMap<Round, HashSet<PublicKey>>,
 
 }
 
@@ -44,7 +46,7 @@ impl GarbageCollector {
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<(Certificate, bool)>,
         tx_committed_own_headers: Sender<Round>,
-        rx_header_arrival: Receiver<(Round, Digest, Vec<Digest>)>,
+        rx_header_arrival: Receiver<(Round, PublicKey, Digest, Vec<Digest>)>,
     ) {
         let addresses = committee
             .our_workers(&name)
@@ -70,7 +72,8 @@ impl GarbageCollector {
                 header_to_local_orders: HashMap::new(),
                 rx_header_arrival,
                 committed_headers_without_local_orders: HashSet::new(),
-                of_worker_address
+                of_worker_address,
+                current_subdag: HashMap::new(),
             }
             .run()
             .await;
@@ -85,29 +88,48 @@ impl GarbageCollector {
 
                 Some((certificate, is_leader)) = self.rx_consensus.recv() => {
 
+                    let round = certificate.header.round;
+                    let author = certificate.header.author;
+
                     if let Some((_hdr_round, _local_orders)) =
                         self.header_to_local_orders.remove(&certificate.header.id)
                     {
                         
-                    } else {
+                    }else {
                         self.committed_headers_without_local_orders.insert(certificate.header.id.clone());
                     }
 
+                    self.current_subdag
+                        .entry(round)
+                        .or_default()
+                        .insert(author);
+
                     if is_leader {
 
-                        // let message = PrimaryWorkerMessage::NewHeader(
-                        //     header.id.clone(),
-                        //     header.author,
-                        //     header.round,
-                        //     header.local_orderings
-                        //         .keys()
-                        //         .cloned()
-                        //         .collect(),
-                        //     false
-                        // );
-                        // let serialized = bincode::serialize(&message)
-                        //     .expect("Failed to serialize our own NewHeader message");
-                        // self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
+                        let mut entries: Vec<(Round, HashSet<PublicKey>)> =
+                            self.current_subdag.drain().collect();
+                        entries.sort_by_key(|(round, _)| *round);
+
+                        let sub_dag: Vec<(Round, Vec<PublicKey>)> = entries
+                            .into_iter()
+                            .map(|(round, authors_set)| {
+                                let authors: Vec<PublicKey> = authors_set.into_iter().collect();
+                                (round, authors)
+                            })
+                            .collect();
+
+                        let message = PrimaryWorkerMessage::CommittedSubDag(
+                            sub_dag
+                        );
+                        let serialized = bincode::serialize(&message)
+                            .expect("Failed to serialize our own CommittedSubDag message");
+                        self.simple_network.send(self.of_worker_address, Bytes::from(serialized)).await;
+
+                        if self.committed_headers_without_local_orders.len() > 0 {
+                            log::info!(
+                                "committed_headers_without_local_orders : {}", self.committed_headers_without_local_orders.len()
+                            );
+                        }
                         
                     }
 
@@ -134,9 +156,13 @@ impl GarbageCollector {
                             .expect("Could not send own committed round back");
                     }
                 },
-                Some((round, header_digest, local_orders)) = self.rx_header_arrival.recv() => {
+                Some((round, author, header_digest, local_orders)) = self.rx_header_arrival.recv() => {
                     self.header_to_local_orders
-                        .insert(header_digest, (round, local_orders)); 
+                        .insert(header_digest.clone(), (round, local_orders)); 
+
+                    if self.committed_headers_without_local_orders.remove(&header_digest){
+
+                    }
                 }
 
             }

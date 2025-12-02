@@ -52,6 +52,9 @@ pub struct Proposer {
     rx_committed_own_headers: Receiver<Round>,
     /// The round of the maximum own header we committed
     max_committed_header: Round,
+
+    at_least_one_local_order: bool,
+
 }
 
 impl Proposer {
@@ -89,6 +92,7 @@ impl Proposer {
                 proposed_headers: BTreeMap::new(),
                 rx_committed_own_headers,
                 max_committed_header: 0,
+                at_least_one_local_order: false,
             }
             .run()
             .await;
@@ -144,10 +148,11 @@ impl Proposer {
             let enough_parents = !self.last_parents.is_empty();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
-            if (timer_expired || enough_digests) && enough_parents {
+            if (timer_expired || enough_digests) && enough_parents && self.at_least_one_local_order {
                 // Make a new header.
                 self.make_header().await;
                 self.payload_size = 0;
+                self.at_least_one_local_order = false;
 
                 // Reschedule the timer.
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
@@ -171,6 +176,7 @@ impl Proposer {
                     self.payload_size += digest.size();
                     if worker_id == 0 {
                         self.local_order_digests.push_back((digest, worker_id));
+                        self.at_least_one_local_order = true;
                     }else{
                         self.batch_digests.push_back((digest, worker_id));
                     }

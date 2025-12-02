@@ -85,10 +85,12 @@ impl Worker {
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
 
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
+        let (tx_header_update, rx_header_update) = channel(CHANNEL_CAPACITY);
+        let (tx_consensus_update, rx_consensus_update) = channel(CHANNEL_CAPACITY);
 
-        worker.handle_primary_messages();
+        worker.handle_primary_messages(tx_header_update, tx_consensus_update);
         worker.handle_clients_transactions(tx_primary.clone(), tx_quorum_waiter.clone(), rx_quorum_waiter);
-        worker.handle_workers_messages(tx_primary, tx_quorum_waiter);
+        worker.handle_workers_messages(tx_primary, tx_quorum_waiter, rx_header_update, rx_consensus_update);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -114,7 +116,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(
+        &self,
+        tx_header_update: Sender<(PublicKey, Round, Vec<Digest>)>,
+        tx_consensus_update: Sender<Vec<(Round, Vec<PublicKey>)>>,
+    ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         let is_byzantine = self.is_byzantine;
@@ -131,7 +137,9 @@ impl Worker {
             /* handler */
             PrimaryReceiverHandler { 
                 is_byzantine,
-                tx_synchronizer 
+                tx_synchronizer,
+                tx_header_update,
+                tx_consensus_update,
             },
         );
 
@@ -242,6 +250,8 @@ impl Worker {
         &self, 
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_quorum_waiter: Sender<crate::quorum_waiter::QuorumWaiterMessage>,
+        rx_header_update: tokio::sync::mpsc::Receiver<(PublicKey, Round, Vec<Digest>)>,
+        rx_consensus_update: tokio::sync::mpsc::Receiver<Vec<(Round, Vec<PublicKey>)>>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -257,27 +267,6 @@ impl Worker {
             .worker_to_worker;
 
         let is_byzantine = self.is_byzantine;
-
-        // Receive incoming messages from other workers.
-        let mut address = self
-            .committee
-            .worker(&self.name, &self.id)
-            .expect("Our public key or worker id is not in the committee")
-            .worker_to_worker;
-        address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
-            address,
-            /* handler */
-            WorkerReceiverHandler {
-                is_byzantine,
-                own_worker_id,
-                tx_helper,
-                tx_processor,
-                tx_processor_transaction,
-                tx_tx_digests,
-                tx_local_orders: tx_local_orders.clone()
-            },
-        );
 
         // The `Helper` is dedicated to reply to batch requests from other workers.
         Helper::spawn(
@@ -306,18 +295,47 @@ impl Worker {
                 self.parameters.lo_max_delay, 
                 rx_tx_digests, 
                 tx_quorum_waiter, 
-                tx_local_orders,
+                tx_local_orders.clone(),
                 self.committee
-                    .others_workers(&self.name, &self.id)
+                    .others_workers(&self.name, &0)
                     .iter()
                     .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                     .collect(),
                 self.name
             );
 
-            GlobalOrder::spawn(rx_local_orders);
+            let go = GlobalOrder::new(
+                rx_local_orders,
+                rx_header_update,
+                rx_consensus_update,
+                self.committee.size() as u64,
+                self.parameters.faults,
+                self.parameters.gamma
+            );
+            go.start();
 
         }
+
+        // Receive incoming messages from other workers.
+        let mut address = self
+            .committee
+            .worker(&self.name, &self.id)
+            .expect("Our public key or worker id is not in the committee")
+            .worker_to_worker;
+        address.set_ip("0.0.0.0".parse().unwrap());
+        Receiver::spawn(
+            address,
+            /* handler */
+            WorkerReceiverHandler {
+                is_byzantine,
+                own_worker_id,
+                tx_helper,
+                tx_processor,
+                tx_processor_transaction,
+                tx_tx_digests,
+                tx_local_orders: tx_local_orders,
+            },
+        );
 
         info!(
             "Worker {} listening to worker messages on {}",
@@ -365,7 +383,7 @@ struct WorkerReceiverHandler {
     tx_processor: Sender<(Digest, SerializedBatchMessage)>,
     tx_processor_transaction: Sender<Transaction>,
     tx_tx_digests: Sender<Digest>,
-    tx_local_orders: Sender<(PublicKey, Digest, Batch)>
+    tx_local_orders: Sender<(PublicKey, Digest, Batch)>,
 }
 
 #[async_trait]
@@ -400,7 +418,6 @@ impl MessageHandler for WorkerReceiverHandler {
                         }
                     }else{
                         // Send to global_order.rs
-
                         self.tx_local_orders
                             .send((author, digest.clone(), batch))
                             .await
@@ -432,6 +449,8 @@ impl MessageHandler for WorkerReceiverHandler {
 struct PrimaryReceiverHandler {
     is_byzantine: bool,
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
+    tx_header_update: Sender<(PublicKey, Round, Vec<Digest>)>,
+    tx_consensus_update: Sender<Vec<(Round, Vec<PublicKey>)>>,
 }
 
 #[async_trait]
@@ -446,8 +465,17 @@ impl MessageHandler for PrimaryReceiverHandler {
             // Deserialize the message and send it to the synchronizer.
             match bincode::deserialize(&serialized) {
                 Err(e) => error!("Failed to deserialize primary message: {}", e),
-                Ok(PrimaryWorkerMessage::NewHeader(header_id, author, round, local_order_digests, is_certificate)) => {
-                    // TODO: Update global_order.rs
+                Ok(PrimaryWorkerMessage::NewHeader(author, round, local_order_digests)) => {
+                    self.tx_header_update
+                        .send((author, round, local_order_digests))
+                        .await
+                        .expect("Failed forwarding header update to global_order.rs");
+                },
+                Ok(PrimaryWorkerMessage::CommittedSubDag(sub_dag)) => {
+                    self.tx_consensus_update
+                        .send(sub_dag)
+                        .await
+                        .expect("Failed to send via tx_consensus_update");
                 },
                 Ok(message) => self
                     .tx_synchronizer

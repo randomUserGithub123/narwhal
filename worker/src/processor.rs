@@ -47,7 +47,7 @@ impl Processor {
             loop {
                 tokio::select! {
 
-                    Some((digest, batch)) = rx_batch.recv() => {    
+                    Some((digest, batch)) = rx_batch.recv() => {  
 
                         // Store the batch.
                         store.write(digest.to_vec(), batch).await;

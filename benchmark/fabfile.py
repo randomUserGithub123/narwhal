@@ -18,9 +18,9 @@ def local(ctx, debug=True):
         'faults': 1,
         'nodes': 5,
         'workers': 2,
-        'rate': 50_000,
+        'rate': 10_000,
         'tx_size': 512,
-        'duration': 20,
+        'duration': 30,
     }
     node_params = {
         'header_size': 1_000,  # bytes
@@ -28,9 +28,9 @@ def local(ctx, debug=True):
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 10_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 500_000,  # bytes
+        'batch_size': 50_000,  # bytes
         'max_batch_delay': 200,  # ms
-        "lo_size": 500, # number of entries in LocalOrder queue
+        "lo_size": 400, # number of entries in LocalOrder queue
         "lo_max_delay": 200, # ms
         "gamma": 1.0, # batch-OF parameter
     }
@@ -58,7 +58,7 @@ def local(ctx, debug=True):
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for faults, workers_per_node, nodes, runs in [
         (1, 2, 5, 1),
-        (1, 2, 9, 1),
+        (2, 2, 9, 1),
     ]:
         """Run benchmarks on DAS5"""
         bench_params = {
