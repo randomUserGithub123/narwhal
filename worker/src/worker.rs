@@ -305,6 +305,7 @@ impl Worker {
             );
 
             let go = GlobalOrder::new(
+                self.store.clone(),
                 rx_local_orders,
                 rx_header_update,
                 rx_consensus_update,

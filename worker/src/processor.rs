@@ -49,13 +49,10 @@ impl Processor {
 
                     Some((digest, batch)) = rx_batch.recv() => {  
 
-                        // Store the batch.
-                        store.write(digest.to_vec(), batch).await;
-
                         // Deliver the batch's digest.
                         let message = match own_digest {
-                            true => WorkerPrimaryMessage::OurBatch(digest, id),
-                            false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                            true => WorkerPrimaryMessage::OurBatch(digest.clone(), id),
+                            false => WorkerPrimaryMessage::OthersBatch(digest.clone(), id),
                         };
                         let message = bincode::serialize(&message)
                             .expect("Failed to serialize our own worker-primary message");
@@ -63,6 +60,10 @@ impl Processor {
                             .send(message)
                             .await
                             .expect("Failed to send digest");
+
+                        // Store the batch.
+                        store.write(digest.to_vec(), batch).await;
+
                     },
 
                     Some(transaction) = rx_transaction.recv() => {

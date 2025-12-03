@@ -1,85 +1,22 @@
 use primary::Round;
+use store::Store;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use tokio::sync::mpsc::Receiver;
 use tokio::task;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use crypto::{Digest, Hash, PublicKey};
+use crypto::{Digest, PublicKey};
 
 use crate::batch_maker::Batch;
 
 const MAX_TX: usize = 10_000;
-
-struct SubDagBuffers {
-    weight_matrix: Vec<Vec<u16>>,
-    needed_lo_digests: Vec<Digest>,
-    dirty_nodes: Vec<usize>,
-    dirty_pairs: Vec<(usize, usize)>,
-    support: Vec<u16>,
-    is_non_blank: Vec<bool>,
-    is_solid: Vec<bool>,
-    edges: Vec<Vec<usize>>,
-
-    index_counter: i32,
-    stack: Vec<usize>,
-    on_stack: Vec<bool>,
-    dfn: Vec<i32>,
-    low: Vec<i32>,
-    scc_id: Vec<i32>,
-    scc_count: i32,
-    sccs: Vec<Vec<usize>>,
-
-    // Condensation graph + topo.
-    gc: Vec<Vec<usize>>,
-    indegree: Vec<usize>,
-    topo: Vec<usize>,
-    q: VecDeque<usize>,
-
-    final_order: Vec<usize>,
-
-}
-
-impl SubDagBuffers {
-
-    fn new() -> Self {
-        SubDagBuffers {
-            weight_matrix: vec![vec![0u16; MAX_TX]; MAX_TX],
-            needed_lo_digests: Vec::new(),
-            dirty_nodes: Vec::with_capacity(MAX_TX),
-            dirty_pairs: Vec::with_capacity(MAX_TX),
-            support: vec![0u16; MAX_TX],
-            is_non_blank: vec![false; MAX_TX],
-            is_solid: vec![false; MAX_TX],
-            edges: vec![Vec::new(); MAX_TX],
-
-            index_counter: 0,
-            stack: Vec::new(),
-            on_stack: vec![false; MAX_TX],
-            dfn: vec![0i32; MAX_TX],
-            low: vec![0i32; MAX_TX],
-            scc_id: vec![-1i32; MAX_TX],
-            scc_count: 0,
-            sccs: Vec::new(),
-
-            gc: vec![Vec::new(); MAX_TX],
-            indegree: vec![0; MAX_TX],
-            topo: Vec::new(),
-            q: VecDeque::new(),
-
-            final_order: Vec::new(),
-        }
-    }
-
-}
 
 struct GlobalOrderState {
 
     tx_digest_to_index: HashMap<Vec<u8>, usize>,
     index_to_tx_digest: Vec<Vec<u8>>,
     free_indices: Vec<usize>,
-
-    // lo_contributions: HashMap<Digest, Vec<usize>>,
 }
 
 impl GlobalOrderState {
@@ -93,7 +30,6 @@ impl GlobalOrderState {
             tx_digest_to_index,
             index_to_tx_digest,
             free_indices: Vec::new(),
-            // lo_contributions: HashMap::new(),
         }
     }
 
@@ -108,11 +44,6 @@ impl GlobalOrderState {
             free_idx
         }else{
             let idx = self.index_to_tx_digest.len();
-
-            if idx >= MAX_TX {
-                panic!("GlobalOrder: exceeded MAX_TX ({}) distinct transactions", MAX_TX);
-            }
-
             self.index_to_tx_digest.push(digest.clone());
             idx
         };
@@ -132,7 +63,14 @@ impl GlobalOrderState {
 
 }
 
+#[cfg(test)]
+#[path = "tests/global_order_tests.rs"]
+mod global_order_tests;
+
 pub struct GlobalOrder {
+
+    // The persistent storage.
+    store: Store,
     
     rx_local_orders: Receiver<(PublicKey, Digest, Batch)>,
     rx_header_update: Receiver<(PublicKey, Round, Vec<Digest>)>,
@@ -149,9 +87,6 @@ pub struct GlobalOrder {
     digest_to_local_order: HashMap<Digest, Vec<Vec<u8>>>,
     author_round_boundaries: HashMap<PublicKey, Vec<(Round, usize, usize)>>,
 
-    subdag_buffers: Vec<Arc<Mutex<SubDagBuffers>>>,
-    subdag_counter: usize,
-
     tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>,
     rx_utig_results: tokio::sync::mpsc::Receiver<Vec<usize>>,
 
@@ -160,6 +95,7 @@ pub struct GlobalOrder {
 impl GlobalOrder {
 
     pub fn new(
+        store: Store,
         rx_local_orders: Receiver<(PublicKey, Digest, Batch)>,
         rx_header_update: Receiver<(PublicKey, Round, Vec<Digest>)>,
         rx_consensus_update: Receiver<Vec<(Round, Vec<PublicKey>)>>,
@@ -173,15 +109,10 @@ impl GlobalOrder {
             ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
         let solid_threshold = (n - 2 * f) as u16;
 
-        const NUM_BUFFERS: usize = 3;
-        let mut subdag_buffers = Vec::with_capacity(NUM_BUFFERS);
-        for _ in 0..NUM_BUFFERS {
-            subdag_buffers.push(Arc::new(Mutex::new(SubDagBuffers::new())));
-        }
-
         let (tx_utig_results, rx_utig_results) = tokio::sync::mpsc::channel(1024);
 
         GlobalOrder {
+            store,
             rx_local_orders,
             rx_header_update,
             rx_consensus_update,
@@ -194,8 +125,6 @@ impl GlobalOrder {
             author_to_lo_digests: HashMap::new(),
             digest_to_local_order: HashMap::new(),
             author_round_boundaries: HashMap::new(),
-            subdag_buffers,
-            subdag_counter: 0,
             rx_utig_results,
             tx_utig_results,
         }
@@ -367,9 +296,7 @@ impl GlobalOrder {
                                     .get(lo_digest)
                                     .expect("Not able to retrieve local_order");
                                 for tx_digest in local_order {
-
                                     author_indices.push(g.index_for_digest(tx_digest.clone()));
-
                                 }
 
                             }
@@ -383,296 +310,17 @@ impl GlobalOrder {
                         "t2 : {}", t2
                     );
 
-                    // // ---- pick buffer & spawn heavy UTIG job on blocking thread ----
-                    let buf_index = self.subdag_counter % self.subdag_buffers.len();
-                    self.subdag_counter = self.subdag_counter.wrapping_add(1);
-                    let buf_arc = self.subdag_buffers[buf_index].clone();
-
                     let non_blank_threshold = self.non_blank_threshold;
                     let solid_threshold = self.solid_threshold;
-
                     let tx_utig_results = self.tx_utig_results.clone();
+
                     task::spawn_blocking(move || {
-                        let start = Instant::now();
-
-                        let mut buf = buf_arc.lock().expect("lock SubDagBuffers");
-
-                        let SubDagBuffers {
-                            weight_matrix,
-                            needed_lo_digests: _,
-                            dirty_nodes,
-                            dirty_pairs,
-                            support,
-                            is_non_blank,
-                            is_solid,
-                            edges,
-                            index_counter,
-                            stack,
-                            on_stack,
-                            dfn,
-                            low,
-                            scc_id,
-                            scc_count,
-                            sccs,
-                            gc,
-                            indegree,
-                            topo,
-                            q,
-                            final_order,
-                        } = &mut *buf;
-
-                        // -------- Phase 2: support, weights, dirty_nodes/pairs --------
-                        for indices in &indices_sets {
-
-                            log::info!(
-                                "LEN {}", indices.len()
-                            );
-
-                            for (pos, &i) in indices.iter().enumerate() {
-                                if i >= MAX_TX {
-                                    log::error!("rx_consensus_update: tx index {} >= MAX_TX", i);
-                                    continue;
-                                }
-
-                                let old_sup = support[i];
-                                let new_sup = old_sup.saturating_add(1);
-                                support[i] = new_sup;
-
-                                if !is_non_blank[i] && new_sup >= non_blank_threshold {
-                                    is_non_blank[i] = true;
-                                    dirty_nodes.push(i);
-                                }
-
-                                if !is_solid[i] && new_sup >= solid_threshold {
-                                    is_solid[i] = true;
-                                }
-
-                                for &j in &indices[pos + 1..] {
-                                    if j >= MAX_TX {
-                                        log::error!("rx_consensus_update: tx index {} >= MAX_TX", j);
-                                        continue;
-                                    }
-
-                                    let old_w = weight_matrix[i][j];
-                                    let new_w = old_w.saturating_add(1);
-                                    weight_matrix[i][j] = new_w;
-
-                                    if old_w < non_blank_threshold && new_w >= non_blank_threshold {
-                                        let (a, b) = if i < j { (i, j) } else { (j, i) };
-                                        dirty_pairs.push((a, b));
-                                    }
-                                }
-                            }
-                        }
-
-                        let t_weights = start.elapsed().as_nanos();
-                        log::info!("t(weights + support): {}", t_weights);
-
-                        // -------- Phase 3: orientation predicate and edges --------
-                        let predicate_p = |u: usize, v: usize, w_uv: u16, w_vu: u16, t_edge: u16| -> bool {
-                            if w_uv < t_edge {
-                                return false;
-                            }
-                            if w_vu < t_edge {
-                                return true;
-                            }
-                            if w_uv > w_vu {
-                                return true;
-                            }
-                            if w_uv < w_vu {
-                                return false;
-                            }
-                            u < v
-                        };
-
-                        for &(u_raw, v_raw) in dirty_pairs.iter() {
-                            let u = u_raw;
-                            let v = v_raw;
-
-                            if !is_non_blank[u] || !is_non_blank[v] {
-                                continue;
-                            }
-
-                            let w_uv = weight_matrix[u][v];
-                            let w_vu = weight_matrix[v][u];
-
-                            if w_uv == 0 && w_vu == 0 {
-                                continue;
-                            }
-
-                            let u_to_v = predicate_p(u, v, w_uv, w_vu, non_blank_threshold);
-                            let v_to_u = predicate_p(v, u, w_vu, w_uv, non_blank_threshold);
-
-                            if u_to_v {
-                                edges[u].push(v);
-                            } else if v_to_u {
-                                edges[v].push(u);
-                            }
-                        }
-
-                        let t_edges = start.elapsed().as_nanos() - t_weights;
-                        log::info!("t(edges): {}", t_edges);
-
-                        // -------- Phase 4: Tarjan on affected nodes --------
-
-                        fn strongconnect(
-                            u: usize,
-                            index_counter: &mut i32,
-                            stack: &mut Vec<usize>,
-                            on_stack: &mut [bool],
-                            dfn: &mut [i32],
-                            low: &mut [i32],
-                            edges: &Vec<Vec<usize>>,
-                            scc_id: &mut [i32],
-                            scc_count: &mut i32,
-                            sccs: &mut Vec<Vec<usize>>,
-                        ) {
-                            *index_counter += 1;
-                            dfn[u] = *index_counter;
-                            low[u] = *index_counter;
-                            stack.push(u);
-                            on_stack[u] = true;
-
-                            for &v in &edges[u] {
-                                if dfn[v] == 0 {
-                                    strongconnect(v, index_counter, stack, on_stack, dfn, low, edges, scc_id, scc_count, sccs);
-                                    low[u] = std::cmp::min(low[u], low[v]);
-                                } else if on_stack[v] {
-                                    low[u] = std::cmp::min(low[u], dfn[v]);
-                                }
-                            }
-
-                            if low[u] == dfn[u] {
-                                let mut comp = Vec::new();
-                                loop {
-                                    let w = stack.pop().unwrap();
-                                    on_stack[w] = false;
-                                    scc_id[w] = *scc_count;
-                                    comp.push(w);
-                                    if w == u {
-                                        break;
-                                    }
-                                }
-                                sccs.push(comp);
-                                *scc_count += 1;
-                            }
-                        }
-
-                        for &u in dirty_nodes.iter() {
-                            if dfn[u] == 0 {
-                                strongconnect(
-                                    u,
-                                    index_counter,
-                                    stack,
-                                    on_stack,
-                                    dfn,
-                                    low,
-                                    edges,
-                                    scc_id,
-                                    scc_count,
-                                    sccs,
-                                );
-                            }
-                        }
-
-                        let t_tarjan = start.elapsed().as_nanos() - t_weights - t_edges;
-                        log::info!("t(Tarjan): {}", t_tarjan);
-
-                        // -------- Phase 5: condensation + topo + finalize --------
-                        let scc_n = sccs.len();
-                        gc.clear();
-                        gc.resize(scc_n, Vec::new());
-                        indegree.clear();
-                        indegree.resize(scc_n, 0);
-
-                        for u in 0..MAX_TX {
-                            let su = scc_id[u];
-                            if su < 0 {
-                                continue;
-                            }
-                            let su = su as usize;
-
-                            for &v in &edges[u] {
-                                let sv = scc_id[v];
-                                if sv < 0 {
-                                    continue;
-                                }
-                                let sv = sv as usize;
-                                if su == sv {
-                                    continue;
-                                }
-                                gc[su].push(sv);
-                                indegree[sv] += 1;
-                            }
-                        }
-
-                        topo.clear();
-                        q.clear();
-                        for s in 0..scc_n {
-                            if indegree[s] == 0 {
-                                q.push_back(s);
-                            }
-                        }
-
-                        while let Some(u) = q.pop_front() {
-                            topo.push(u);
-                            for &v in &gc[u] {
-                                if indegree[v] > 0 {
-                                    indegree[v] -= 1;
-                                    if indegree[v] == 0 {
-                                        q.push_back(v);
-                                    }
-                                }
-                            }
-                        }
-
-                        // anchor: last SCC with solid tx
-                        let mut anchor_idx: Option<usize> = None;
-                        for (idx, &scc_index) in topo.iter().enumerate() {
-                            let comp = &sccs[scc_index];
-                            if comp.iter().any(|&v| is_solid[v]) {
-                                anchor_idx = Some(idx);
-                            }
-                        }
-
-                        if let Some(anchor) = anchor_idx {
-                            final_order.clear();
-                            for topo_pos in 0..=anchor {
-                                let scc_index = topo[topo_pos];
-                                let comp = &sccs[scc_index];
-                                if comp.len() == 1 {
-                                    final_order.push(comp[0]);
-                                } else {
-                                    let mut sorted = comp.clone();
-                                    sorted.sort_unstable();
-                                    final_order.extend(sorted);
-                                }
-                            }
-
-                            let total = start.elapsed().as_nanos();
-                            log::info!(
-                                "GlobalOrder: finalized prefix length = {}, anchor_scc_idx = {}, total ns = {}",
-                                final_order.len(),
-                                anchor,
-                                total,
-                            );
-
-                            if let Err(_e) = tx_utig_results.blocking_send(final_order.clone()) {
-                                // GlobalOrder might have been dropped; handle if needed
-                            }
-
-                        } else {
-                            let total = start.elapsed().as_nanos();
-                            log::info!(
-                                "GlobalOrder: no solid anchor in this sub_dag, total ns = {}",
-                                total
-                            );
-                        }
-
+                        run_utig(indices_sets, non_blank_threshold, solid_threshold, tx_utig_results);
                     });
 
                     log::info!(
-                        "spawning took time : {}", start_time.elapsed().as_nanos() - t2
+                        "spawn_blocking overhead: {} ns",
+                        start_time.elapsed().as_nanos() - t2
                     );
 
                 },
@@ -685,5 +333,349 @@ impl GlobalOrder {
 
             }
         }
+    }
+}
+
+
+fn run_utig(
+    indices_sets: Vec<Vec<usize>>,  // GLOBAL indices
+    non_blank_threshold: u16,
+    solid_threshold: u16,
+    tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>, // returns GLOBAL indices
+) {
+    let start_total = Instant::now();
+
+    // 1) Build the set of active global indices and a compact mapping.
+    let mut global_to_local: HashMap<usize, usize> = HashMap::new();
+    let mut local_to_global: Vec<usize> = Vec::new();
+
+    for indices in &indices_sets {
+        for &g_idx in indices {
+            if !global_to_local.contains_key(&g_idx) {
+                let local_idx = local_to_global.len();
+                local_to_global.push(g_idx);
+                global_to_local.insert(g_idx, local_idx);
+            }
+        }
+    }
+
+    let k = local_to_global.len();
+    log::info!(
+        "unique txs in sub_dag: {}", k
+    );
+    if k == 0 {
+        log::info!("run_utig: empty sub-dag, nothing to do");
+        return;
+    }
+
+    // Map each indices_set to local indices.
+    let local_indices_sets: Vec<Vec<usize>> = indices_sets
+        .into_iter()
+        .map(|indices| {
+            indices
+                .into_iter()
+                .map(|g_idx| *global_to_local.get(&g_idx).unwrap())
+                .collect()
+        })
+        .collect();
+
+    let t_map = start_total.elapsed().as_nanos();
+    log::info!("UTIG: mapping global->local took {} ns", t_map);
+
+    // 2) Allocate UTIG structures sized by k (NOT MAX_TX).
+    let mut support: Vec<u16> = vec![0u16; k];
+    let mut is_non_blank: Vec<bool> = vec![false; k];
+    let mut is_solid: Vec<bool> = vec![false; k];
+    let mut dirty_nodes: Vec<usize> = Vec::new();
+    let mut dirty_pairs: Vec<(usize, usize)> = Vec::new();
+
+    // dense k×k matrix, but k is just "txs in this sub-dag", typically << MAX_TX
+    let mut weight: Vec<u16> = vec![0u16; k * k];
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); k];
+
+    #[inline]
+    fn w_idx(i: usize, j: usize, k: usize) -> usize {
+        i * k + j
+    }
+
+    let t_alloc = start_total.elapsed().as_nanos() - t_map;
+    log::info!(
+        "t_alloc: {}", t_alloc
+    );
+
+    // 3) Phase 2: support, weights, dirty_nodes/pairs
+    for indices in &local_indices_sets {
+        for (pos, &i) in indices.iter().enumerate() {
+            let old_sup = support[i];
+            let new_sup = old_sup.saturating_add(1);
+            support[i] = new_sup;
+
+            if !is_non_blank[i] && new_sup >= non_blank_threshold {
+                is_non_blank[i] = true;
+                dirty_nodes.push(i);
+            }
+
+            if !is_solid[i] && new_sup >= solid_threshold {
+                is_solid[i] = true;
+            }
+
+            for &j in &indices[pos + 1..] {
+                let idx_ij = w_idx(i, j, k);
+                let old_w = weight[idx_ij];
+                let new_w = old_w.saturating_add(1);
+                weight[idx_ij] = new_w;
+
+                if old_w < non_blank_threshold && new_w >= non_blank_threshold {
+                    let (a, b) = if i < j { (i, j) } else { (j, i) };
+                    dirty_pairs.push((a, b));
+                }
+            }
+        }
+    }
+
+    let t_weights = start_total.elapsed().as_nanos() - t_alloc - t_map;
+    log::info!("UTIG: weights+support took {} ns", t_weights);
+
+    // 4) Orientation predicate and edges
+    let predicate_p = |u: usize, v: usize, k: usize, weight: &Vec<u16>, t_edge: u16| -> bool {
+        let w_uv = weight[w_idx(u, v, k)];
+        let w_vu = weight[w_idx(v, u, k)];
+
+        if w_uv < t_edge {
+            return false;
+        }
+        if w_vu < t_edge {
+            return true;
+        }
+        if w_uv > w_vu {
+            return true;
+        }
+        if w_uv < w_vu {
+            return false;
+        }
+        u < v
+    };
+
+    for &(u, v) in &dirty_pairs {
+        if !is_non_blank[u] || !is_non_blank[v] {
+            continue;
+        }
+
+        let w_uv = weight[w_idx(u, v, k)];
+        let w_vu = weight[w_idx(v, u, k)];
+        if w_uv == 0 && w_vu == 0 {
+            continue;
+        }
+
+        let u_to_v = predicate_p(u, v, k, &weight, non_blank_threshold);
+        let v_to_u = predicate_p(v, u, k, &weight, non_blank_threshold);
+
+        if u_to_v {
+            edges[u].push(v);
+        } else if v_to_u {
+            edges[v].push(u);
+        }
+    }
+
+    let t_edges = start_total.elapsed().as_nanos() - t_map - t_alloc - t_weights;
+    log::info!("UTIG: edges/orientation took {} ns", t_edges);
+
+    let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
+
+    if active.is_empty() {
+        log::info!("UTIG: no non-blank txs in this sub-dag, nothing to propose");
+        return;
+    }
+
+    // 5) Tarjan SCC only on non-blank nodes
+    let mut index_counter: i32 = 0;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut on_stack: Vec<bool> = vec![false; k];
+    let mut dfn: Vec<i32> = vec![0; k];
+    let mut low: Vec<i32> = vec![0; k];
+    let mut scc_id: Vec<i32> = vec![-1; k];
+    let mut scc_count: i32 = 0;
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    fn strongconnect(
+        u: usize,
+        index_counter: &mut i32,
+        stack: &mut Vec<usize>,
+        on_stack: &mut [bool],
+        dfn: &mut [i32],
+        low: &mut [i32],
+        edges: &Vec<Vec<usize>>,
+        scc_id: &mut [i32],
+        scc_count: &mut i32,
+        sccs: &mut Vec<Vec<usize>>,
+    ) {
+        *index_counter += 1;
+        dfn[u] = *index_counter;
+        low[u] = *index_counter;
+        stack.push(u);
+        on_stack[u] = true;
+
+        for &v in &edges[u] {
+            if dfn[v] == 0 {
+                strongconnect(v, index_counter, stack, on_stack, dfn, low, edges, scc_id, scc_count, sccs);
+                low[u] = std::cmp::min(low[u], low[v]);
+            } else if on_stack[v] {
+                low[u] = std::cmp::min(low[u], dfn[v]);
+            }
+        }
+
+        if low[u] == dfn[u] {
+            let mut comp = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack[w] = false;
+                scc_id[w] = *scc_count;
+                comp.push(w);
+                if w == u {
+                    break;
+                }
+            }
+            sccs.push(comp);
+            *scc_count += 1;
+        }
+    }
+
+    // **only start DFS from non-blank nodes**
+    for &u in &active {
+        if dfn[u] == 0 {
+            strongconnect(
+                u,
+                &mut index_counter,
+                &mut stack,
+                &mut on_stack,
+                &mut dfn,
+                &mut low,
+                &edges,
+                &mut scc_id,
+                &mut scc_count,
+                &mut sccs,
+            );
+        }
+    }
+
+    // 6) Condensation graph + topo sort, again only over non-blank nodes
+    let scc_n = sccs.len();
+    let mut gc: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
+    let mut indegree: Vec<usize> = vec![0; scc_n];
+
+    for &u in &active {
+        let su = scc_id[u];
+        if su < 0 { continue; }
+        let su = su as usize;
+        for &v in &edges[u] {
+            if !is_non_blank[v] { continue; } // redundant but safe
+            let sv = scc_id[v];
+            if sv < 0 { continue; }
+            let sv = sv as usize;
+            if su == sv { continue; }
+            gc[su].push(sv);
+            indegree[sv] += 1;
+        }
+    }
+
+    let mut topo: Vec<usize> = Vec::with_capacity(scc_n);
+    let mut q: VecDeque<usize> = VecDeque::new();
+    for s in 0..scc_n {
+        if indegree[s] == 0 {
+            q.push_back(s);
+        }
+    }
+    while let Some(u) = q.pop_front() {
+        topo.push(u);
+        for &v in &gc[u] {
+            if indegree[v] > 0 {
+                indegree[v] -= 1;
+                if indegree[v] == 0 {
+                    q.push_back(v);
+                }
+            }
+        }
+    }
+
+    // 7) Anchor: last SCC in topo with at least one SOLID tx.
+    let mut anchor_idx: Option<usize> = None;
+    for (idx, &scc_index) in topo.iter().enumerate() {
+        let comp = &sccs[scc_index];
+        if comp.iter().any(|&v| is_solid[v]) {
+            anchor_idx = Some(idx);
+        }
+    }
+
+    if let Some(anchor) = anchor_idx {
+        let mut final_local: Vec<usize> = Vec::new();
+
+        for topo_pos in 0..=anchor {
+            let scc_index = topo[topo_pos];
+            let comp = &sccs[scc_index];
+
+            if comp.len() == 1 {
+                final_local.push(comp[0]);
+            } else {
+                let mut sorted = comp.clone();
+                sorted.sort_unstable();
+                final_local.extend(sorted);
+            }
+        }
+
+        let solid_nodes = is_solid.iter().filter(|&&solid| solid).count();
+        log::info!(
+            "solid_nodes : {} {}", solid_nodes, final_local.len()
+        );
+
+        let mut unordered_pairs_global: Vec<(usize, usize)> = Vec::new();
+        let p = final_local.len();
+
+        for a in 0..p {
+            let i = final_local[a];
+            if is_solid[i] {
+                continue;
+            }
+            for b in (a + 1)..p {
+                let j = final_local[b];
+                if is_solid[j] {
+                    continue;
+                }
+
+                let w_ij = weight[w_idx(i, j, k)];
+                let w_ji = weight[w_idx(j, i, k)];
+
+                if w_ij < non_blank_threshold && w_ji < non_blank_threshold {
+                    let gi = local_to_global[i];
+                    let gj = local_to_global[j];
+                    unordered_pairs_global.push((gi, gj));
+                }
+            }
+        }
+
+        log::info!(
+            "unordered len : {}", unordered_pairs_global.len()
+        );
+
+        // Map local indices back to GLOBAL tx indices.
+        let final_global: Vec<usize> = final_local
+            .into_iter()
+            .map(|li| local_to_global[li])
+            .collect();
+
+        let total = start_total.elapsed().as_nanos();
+        log::info!(
+            "UTIG: finalized prefix length = {}, anchor_scc_idx = {}, total ns = {}",
+            final_global.len(),
+            anchor,
+            total
+        );
+
+        let _ = tx_utig_results.blocking_send(final_global);
+    } else {
+        let total = start_total.elapsed().as_nanos();
+        log::info!(
+            "UTIG: no solid anchor in this sub_dag, total ns = {}",
+            total
+        );
     }
 }

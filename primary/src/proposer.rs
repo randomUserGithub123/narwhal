@@ -43,6 +43,8 @@ pub struct Proposer {
 
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
+    /// Keeps track of the size (in bytes) of LocalOrders' digests that we received so far.
+    lo_size: usize,
 
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
@@ -89,6 +91,7 @@ impl Proposer {
                 batch_digests: VecDeque::with_capacity(2 * header_size),
                 local_order_digests: VecDeque::with_capacity(2 * header_size),
                 payload_size: 0,
+                lo_size: 0,
                 proposed_headers: BTreeMap::new(),
                 rx_committed_own_headers,
                 max_committed_header: 0,
@@ -146,12 +149,13 @@ impl Proposer {
             // 2. We have a quorum of certificates from the previous round and the specified maximum
             // inter-header delay has passed.
             let enough_parents = !self.last_parents.is_empty();
-            let enough_digests = self.payload_size >= self.header_size;
+            let enough_digests = (self.payload_size >= self.header_size) && (self.lo_size >= self.header_size);
             let timer_expired = timer.is_elapsed();
             if (timer_expired || enough_digests) && enough_parents && self.at_least_one_local_order {
                 // Make a new header.
                 self.make_header().await;
                 self.payload_size = 0;
+                self.lo_size = 0;
                 self.at_least_one_local_order = false;
 
                 // Reschedule the timer.
@@ -173,11 +177,12 @@ impl Proposer {
                     self.last_parents = parents;
                 }
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
-                    self.payload_size += digest.size();
                     if worker_id == 0 {
-                        self.local_order_digests.push_back((digest, worker_id));
+                        self.lo_size += digest.size();
                         self.at_least_one_local_order = true;
+                        self.local_order_digests.push_back((digest, worker_id));
                     }else{
+                        self.payload_size += digest.size();
                         self.batch_digests.push_back((digest, worker_id));
                     }
                 }
