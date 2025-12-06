@@ -10,6 +10,7 @@ from benchmark.plot import Ploter, PlotError
 from benchmark.instance import InstanceManager
 from benchmark.remote import Bench, BenchError
 from benchmark.das import DASBench
+from benchmark.themis import ThemisBench
 
 @task
 def local(ctx, debug=True):
@@ -78,6 +79,48 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                 
         except BenchError as e:
             Print.error(e)
+
+@task
+def themis(ctx, debug=True, local=True):
+    ''' Run benchmarks on localhost '''
+    bench_params = {
+        'faults': 1,
+        'nodes': 5,
+        'workers': 2, # Not used in Themis
+        'rate': 10_000,
+        'tx_size': 512,
+        'duration': 30,
+    }
+    node_params = {
+        'header_size': 1_000,  # bytes
+        'max_header_delay': 200,  # ms
+        'gc_depth': 50,  # rounds
+        'sync_retry_delay': 10_000,  # ms
+        'sync_retry_nodes': 3,  # number of nodes
+        'batch_size': 50_000,  # bytes
+        'max_batch_delay': 200,  # ms
+        "lo_size": 400, # number of entries in LocalOrder queue
+        "lo_max_delay": 200, # ms
+        "gamma": 1.0, # batch-OF parameter
+    }
+
+    node_params.update(
+        {
+            "faults": bench_params["faults"]
+        }
+    )
+
+    assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+    assert bench_params['nodes'] > (
+        (4 * node_params['faults']) /
+        (2 * node_params['gamma'] - 1)
+    )
+
+    try:
+        ret = ThemisBench(bench_params, node_params).run(debug, local=local)
+        print(ret.result())
+    except BenchError as e:
+        Print.error(e)
 
 @task
 def create(ctx, nodes=2):

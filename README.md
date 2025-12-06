@@ -10,6 +10,27 @@
 4. `tmux`
     - `sudo apt install tmux`
 
+## Themis Setup
+### Ensure openssl and libevent are installed on your machine, more specifically, you need:
+* CMake >= 3.9 (cmake)
+* C++14 (g++)
+* libuv >= 1.10.0 (libuv1-dev)
+* openssl >= 1.1.0 (libssl-dev)
+* on Ubuntu: `sudo apt-get install libssl-dev libuv1-dev cmake make autoconf automake libtool pkg-config`
+* `apt-get` might not get the newest `cmake`, ensure the `CMake >= 3.9`
+
+### Build project
+1. `cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON -DCMAKE_CXX_FLAGS="-include cstdint"`
+2. `make`
+
+### Run Themis locally
+* Make sure in the `scripts/run_demo.sh` file number of replicas are 0 to 3.
+* Make sure the hotstuff.conf file has exactly 4 replica signatures.
+* start 4 demo replicas with `scripts/run_demo.sh`
+* start the demo client with `scripts/run_demo_client.sh` in another terminal
+* Use Ctrl-C to terminate the client and replicas
+
+
 ## DAS Setup
 1. Contact `das-account@cs.vu.nl` for access (you will get credentials via email)
 2. Nodes need to be accessed from university ip address (e.g. [TU Delft VPN](https://docs.eduvpn.org/client/linux/installation.html))

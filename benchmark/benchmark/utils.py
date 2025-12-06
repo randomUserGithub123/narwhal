@@ -1,9 +1,8 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
-from os.path import join
-
+from os.path import join, dirname, abspath
 
 class BenchError(Exception):
-    def __init__(self, message, error):
+    def __init__(self, message, error=None):
         assert isinstance(error, Exception)
         self.message = message
         self.cause = error
@@ -18,6 +17,20 @@ class PathMaker:
     @staticmethod
     def node_crate_path():
         return join('..', 'node')
+    
+    @staticmethod
+    def themis_code_path():
+        benchmark_dir = dirname(dirname(__file__))
+        root_dir = abspath(join(benchmark_dir, '..'))
+        return join(root_dir, 'Batch-OF', 'Themis_tx')
+
+    @staticmethod
+    def themis_log_file(name: str) -> str:
+        """
+        Log file used to capture stderr of run_demo.sh and run_demo_client.sh.
+        The real Themis execution logs remain log0..log3 in Themis_tx/.
+        """
+        return join(PathMaker.logs_path(), f'themis-{name}.log')
 
     @staticmethod
     def committee_file():
