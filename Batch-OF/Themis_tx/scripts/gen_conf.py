@@ -5,7 +5,7 @@ import argparse
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate configuration file for a batch of replicas')
-    parser.add_argument('--prefix', type=str, default='hotstuff.gen')
+    parser.add_argument('--prefix', type=str, default='hotstuff')
     parser.add_argument('--ips', type=str, default=None)
     parser.add_argument('--iter', type=int, default=10)
     parser.add_argument('--pport', type=int, default=10000)
@@ -20,7 +20,7 @@ if __name__ == "__main__":
     parser.add_argument('--clinworker', type=int, default=1)
     parser.add_argument('--repburst', type=int, default=1000)
     parser.add_argument('--cliburst', type=int, default=1000)
-    parser.add_argument('--sb-users', type=int, default=20)
+    parser.add_argument('--sb-users', type=int, default=1000000)
     parser.add_argument('--sb-prob-choose_mtx', type=float, default=0.9)
     parser.add_argument('--sb-skew-factor', type=float, default=0.1)
     parser.add_argument('--fairness-parameter', type=float, default=1.0)
@@ -29,7 +29,7 @@ if __name__ == "__main__":
 
 
     if args.ips is None:
-        ips = ['127.0.0.1']
+        ips = ['127.0.0.1'] * 5
     else:
         ips = [l.strip() for l in open(args.ips, 'r').readlines()]
     prefix = args.prefix

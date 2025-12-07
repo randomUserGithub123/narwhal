@@ -79,7 +79,7 @@ class CommandMaker:
         for i in range(n_replicas):
             cmd = (
                 f"cd {themis_dir} && "
-                f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf > log{i} 2>&1"
+                f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf"
             )
             cmds.append(cmd)
         return cmds
@@ -90,8 +90,9 @@ class CommandMaker:
         idx=0,
         max_async=400,
         fairness=1.0,
-        sb_users=1_000_000,
+        sb_users=1000000,
         sb_prob=0.9,
+        sb_skew_factor=0.1,
         iter_count=-1,
     ):
     
@@ -104,47 +105,42 @@ class CommandMaker:
             f"--max-async {max_async} "
             f"--fairness-parameter {fairness} "
             f"--sb-users {sb_users} "
-            f"--sb-prob-choose_mtx {sb_prob}"
+            f"--sb-prob-choose_mtx {sb_prob} "
+            f"--sb-skew-factor {sb_skew_factor} "
         )
         return cmd
 
     # Themis
     @staticmethod
     def generate_themis_config(
-        n_replicas,
+        n_replica_ips: list,
         base_port=10000,
         block_size=100,
         fairness=1.0,
-        sb_users=1_000_000,
+        sb_users=1000000,
         sb_prob=0.9,
-        pace_maker="dummy",
-        themis_dir=None,
-        ips_file=None,
+        sb_skew_factor=0.1,
     ):
         
-        assert isinstance(n_replicas, int) and n_replicas > 0
         assert isinstance(base_port, int)
 
-        if themis_dir is None:
-            themis_dir = PathMaker.themis_code_path()
+        ips_path = join(PathMaker.themis_code_path(), "ips.txt")
+        with open(ips_path, "w") as f:
+            for replica_ip in n_replica_ips:
+                f.write(f"{replica_ip}\n")
 
         cmd = (
-            f"python3 scripts/gen_conf.py "
+            f"python3 scripts/gen_conf.py " # There are other default params in 'gen_conf.py'
             f"--prefix hotstuff "
-            f"--iter 10 "
             f"--pport {base_port} "
             f"--cport {base_port + 10000} "
             f"--block-size {block_size} "
-            f"--pace-maker {pace_maker} "
             f"--sb-users {sb_users} "
             f"--sb-prob-choose_mtx {sb_prob} "
+            f"--sb-skew-factor {sb_skew_factor} "
             f"--fairness-parameter {fairness} "
-            f"--keygen ./hotstuff-keygen "
-            f"--tls-keygen ./hotstuff-tls-keygen "
+            f" --ips {ips_path} "
         )
-
-        if ips_file is not None:
-            cmd += f" --ips {ips_file}"
 
         return cmd
 
