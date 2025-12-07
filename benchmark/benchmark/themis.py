@@ -49,12 +49,12 @@ class ThemisBench:
 
         try:
             subprocess.run(
-                "pkill -f 'examples/hotstuff-app' || true",
+                "pkill -9 -f 'examples/hotstuff-app' || true",
                 shell=True,
                 stderr=subprocess.DEVNULL,
             )
             subprocess.run(
-                "pkill -f 'examples/hotstuff-client' || true",
+                "pkill -9 -f 'examples/hotstuff-client' || true",
                 shell=True,
                 stderr=subprocess.DEVNULL,
             )
@@ -99,7 +99,7 @@ class ThemisBench:
             Print.info("Generating Themis configuration files...")
             cmd = CommandMaker.generate_themis_config(
                 n_replica_ips=replica_IPs,
-                block_size=100, # Hardcode for now
+                block_size=101, # Hardcode for now
                 fairness=self.node_parameters.json['gamma'],
             )
             subprocess.run(
@@ -120,7 +120,7 @@ class ThemisBench:
             Print.info("Starting Themis Client ...")
             client_cmd = CommandMaker.run_themis_client(
                 idx=0,
-                max_async=400, # Hardcode for now
+                max_async=500, # Hardcode for now
                 fairness=self.node_parameters.json['gamma'],
             )
             client_log = PathMaker.themis_log_file("client")
