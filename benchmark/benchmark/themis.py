@@ -63,13 +63,13 @@ class ThemisBench:
                 
                 hosts = self._get_hostnames()
 
-                for host in hosts:
-                    Print.info(f"[{host}] Sending SIGTERM to hotstuff-app and hotstuff-client (graceful shutdown)")
-                    subprocess.run(
-                        f"ssh {host} \"pkill -TERM -f 'examples/hotstuff-app' || true; pkill -TERM -f 'examples/hotstuff-client' || true\"",
-                        shell=True,
-                        stderr=subprocess.DEVNULL,
-                    )
+                client_host = hosts[-1]
+                Print.info(f"[{host}] Sending SIGTERM to hotstuff-client (graceful shutdown)")
+                subprocess.run(
+                    f"ssh {client_host} \"pkill -TERM -f 'examples/hotstuff-client' || true\"",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
 
                 sleep(5)
 
