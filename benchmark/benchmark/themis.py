@@ -226,8 +226,7 @@ class ThemisBench:
             Print.info("Generating Themis configuration files...")
             cmd = CommandMaker.generate_themis_config(
                 n_replica_ips=replica_IPs,
-                # block_size=int(self.bench_parameters.rate[0] / self.nodes[0]),
-                block_size=100, # Hardcode for now
+                block_size=self.node_parameters.json['lo_size'],
                 fairness=self.node_parameters.json['gamma'],
             )
             subprocess.run(

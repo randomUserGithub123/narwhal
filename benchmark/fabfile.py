@@ -81,15 +81,15 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def themis(ctx, debug=True, local=True, username="mputnik"):
+def themis(ctx, debug=True, local=False, username="mputnik"):
     ''' Run benchmarks on localhost '''
     bench_params = {
-        'faults': 1,
-        'nodes': 5,
+        'faults': 4,
+        'nodes': 17,
         'workers': 2, # Not used in Themis
         'rate': 10_000,
         'tx_size': 512,
-        'duration': 60,
+        'duration': 120,
     }
     node_params = {
         'header_size': 1_000,  # bytes
@@ -99,7 +99,7 @@ def themis(ctx, debug=True, local=True, username="mputnik"):
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 50_000,  # bytes
         'max_batch_delay': 200,  # ms
-        "lo_size": 400, # number of entries in LocalOrder queue
+        "lo_size": 100, # number of entries in LocalOrder queue
         "lo_max_delay": 200, # ms
         "gamma": 1.0, # batch-OF parameter
     }
