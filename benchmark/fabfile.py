@@ -81,7 +81,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def themis(ctx, debug=True, local=True):
+def themis(ctx, debug=True, local=True, username="mputnik"):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 1,
@@ -117,7 +117,7 @@ def themis(ctx, debug=True, local=True):
     )
 
     try:
-        ret = ThemisBench(bench_params, node_params).run(debug, local=local)
+        ret = ThemisBench(bench_params, node_params, local, username).run(debug, local=local)
         print(ret.result())
     except BenchError as e:
         Print.error(e)

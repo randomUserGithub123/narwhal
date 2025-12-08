@@ -3,73 +3,141 @@ import os
 import re
 import ast
 import subprocess
+import datetime
 from time import sleep
 
 from benchmark.commands import CommandMaker
 from benchmark.config import BenchParameters, NodeParameters, ConfigError
 from benchmark.utils import Print, BenchError, PathMaker
+from benchmark.preserve import *
 
+BANNED_NODES = []
 
 class ThemisBench:
     BASE_PORT = 4000
 
-    def __init__(self, bench_parameters_dict, node_parameters_dict):
+    def __init__(self, bench_parameters_dict, node_parameters_dict, local, username):
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
         except ConfigError as e:
             raise BenchError("Invalid bench parameters", e)
+        self.local = local
+        if(
+            not self.local
+        ):
+            self.preserve_manager = PreserveManager(username)
+        else:
+            self.preserve_manager = None
+        self.username = username
+        self._wd = os.getcwd()
+        self._hostnames = None
 
     def __getattr__(self, attr):
         return getattr(self.bench_parameters, attr)
 
-    def _background_run(self, command, log_file):
+    def _background_run(self, command, log_file, hostname=None):
         abs_log_path = os.path.abspath(log_file)
-        log_fd = open(abs_log_path, "w")
 
-        full_cmd = f"ulimit -s unlimited && {command}"
-
-        proc = subprocess.Popen(
-            ["bash", "-lc", full_cmd],
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            cwd=PathMaker.themis_code_path(),
-        )
-        return proc
+        if self.local:
+            full_cmd = f"ulimit -s unlimited && {command}"
+            subprocess.Popen(
+                ["bash", "-lc", full_cmd],
+                stdout=open(abs_log_path, "w"),
+                stderr=subprocess.STDOUT,
+                cwd=PathMaker.themis_code_path(),
+            )
+        else:
+            assert hostname is not None, "Hostname must be provided in remote mode"
+            full_cmd = f"source /etc/profile; cd {PathMaker.themis_code_path()}; ulimit -s unlimited; {command} > {abs_log_path} 2>&1 &"
+            ssh_cmd = f"ssh {hostname} '{full_cmd}'"
+            print(f"[remote-run] {ssh_cmd}")
+            subprocess.Popen(ssh_cmd, shell=True)
 
     def _kill_nodes(self):
-        try:
-            cmd = CommandMaker.kill().split()
-            subprocess.run(cmd, stderr=subprocess.DEVNULL)
-        except subprocess.SubprocessError as e:
-            pass
+        
+        Print.info("Killing all running HotStuff processes...")
 
-        # SIGKILL to hotstuff-appp; SIGTERM to hotstuff-client
         try:
-            subprocess.run(
-                "pkill -9 -f 'examples/hotstuff-app' || true",
-                shell=True,
-                stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                "pkill -f 'examples/hotstuff-client' || true",
-                shell=True,
-                stderr=subprocess.DEVNULL,
-            )
-        except subprocess.SubprocessError:
-            pass
+            if not self.local:
+                
+                hosts = self._get_hostnames()
 
-        sleep(5)
+                for host in hosts:
+                    Print.info(f"[{host}] Sending SIGTERM to hotstuff-app and hotstuff-client")
+                    subprocess.run(
+                        f"ssh {host} \"pkill -f 'examples/hotstuff-app' || true; pkill -f 'examples/hotstuff-client' || true\"",
+                        shell=True,
+                        stderr=subprocess.DEVNULL,
+                    )
 
-        # SIGKILL to hotstuff-client
-        try:
-            subprocess.run(
-                "pkill -9 -f 'examples/hotstuff-client' || true",
-                shell=True,
-                stderr=subprocess.DEVNULL,
-            )
-        except subprocess.SubprocessError:
-            pass
+                sleep(5)
+
+                for host in hosts:
+                    Print.info(f"[{host}] Sending SIGKILL to remaining processes")
+                    subprocess.run(
+                        f"ssh {host} \"pkill -9 -f 'examples/hotstuff-app' || true; pkill -9 -f 'examples/hotstuff-client' || true\"",
+                        shell=True,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+                for host in hosts:
+                    subprocess.run(
+                        f"ssh {host} \"rm -f /tmp/hotstuff* || true\"",
+                        shell=True,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+                self.preserve_manager.kill_reservation("LAST")
+
+            else:
+                
+                subprocess.run(
+                    "pkill -f 'examples/hotstuff-app' || true",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    "pkill -f 'examples/hotstuff-client' || true",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                sleep(5)
+
+                subprocess.run(
+                    "pkill -9 -f 'examples/hotstuff-app' || true",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    "pkill -9 -f 'examples/hotstuff-client' || true",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
+
+        except Exception as e:
+            Print.warn(f"Error during kill: {e}")
+
+    def _preserve_machines(self):
+        # we need one machine per node + one machine for client
+        self._amount_for_nodes = self.nodes[0]
+        self._num_machines = self._amount_for_nodes + 1
+
+        time_string = str(datetime.timedelta(seconds=self.duration + 30)) # extra time to set up things
+        self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
+
+    def _get_hostnames(self):
+        if self._hostnames:
+            return self._hostnames
+
+        reservations = self.preserve_manager.get_own_reservations()
+        for v in reservations.values():
+            # print(v)
+            # should be exactly one
+            self._hostnames = v.assigned_machines
+            return self._hostnames
+        return []
 
     def _parse_themis_logs(self):
         log_file = PathMaker.themis_log_file("client")
@@ -153,9 +221,14 @@ class ThemisBench:
                 local
             ):
                 replica_IPs = ['127.0.0.1'] * self.nodes[0]
+                clients_hostnames = [None]
             else:
-                # TODO: Generate from 'preserve' in DAS
-                pass
+                self._preserve_machines()
+                sleep(1.5)
+                all_hostnames = self._get_hostnames()
+                all_hostnames = all_hostnames[:self._num_machines]
+                replica_IPs = all_hostnames[:self._amount_for_nodes]
+                clients_hostnames = all_hostnames[self._amount_for_nodes:]
 
             Print.info("Generating Themis configuration files...")
             cmd = CommandMaker.generate_themis_config(
@@ -175,7 +248,7 @@ class ThemisBench:
             replica_cmds = CommandMaker.run_themis_replicas(self.nodes[0])
             for i, cmd in enumerate(replica_cmds):
                 log_file = PathMaker.themis_log_file(f"replica-{i}")
-                self._background_run(cmd, log_file)
+                self._background_run(cmd, log_file, replica_IPs[i])
 
             sleep(5) # Wait for replicas to be spawned, otherwise client will silently exit
 
@@ -186,7 +259,7 @@ class ThemisBench:
                 fairness=self.node_parameters.json['gamma'],
             )
             client_log = PathMaker.themis_log_file("client")
-            self._background_run(client_cmd, client_log)
+            self._background_run(client_cmd, client_log, clients_hostnames[0])
 
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
