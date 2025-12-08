@@ -74,11 +74,9 @@ class CommandMaker:
 
         assert isinstance(n_replicas, int) and n_replicas > 0
 
-        themis_dir = PathMaker.themis_code_path()
         cmds = []
         for i in range(n_replicas):
             cmd = (
-                f"cd {themis_dir} && "
                 f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf"
             )
             cmds.append(cmd)
@@ -96,9 +94,7 @@ class CommandMaker:
         iter_count=-1,
     ):
     
-        themis_dir = PathMaker.themis_code_path()
         cmd = (
-            f"cd {themis_dir} && "
             f"./examples/hotstuff-client "
             f"--idx {idx} "
             f"--iter {iter_count} "
