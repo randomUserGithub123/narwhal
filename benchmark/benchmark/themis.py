@@ -64,7 +64,7 @@ class ThemisBench:
                 hosts = self._get_hostnames()
 
                 client_host = hosts[-1]
-                Print.info(f"[{host}] Sending SIGTERM to hotstuff-client (graceful shutdown)")
+                Print.info(f"[{client_host}] Sending SIGTERM to hotstuff-client (graceful shutdown)")
                 subprocess.run(
                     f"ssh {client_host} \"pkill -TERM -f 'examples/hotstuff-client' || true\"",
                     shell=True,
