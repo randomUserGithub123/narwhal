@@ -26,10 +26,6 @@ class PathMaker:
 
     @staticmethod
     def themis_log_file(name: str) -> str:
-        """
-        Log file used to capture stderr of run_demo.sh and run_demo_client.sh.
-        The real Themis execution logs remain log0..log3 in Themis_tx/.
-        """
         return join(PathMaker.logs_path(), f'themis-{name}.log')
 
     @staticmethod

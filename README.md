@@ -30,6 +30,10 @@
 * start the demo client with `scripts/run_demo_client.sh` in another terminal
 * Use Ctrl-C to terminate the client and replicas
 
+### Print Throughput and Latency
+1. Route client logs to a `.log` file: `./scripts/run_demo_client.sh > client.log 2>&1`
+2. Run `python ./scripts/thr_hist.py --interval 1 < client.log`
+
 
 ## DAS Setup
 1. Contact `das-account@cs.vu.nl` for access (you will get credentials via email)

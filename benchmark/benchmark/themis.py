@@ -3,10 +3,7 @@ import os
 import re
 import ast
 import subprocess
-from os.path import basename, splitext
 from time import sleep
-from datetime import datetime, timedelta
-from statistics import mean
 
 from benchmark.commands import CommandMaker
 from benchmark.config import BenchParameters, NodeParameters, ConfigError
@@ -47,12 +44,25 @@ class ThemisBench:
         except subprocess.SubprocessError as e:
             pass
 
+        # SIGKILL to hotstuff-appp; SIGTERM to hotstuff-client
         try:
             subprocess.run(
                 "pkill -9 -f 'examples/hotstuff-app' || true",
                 shell=True,
                 stderr=subprocess.DEVNULL,
             )
+            subprocess.run(
+                "pkill -f 'examples/hotstuff-client' || true",
+                shell=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.SubprocessError:
+            pass
+
+        sleep(5)
+
+        # SIGKILL to hotstuff-client
+        try:
             subprocess.run(
                 "pkill -9 -f 'examples/hotstuff-client' || true",
                 shell=True,
@@ -62,8 +72,59 @@ class ThemisBench:
             pass
 
     def _parse_themis_logs(self):
-        # TODO: Parse logs
-        pass
+        log_file = PathMaker.themis_log_file("client")
+        abs_log_path = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), log_file)
+        )
+
+        if not os.path.exists(abs_log_path):
+            raise BenchError(
+                "Themis client log not found",
+                FileNotFoundError(abs_log_path),
+            )
+
+        cmd = ["python", "./scripts/thr_hist.py", "--interval", "1"]
+
+        proc = subprocess.run(
+            cmd,
+            cwd=PathMaker.themis_code_path(),
+            stdin=open(abs_log_path, "r"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if proc.returncode != 0:
+            print(proc.stderr)
+            raise BenchError(
+                "Failed to parse Themis logs with thr_hist.py",
+                proc.stderr,
+            )
+
+        throughput = None
+        lat_raw = None
+        lat_wo = None
+
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]") and throughput is None:
+                try:
+                    throughput = ast.literal_eval(line)
+                except Exception:
+                    pass
+            m = re.match(r"lat = ([0-9.]+)ms", line)
+            if m:
+                val = float(m.group(1))
+                if lat_raw is None:
+                    lat_raw = val
+                elif lat_wo is None:
+                    lat_wo = val
+
+        print(
+            "\nthroughput: ", throughput,
+            "\nlatency_avg_ms: ", lat_raw,
+            "\nlatency_avg_wo_outliers_ms: ", lat_wo,
+        )
 
     def run(self, debug=False, local=True):
         assert isinstance(debug, bool)
@@ -99,8 +160,8 @@ class ThemisBench:
             Print.info("Generating Themis configuration files...")
             cmd = CommandMaker.generate_themis_config(
                 n_replica_ips=replica_IPs,
-                block_size=int(self.bench_parameters.rate[0] / self.nodes[0]),
-                # block_size=200, # Hardcode for now
+                # block_size=int(self.bench_parameters.rate[0] / self.nodes[0]),
+                block_size=100, # Hardcode for now
                 fairness=self.node_parameters.json['gamma'],
             )
             subprocess.run(

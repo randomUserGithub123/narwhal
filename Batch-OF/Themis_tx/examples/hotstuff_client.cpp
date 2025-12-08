@@ -53,6 +53,8 @@ uint32_t cid;
 uint32_t cnt = 0;
 uint32_t nfaulty;
 
+static uint32_t starting_cnt;
+
 struct Request {
     command_t cmd;
     size_t confirmed;
@@ -128,6 +130,21 @@ bool try_send(bool check = true) {
 void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     auto &fin = msg.fin;
     HOTSTUFF_LOG_DEBUG("got %s", std::string(msg.fin).c_str());
+
+    const uint256_t &cmd_hash = fin.cmd_hash;
+    auto it = waiting.find(cmd_hash);
+    if (it == waiting.end()) return;
+    auto &et = it->second.et;
+    et.stop();
+
+    if (++it->second.confirmed <= nfaulty) return; // wait for f + 1 ack
+
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
+
+    waiting.erase(it);
+
 }
 
 std::pair<std::string, std::string> split_ip_port_cport(const std::string &s) {
@@ -190,6 +207,10 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("out of range");
     cid = opt_cid->get() != -1 ? opt_cid->get() : idx;
 
+    std::mt19937_64 rng(std::random_device{}());
+    starting_cnt = std::uniform_int_distribution<uint32_t>()(rng);
+    cnt = starting_cnt;
+
     for (const auto &p: raw)
     {
         auto _p = split_ip_port_cport(p);
@@ -236,9 +257,9 @@ int main(int argc, char **argv) {
 
         uint64_t sent_in_burst = 0;
         for (uint64_t x = 0; x < burst && max_iter_num; x++) {
-            if (x == 0) {
-                HOTSTUFF_LOG_INFO("Sending sample transaction #%u", cnt);
-            }
+            // if (x == (cnt - starting_cnt) % burst) {
+            //     HOTSTUFF_LOG_INFO("Sending sample transaction #%u", cnt);
+            // }
             if (!try_send())
                 break;
             sent_in_burst++;
@@ -249,20 +270,20 @@ int main(int argc, char **argv) {
 
         if (sent_in_burst > 0 && elapsed_ms > BURST_DURATION_MS) {
             HOTSTUFF_LOG_INFO("Transaction rate too high for this client: "
-                              "burst of %lu tx took %.3f ms (target %.3f ms)",
-                              (unsigned long)sent_in_burst,
-                              elapsed_ms,
-                              BURST_DURATION_MS);
+                            "burst of %lu tx took %.3f ms (target %.3f ms)",
+                            (unsigned long)sent_in_burst,
+                            elapsed_ms,
+                            BURST_DURATION_MS);
         }
 
         te.add(BURST_DURATION_SEC);
     });
 
+
     send_timer.add(BURST_DURATION_SEC);
 
     ec.dispatch();
 
-#ifdef HOTSTUFF_ENABLE_BENCHMARK
     for (const auto &e: elapsed)
     {
         char fmt[64];
@@ -270,7 +291,7 @@ int main(int argc, char **argv) {
         strftime(fmt, sizeof fmt, "%Y-%m-%d %H:%M:%S.%%06u [hotstuff info] %%.6f\n", tmp);
         fprintf(stderr, fmt, e.first.tv_usec, e.second);
     }
-#endif
+    
     HOTSTUFF_LOG_INFO("time_consumed_in_cmd_generation = %lf", time_consumed_in_cmd_generation);
     return 0;
 }
