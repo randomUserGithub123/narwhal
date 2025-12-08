@@ -19,10 +19,19 @@ class PathMaker:
         return join('..', 'node')
     
     @staticmethod
-    def themis_code_path():
+    def themis_code_path(flavor=None):
         benchmark_dir = dirname(dirname(__file__))
         root_dir = abspath(join(benchmark_dir, '..'))
-        return join(root_dir, 'Batch-OF', 'Themis_tx')
+        dir_name = 'Themis_tx'
+        if(
+            flavor == "rashnu"
+        ):
+            dir_name = "Rashnu"
+        elif(
+            flavor == "dikaios"
+        ):
+            dir_name = "dikaios"
+        return join(root_dir, 'Batch-OF', dir_name)
 
     @staticmethod
     def themis_log_file(name: str) -> str:

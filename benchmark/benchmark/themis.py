@@ -45,11 +45,13 @@ class ThemisBench:
                 ["bash", "-lc", full_cmd],
                 stdout=open(abs_log_path, "w"),
                 stderr=subprocess.STDOUT,
-                cwd=PathMaker.themis_code_path(),
+                cwd=PathMaker.themis_code_path(
+                    flavor=self.flavor
+                ),
             )
         else:
             assert hostname is not None, "Hostname must be provided in remote mode"
-            full_cmd = f"source /etc/profile; cd {PathMaker.themis_code_path()}; ulimit -s unlimited; {command} > {abs_log_path} 2>&1 &"
+            full_cmd = f"source /etc/profile; cd {PathMaker.themis_code_path(flavor=self.flavor)}; ulimit -s unlimited; {command} > {abs_log_path} 2>&1 &"
             ssh_cmd = f"ssh {hostname} '{full_cmd}'"
             print(f"[remote-run] {ssh_cmd}")
             subprocess.Popen(ssh_cmd, shell=True)
@@ -148,7 +150,9 @@ class ThemisBench:
 
         proc = subprocess.run(
             cmd,
-            cwd=PathMaker.themis_code_path(),
+            cwd=PathMaker.themis_code_path(
+                flavor=self.flavor
+            ),
             stdin=open(abs_log_path, "r"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -187,8 +191,16 @@ class ThemisBench:
             "\nlatency_avg_wo_outliers_ms: ", lat_wo,
         )
 
-    def run(self, debug=False, local=True):
+    def run(self, debug=False, local=True, flavor="themis"):
+        
         assert isinstance(debug, bool)
+        assert flavor in [
+            "themis",
+            "rashnu",
+            "dikaios"
+        ]
+        self.flavor = flavor
+
         Print.heading("Starting Themis local benchmark")
 
         self._kill_nodes()
@@ -201,14 +213,18 @@ class ThemisBench:
             subprocess.run(
                 "rm -f log* hotstuff.conf hotstuff-sec*.conf nodes.txt ips.txt", 
                 shell=True, 
-                cwd=PathMaker.themis_code_path()
+                cwd=PathMaker.themis_code_path(
+                    flavor=self.flavor
+                )
             )
 
             sleep(0.5)
 
             Print.info("Compiling Themis ...")
             cmd = CommandMaker.compile_themis()
-            subprocess.run(cmd, shell=True, check=True, cwd=PathMaker.themis_code_path())
+            subprocess.run(cmd, shell=True, check=True, cwd=PathMaker.themis_code_path(
+                flavor=self.flavor
+            ))
 
             if(
                 local
@@ -224,16 +240,39 @@ class ThemisBench:
                 clients_hostnames = all_hostnames[self._amount_for_nodes:]
 
             Print.info("Generating Themis configuration files...")
+            if(
+                flavor == "themis"
+            ):
+                sb_users = 1000000
+                sb_prob = 0.9
+                sb_skew_factor = 0.1
+            elif(
+                flavor == "rashnu"
+            ):
+                sb_users = 100
+                sb_prob = 0.95
+                sb_skew_factor = 0.99
+            elif(
+                flavor == "dikaios"
+            ):
+                sb_users = 1000000
+                sb_prob = 0.9
+                sb_skew_factor = 0.1
             cmd = CommandMaker.generate_themis_config(
                 n_replica_ips=replica_IPs,
                 block_size=self.node_parameters.json['lo_size'],
                 fairness=self.node_parameters.json['gamma'],
+                sb_users=sb_users,
+                sb_prob=sb_prob,
+                sb_skew_factor=sb_skew_factor,
             )
             subprocess.run(
                 cmd,
                 shell=True,
                 check=True,
-                cwd=PathMaker.themis_code_path(),
+                cwd=PathMaker.themis_code_path(
+                    flavor=flavor
+                ),
             )
 
             logs_dir = os.path.abspath(PathMaker.logs_path())
@@ -253,6 +292,9 @@ class ThemisBench:
                 idx=0,
                 max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
                 fairness=self.node_parameters.json['gamma'],
+                sb_users=sb_users,
+                sb_prob=sb_prob,
+                sb_skew_factor=sb_skew_factor,
             )
             client_log = PathMaker.themis_log_file("client")
             self._background_run(client_cmd, client_log, clients_hostnames[0])
