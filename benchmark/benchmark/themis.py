@@ -64,26 +64,19 @@ class ThemisBench:
                 hosts = self._get_hostnames()
 
                 for host in hosts:
-                    Print.info(f"[{host}] Sending SIGTERM to hotstuff-app and hotstuff-client")
+                    Print.info(f"[{host}] Sending SIGTERM to hotstuff-app and hotstuff-client (graceful shutdown)")
                     subprocess.run(
-                        f"ssh {host} \"pkill -f 'examples/hotstuff-app' || true; pkill -f 'examples/hotstuff-client' || true\"",
+                        f"ssh {host} \"pkill -TERM -f 'examples/hotstuff-app' || true; pkill -TERM -f 'examples/hotstuff-client' || true\"",
                         shell=True,
                         stderr=subprocess.DEVNULL,
                     )
 
-                sleep(1)
+                sleep(5)
 
                 for host in hosts:
-                    Print.info(f"[{host}] Sending SIGKILL to remaining processes")
+                    Print.info(f"[{host}] Checking for remaining processes (SIGKILL only if needed)")
                     subprocess.run(
-                        f"ssh {host} \"pkill -9 -f 'examples/hotstuff-app' || true; pkill -9 -f 'examples/hotstuff-client' || true\"",
-                        shell=True,
-                        stderr=subprocess.DEVNULL,
-                    )
-
-                for host in hosts:
-                    subprocess.run(
-                        f"ssh {host} \"rm -f /tmp/hotstuff* || true\"",
+                        f"ssh {host} \"pgrep -f 'examples/hotstuff' >/dev/null && pkill -9 -f 'examples/hotstuff' || true\"",
                         shell=True,
                         stderr=subprocess.DEVNULL,
                     )
@@ -124,7 +117,7 @@ class ThemisBench:
         self._amount_for_nodes = self.nodes[0]
         self._num_machines = self._amount_for_nodes + 1
 
-        time_string = str(datetime.timedelta(seconds=self.duration + 30)) # extra time to set up things
+        time_string = str(datetime.timedelta(seconds=self.duration + 60)) # extra time to set up things
         self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
 
     def _get_hostnames(self):
