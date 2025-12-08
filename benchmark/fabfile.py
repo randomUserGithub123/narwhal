@@ -81,7 +81,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def themis(ctx, debug=True, local=False, username="mputnik", flavor="dikaios"):
+def themis(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 4,
