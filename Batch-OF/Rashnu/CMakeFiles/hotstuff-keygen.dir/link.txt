@@ -1,0 +1,1 @@
+/usr/bin/c++ -include cstdint -O3  -g3 -W -Wall -Wextra -pedantic -Wsuggest-override -Wl,--dependency-file=CMakeFiles/hotstuff-keygen.dir/link.d "CMakeFiles/hotstuff-keygen.dir/src/hotstuff_keygen.cpp.o" -o hotstuff-keygen  libhotstuff.a salticidae/libsalticidae.a -luv -lssl -lpthread secp256k1/.libs/libsecp256k1.a -lcrypto

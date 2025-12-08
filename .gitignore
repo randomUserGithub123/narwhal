@@ -12,14 +12,14 @@ rust/.idea/*
 **/*.conf
 **/*.a
 **/*.so
-**/*.txt
-**/*.cmake
-**/Makefile
+# **/*.txt
+# **/*.cmake
+# **/Makefile
 **/hotstuff-keygen
 **/hotstuff-tls-keygen
-**/test_secp256k1
-**/libsecp256k1-prefix
-**/CMakeFiles
+# **/test_secp256k1
+# **/libsecp256k1-prefix
+# **/CMakeFiles
 **/test_graph
 
 target/

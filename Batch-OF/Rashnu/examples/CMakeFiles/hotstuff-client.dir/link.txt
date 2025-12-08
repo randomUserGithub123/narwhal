@@ -1,0 +1,1 @@
+/usr/bin/c++ -include cstdint -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/hotstuff-client.dir/link.d "CMakeFiles/hotstuff-client.dir/hotstuff_client.cpp.o" -o hotstuff-client  ../libhotstuff.a ../salticidae/libsalticidae.a -luv -lssl -lpthread ../secp256k1/.libs/libsecp256k1.a -lcrypto

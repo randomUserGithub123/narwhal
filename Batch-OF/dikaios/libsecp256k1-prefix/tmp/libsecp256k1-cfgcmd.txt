@@ -1,0 +1,1 @@
+cmd='/home/yancey/Order-Fairness/myOrder/myOrder/secp256k1/autogen.sh;COMMAND;/home/yancey/Order-Fairness/myOrder/myOrder/secp256k1/configure;--disable-shared;--with-pic;--with-bignum=no;--enable-module-recovery'

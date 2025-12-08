@@ -1,0 +1,1 @@
+cmd='/home/nnescio/Documents/university/thesis/code/narwhal/Batch-OF/Rashnu/secp256k1/autogen.sh;COMMAND;/home/nnescio/Documents/university/thesis/code/narwhal/Batch-OF/Rashnu/secp256k1/configure;--disable-shared;--with-pic;--with-bignum=no;--enable-module-recovery'
