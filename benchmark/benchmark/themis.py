@@ -99,7 +99,8 @@ class ThemisBench:
             Print.info("Generating Themis configuration files...")
             cmd = CommandMaker.generate_themis_config(
                 n_replica_ips=replica_IPs,
-                block_size=101, # Hardcode for now
+                block_size=int(self.bench_parameters.rate[0] / self.nodes[0]),
+                # block_size=200, # Hardcode for now
                 fairness=self.node_parameters.json['gamma'],
             )
             subprocess.run(
@@ -120,7 +121,7 @@ class ThemisBench:
             Print.info("Starting Themis Client ...")
             client_cmd = CommandMaker.run_themis_client(
                 idx=0,
-                max_async=500, # Hardcode for now
+                max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
                 fairness=self.node_parameters.json['gamma'],
             )
             client_log = PathMaker.themis_log_file("client")

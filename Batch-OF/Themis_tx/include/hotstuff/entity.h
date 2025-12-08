@@ -35,7 +35,7 @@
 
 namespace hotstuff {
 
-#define MAX_PROPOSAL_SIZE_SUPPORTED 960
+#define MAX_PROPOSAL_SIZE_SUPPORTED 10000
 
 enum EntityType {
     ENT_TYPE_CMD = 0x0,

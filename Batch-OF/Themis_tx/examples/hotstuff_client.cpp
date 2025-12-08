@@ -20,6 +20,7 @@
 #include <memory>
 #include <signal.h>
 #include <sys/time.h>
+#include <algorithm>
 
 #include "salticidae/type.h"
 #include "salticidae/netaddr.h"
@@ -46,7 +47,7 @@ using hotstuff::command_t;
 
 EventContext ec;
 ReplicaID proposer;
-size_t max_async_num;
+size_t max_async_num;   // tx/s
 int max_iter_num;
 uint32_t cid;
 uint32_t cnt = 0;
@@ -60,6 +61,7 @@ struct Request {
 };
 
 using Net = salticidae::MsgNetwork<opcode_t>;
+using TimerEvent = salticidae::TimerEvent;
 
 std::unordered_map<ReplicaID, Net::conn_t> conns;
 std::unordered_map<const uint256_t, Request> waiting;
@@ -69,65 +71,63 @@ std::unique_ptr<Net> mn;
 SmallBankManager *small_bank_manager;
 double time_consumed_in_cmd_generation = 0.0;
 
-
 void connect_all() {
-    for (size_t i = 0; i < replicas.size(); i++)
-        conns.insert(std::make_pair(i, mn->connect_sync(replicas[i])));
+    for (size_t i = 0; i < replicas.size(); i++) {
+        auto conn = mn->connect_sync(replicas[i]);
+        conns.insert(std::make_pair(i, conn));
+    }
 }
 
 bool try_send(bool check = true) {
-    if ((!check || waiting.size() < max_async_num) && max_iter_num)
-    {
-        // auto cmd = new CommandDummy(cid, cnt++);
-        salticidae::ElapsedTime et_cmd_generation;
-        et_cmd_generation.start();
-        auto next_tx = small_bank_manager->get_next_transaction_serialized();
-        auto cmd = new CommandDummy(cid, cnt++, next_tx);
+    (void)check;
 
-        MsgReqCmd msg(*cmd);
-        for (auto &p: conns) mn->send_msg(msg, p.second);
+    if (!max_iter_num)
+        return false;
+
+    salticidae::ElapsedTime et_cmd_generation;
+    et_cmd_generation.start();
+
+    auto next_tx = small_bank_manager->get_next_transaction_serialized();
+    auto cmd = new CommandDummy(cid, cnt++, next_tx);
+
+    MsgReqCmd msg(*cmd);
+
+    std::vector<Net::conn_t> shuffled_conns;
+    shuffled_conns.reserve(conns.size());
+    for (auto &p: conns) shuffled_conns.push_back(p.second);
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    std::shuffle(shuffled_conns.begin(), shuffled_conns.end(), rng);
+
+    for (auto &c: shuffled_conns)
+        mn->send_msg(msg, c);
+
 #ifndef HOTSTUFF_ENABLE_BENCHMARK
-
-        std::string data = "";
-        const uint64_t *payload =  cmd->get_payload();
-        for(int i=0; i<cmd->get_payload_size(); i++){
-            data += std::to_string(payload[i]) + " ";
-        }
-        
-        HOTSTUFF_LOG_INFO("send new cmd %.10s with payload (size %ld) %s",
-                            get_hex(cmd->get_hash()).c_str(), cmd->get_payload_size(), data.c_str());
-#endif
-        et_cmd_generation.stop();
-        time_consumed_in_cmd_generation += et_cmd_generation.elapsed_sec;
-        waiting.insert(std::make_pair(
-            cmd->get_hash(), Request(cmd)));
-        if (max_iter_num > 0)
-            max_iter_num--;
-        return true;
+    std::string data;
+    const uint64_t *payload = cmd->get_payload();
+    for (int i = 0; i < cmd->get_payload_size(); i++) {
+        data += std::to_string(payload[i]) + " ";
     }
-    return false;
+
+    HOTSTUFF_LOG_INFO("send new cmd %.10s with payload (size %ld) %s",
+                        get_hex(cmd->get_hash()).c_str(),
+                        cmd->get_payload_size(),
+                        data.c_str());
+#endif
+
+    et_cmd_generation.stop();
+    time_consumed_in_cmd_generation += et_cmd_generation.elapsed_sec;
+
+    waiting.insert(std::make_pair(cmd->get_hash(), Request(cmd)));
+
+    if (max_iter_num > 0)
+        max_iter_num--;
+
+    return true;
 }
 
 void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     auto &fin = msg.fin;
     HOTSTUFF_LOG_DEBUG("got %s", std::string(msg.fin).c_str());
-    const uint256_t &cmd_hash = fin.cmd_hash;
-    auto it = waiting.find(cmd_hash);
-    auto &et = it->second.et;
-    if (it == waiting.end()) return;
-    et.stop();
-    if (++it->second.confirmed <= nfaulty) return; // wait for f + 1 ack
-#ifndef HOTSTUFF_ENABLE_BENCHMARK
-    HOTSTUFF_LOG_INFO("got %s, wall: %.3f, cpu: %.3f",
-                        std::string(fin).c_str(),
-                        et.elapsed_sec, et.cpu_elapsed_sec);
-#else
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
-#endif
-    waiting.erase(it);
-    while (try_send());
 }
 
 std::pair<std::string, std::string> split_ip_port_cport(const std::string &s) {
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
     auto opt_idx = Config::OptValInt::create(0);
     auto opt_replicas = Config::OptValStrVec::create();
     auto opt_max_iter_num = Config::OptValInt::create(100);
-    auto opt_max_async_num = Config::OptValInt::create(10);
+    auto opt_max_async_num = Config::OptValInt::create(10); // tx/s
     auto opt_cid = Config::OptValInt::create(-1);
     auto opt_max_cli_msg = Config::OptValInt::create(65536); // 64K by default
 
@@ -168,11 +168,15 @@ int main(int argc, char **argv) {
     config.add_opt("replica", opt_replicas, Config::APPEND);
     config.add_opt("iter", opt_max_iter_num, Config::SET_VAL);
     config.add_opt("max-async", opt_max_async_num, Config::SET_VAL);
-    config.add_opt("max-cli-msg", opt_max_cli_msg, Config::SET_VAL, 'S', "the maximum client message size");
+    config.add_opt("max-cli-msg", opt_max_cli_msg, Config::SET_VAL, 'S',
+                   "the maximum client message size");
+
     config.parse(argc, argv);
+
     auto idx = opt_idx->get();
     max_iter_num = opt_max_iter_num->get();
     max_async_num = opt_max_async_num->get();
+
     std::vector<std::string> raw;
     for (const auto &s: opt_replicas->get())
     {
@@ -185,6 +189,7 @@ int main(int argc, char **argv) {
     if (!(0 <= idx && (size_t)idx < raw.size() && raw.size() > 0))
         throw std::invalid_argument("out of range");
     cid = opt_cid->get() != -1 ? opt_cid->get() : idx;
+
     for (const auto &p: raw)
     {
         auto _p = split_ip_port_cport(p);
@@ -194,14 +199,67 @@ int main(int argc, char **argv) {
 
     double fairness_parameter = opt_fairness_parameter->get();
     // nfaulty = (replicas.size() - 1) / 4;
-    nfaulty = (replicas.size() * ((2*fairness_parameter) -1))/4;
+    nfaulty = (replicas.size() * ((2 * fairness_parameter) - 1)) / 4;
     HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
 
-    HOTSTUFF_LOG_INFO("opt_sb_users = %ld, opt_sb_prob_choose_mtx = %f, opt_sb_skew_factor = %f", opt_sb_users->get(), opt_sb_prob_choose_mtx->get(), opt_sb_skew_factor->get());
-    small_bank_manager = new SmallBankManager(opt_sb_users->get(), opt_sb_prob_choose_mtx->get(), opt_sb_skew_factor->get());
+    HOTSTUFF_LOG_INFO("opt_sb_users = %ld, opt_sb_prob_choose_mtx = %f, opt_sb_skew_factor = %f",
+                      opt_sb_users->get(),
+                      opt_sb_prob_choose_mtx->get(),
+                      opt_sb_skew_factor->get());
+
+    small_bank_manager = new SmallBankManager(opt_sb_users->get(),
+                                              opt_sb_prob_choose_mtx->get(),
+                                              opt_sb_skew_factor->get());
 
     connect_all();
-    while (try_send());
+
+    const uint64_t PRECISION = 1;
+    const double BURST_DURATION_SEC = 1.0 / PRECISION;
+    const double BURST_DURATION_MS  = BURST_DURATION_SEC * 1000.0;
+    const uint64_t burst = static_cast<uint64_t>(max_async_num) / PRECISION;
+
+    HOTSTUFF_LOG_INFO("Transactions rate: %zu tx/s (max-async)", max_async_num);
+    if (burst == 0) {
+        HOTSTUFF_LOG_WARN("burst == 0 (max-async == 0): no transactions will be sent");
+    }
+    HOTSTUFF_LOG_INFO("Start sending transactions");
+
+    TimerEvent send_timer(ec, [&](TimerEvent &te) {
+        if (!max_iter_num) {
+            HOTSTUFF_LOG_INFO("client finished sending all transactions, stopping event loop");
+            ec.stop();
+            return;
+        }
+
+        salticidae::ElapsedTime loop_et;
+        loop_et.start();
+
+        uint64_t sent_in_burst = 0;
+        for (uint64_t x = 0; x < burst && max_iter_num; x++) {
+            if (x == 0) {
+                HOTSTUFF_LOG_INFO("Sending sample transaction #%u", cnt);
+            }
+            if (!try_send())
+                break;
+            sent_in_burst++;
+        }
+
+        loop_et.stop();
+        double elapsed_ms = loop_et.elapsed_sec * 1000.0;
+
+        if (sent_in_burst > 0 && elapsed_ms > BURST_DURATION_MS) {
+            HOTSTUFF_LOG_INFO("Transaction rate too high for this client: "
+                              "burst of %lu tx took %.3f ms (target %.3f ms)",
+                              (unsigned long)sent_in_burst,
+                              elapsed_ms,
+                              BURST_DURATION_MS);
+        }
+
+        te.add(BURST_DURATION_SEC);
+    });
+
+    send_timer.add(BURST_DURATION_SEC);
+
     ec.dispatch();
 
 #ifdef HOTSTUFF_ENABLE_BENCHMARK
