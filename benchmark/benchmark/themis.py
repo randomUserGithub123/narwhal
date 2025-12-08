@@ -71,7 +71,7 @@ class ThemisBench:
                         stderr=subprocess.DEVNULL,
                     )
 
-                sleep(5)
+                sleep(1)
 
                 for host in hosts:
                     Print.info(f"[{host}] Sending SIGKILL to remaining processes")
@@ -243,6 +243,10 @@ class ThemisBench:
                 check=True,
                 cwd=PathMaker.themis_code_path(),
             )
+
+            logs_dir = os.path.abspath(PathMaker.logs_path())
+            os.makedirs(logs_dir, exist_ok=True)
+            Print.info(f"Logs directory ensured at {logs_dir}")
 
             Print.info("Starting Themis Replicas ...")
             replica_cmds = CommandMaker.run_themis_replicas(self.nodes[0])
