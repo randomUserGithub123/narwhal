@@ -11,6 +11,14 @@ use std::time::Instant;
 use crypto::{Digest, Hash, PublicKey};
 use nohash::{IntMap, IntSet};
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WorkerMessage {
+    TxDigest(Digest),
+    Batch(PublicKey, Batch),
+    BatchRequest(Vec<Digest>, /* origin */ PublicKey),
+}
 
 use crate::batch_maker::Batch;
 
@@ -239,13 +247,48 @@ impl GlobalOrder {
                     for (_author, lo_digests) in &author_to_lo_digests_subdag {
                         for lo_digest in lo_digests {
                             
-                            let local_order_opt = self.digest_to_local_order.remove(lo_digest);
-                            if local_order_opt.is_none() {
-                                log::warn!("LocalOrder {:?} missing in digest_to_local_order", lo_digest);
-                                continue;
-                            }
+                            let read_res = self.store.read(lo_digest.to_vec()).await;
+                            let serialized = match read_res {
+                                Ok(Some(v)) => v,
+                                Ok(None) => {
+                                    log::warn!(
+                                        "LocalOrder {:?} missing in RocksDB store",
+                                        lo_digest
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Error reading LocalOrder {:?} from store: {}",
+                                        lo_digest, e
+                                    );
+                                    continue;
+                                }
+                            };
 
-                            let local_order = local_order_opt.unwrap();
+                            let local_order: Vec<Vec<u8>> = match bincode::deserialize(&serialized) {
+                                Ok(WorkerMessage::Batch(_author, batch)) => batch,
+                                Ok(WorkerMessage::TxDigest(..)) => {
+                                    log::error!(
+                                        "Got TxDigest?"
+                                    );
+                                    continue;
+                                },
+                                Ok(WorkerMessage::BatchRequest(..)) => {
+                                    log::error!(
+                                        "Got BatchRequest?"
+                                    );
+                                    continue;
+                                },
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to deserialize LocalOrder {:?} from store: {}",
+                                        lo_digest, e
+                                    );
+                                    continue;
+                                }
+                            };
+
                             let mut indices: Vec<usize> = Vec::with_capacity(local_order.len());
 
                             for tx_digest in local_order {
@@ -258,6 +301,7 @@ impl GlobalOrder {
                             }
 
                             indices_sets.push(indices);
+
                         }
                     }
 
@@ -363,8 +407,8 @@ impl GlobalOrder {
                         .or_default()
                         .push(lo_digest.clone());
                     
-                    self.digest_to_local_order
-                        .insert(lo_digest, local_order);
+                    // self.digest_to_local_order
+                    //     .insert(lo_digest, local_order);
 
                 },
                 Some(final_order) = self.rx_utig_results.recv() => {
