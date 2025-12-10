@@ -1,67 +1,74 @@
+use futures::channel::mpsc::Sender;
 use primary::Round;
 use store::Store;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use tokio::sync::mpsc::Receiver;
 use tokio::task;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use crypto::{Digest, PublicKey};
+use crypto::{Digest, Hash, PublicKey};
+use nohash::{IntMap, IntSet};
+use once_cell::sync::Lazy;
 
 use crate::batch_maker::Batch;
 
 const MAX_TX: usize = 10_000;
+const MATRIX_POOL_SIZE: usize = 4; // M
 
-struct GlobalOrderState {
-
-    tx_digest_to_index: HashMap<Vec<u8>, usize>,
-    index_to_tx_digest: Vec<Vec<u8>>,
-    free_indices: Vec<usize>,
+pub struct UTIGMatrix {
+    pub weight: Vec<u16>,          // N×N
+    pub support: Vec<u16>,         // N
+    pub is_non_blank: Vec<bool>,   // N
+    pub is_solid: Vec<bool>,       // N
+    pub edges: Vec<Vec<usize>>,    // adjacency
 }
 
-impl GlobalOrderState {
-
-    fn new() -> Self {
-
-        let tx_digest_to_index = HashMap::with_capacity(MAX_TX);
-        let index_to_tx_digest = Vec::with_capacity(MAX_TX);
-
-        GlobalOrderState {
-            tx_digest_to_index,
-            index_to_tx_digest,
-            free_indices: Vec::new(),
+impl UTIGMatrix {
+    pub fn new() -> Self {
+        UTIGMatrix {
+            weight: vec![0; MAX_TX * MAX_TX],
+            support: vec![0; MAX_TX],
+            is_non_blank: vec![false; MAX_TX],
+            is_solid: vec![false; MAX_TX],
+            edges: (0..MAX_TX).map(|_| Vec::with_capacity(64)).collect(),
         }
     }
 
-    fn index_for_digest(&mut self, digest: Vec<u8>) -> usize {
-
-        if let Some(&idx) = self.tx_digest_to_index.get(&digest) {
-            return idx;
-        }
-
-        let idx = if let Some(free_idx) = self.free_indices.pop() {
-            self.index_to_tx_digest[free_idx] = digest.clone();
-            free_idx
-        }else{
-            let idx = self.index_to_tx_digest.len();
-            self.index_to_tx_digest.push(digest.clone());
-            idx
-        };
-
-        self.tx_digest_to_index.insert(digest.clone(), idx);
-
-        idx
+    #[inline]
+    pub fn reset(&mut self, k: usize) {
+        // fast clear: only reset the slice actually used
+        self.weight[..k * k].fill(0);
+        self.support[..k].fill(0);
+        self.is_non_blank[..k].fill(false);
+        self.is_solid[..k].fill(false);
+        for e in &mut self.edges[..k] { e.clear(); }
     }
-
-    fn remove_tx(&mut self, idx: usize) {
-        if let Some(tx_digest) = self.index_to_tx_digest.get(idx) {
-            self.tx_digest_to_index.remove(tx_digest); 
-            self.index_to_tx_digest[idx].clear();
-            self.free_indices.push(idx);
-        }
-    }
-
 }
+
+pub struct UTIGMatrixPool {
+    pub pool: [UTIGMatrix; MATRIX_POOL_SIZE],
+    pub next: usize,
+}
+
+impl UTIGMatrixPool {
+    pub fn new() -> Self {
+        UTIGMatrixPool {
+            pool: [UTIGMatrix::new(), UTIGMatrix::new(), UTIGMatrix::new(), UTIGMatrix::new()],
+            next: 0,
+        }
+    }
+
+    pub fn acquire(&mut self) -> &mut UTIGMatrix {
+        let idx = self.next;
+        self.next = (self.next + 1) % MATRIX_POOL_SIZE;
+        &mut self.pool[idx]
+    }
+}
+
+static UTIG_POOL: Lazy<Mutex<UTIGMatrixPool>> =
+    Lazy::new(|| Mutex::new(UTIGMatrixPool::new()));
 
 #[cfg(test)]
 #[path = "tests/global_order_tests.rs"]
@@ -82,7 +89,6 @@ pub struct GlobalOrder {
     non_blank_threshold: u16,
     solid_threshold: u16,
 
-    state: Arc<Mutex<GlobalOrderState>>,
     author_to_lo_digests: HashMap<PublicKey, Vec<Digest>>,
     digest_to_local_order: HashMap<Digest, Vec<Vec<u8>>>,
     author_round_boundaries: HashMap<PublicKey, Vec<(Round, usize, usize)>>,
@@ -103,7 +109,6 @@ impl GlobalOrder {
         f: u64,
         gamma: f64,
     ) -> Self {
-        let state = Arc::new(Mutex::new(GlobalOrderState::new()));
 
         let non_blank_threshold =
             ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
@@ -121,7 +126,6 @@ impl GlobalOrder {
             gamma,
             non_blank_threshold,
             solid_threshold,
-            state,
             author_to_lo_digests: HashMap::new(),
             digest_to_local_order: HashMap::new(),
             author_round_boundaries: HashMap::new(),
@@ -141,84 +145,6 @@ impl GlobalOrder {
         loop {
             tokio::select! {
 
-                Some((author, lo_digest, local_order)) = self.rx_local_orders.recv() => {
-
-                    self.author_to_lo_digests
-                        .entry(author)
-                        .or_default()
-                        .push(lo_digest.clone());
-                    
-                    self.digest_to_local_order
-                        .insert(lo_digest, local_order);
-
-                },
-                Some((author, round, lo_digests)) = self.rx_header_update.recv() => {
-                    
-                    let author_local_orders = self.author_to_lo_digests
-                        .get(&author)
-                        .expect("Header arrived for author, but we have not received LocalOrders?");
-
-                    let author_round_boundary = self.author_round_boundaries
-                        .entry(author.clone())
-                        .or_default();
-
-                    let prev_boundary_opt = author_round_boundary
-                        .iter()
-                        .rev()
-                        .find(|(r, _start, _end)| *r < round);
-
-                    let search_start = match prev_boundary_opt {
-                        Some((_prev_round, _prev_start, prev_end)) => prev_end + 1,
-                        None => 0,
-                    };
-
-                    let target_len = lo_digests.len();
-                    let lo_set: HashSet<Digest> = lo_digests.into_iter().collect();
-                    let mut found: Option<(usize, usize)> = None;
-                    let n = author_local_orders.len();
-
-                    'outer: for i in search_start..=n - target_len {
-                        
-                        if !lo_set.contains(&author_local_orders[i]) {
-                            continue;
-                        }
-
-                        let mut remaining = lo_set.clone();
-                        let mut ok = true;
-
-                        for j in i..i + target_len {
-                            let d = &author_local_orders[j];
-                            if !remaining.remove(d) {
-                                ok = false;
-                                break;
-                            }
-                        }
-
-                        if ok && remaining.is_empty() {
-                            let start_idx = i;
-                            let end_idx = i + target_len - 1;
-                            found = Some((start_idx, end_idx));
-                            break 'outer;
-                        }
-                    }
-
-                    match found {
-                        Some((start_idx, end_idx)) => {
-                            author_round_boundary.push((round, start_idx, end_idx));
-                        }
-                        None => {
-                            log::warn!(
-                                "rx_header_update: could not find contiguous block for author {:?}, round {} \
-                                starting from index {}, with {} digests",
-                                author,
-                                round,
-                                search_start,
-                                target_len
-                            );
-                        }
-                    }
-
-                },
                 Some(sub_dag) = self.rx_consensus_update.recv() => {
 
                     log::info!("Received sub-dag : {:?}", sub_dag);
@@ -285,50 +211,139 @@ impl GlobalOrder {
                     );
 
                     let mut indices_sets: Vec<Vec<usize>> = Vec::new();
-                    {
-                        let mut g = self.state.lock().expect("Failed to get lock");
+                    let mut digest_to_local: HashMap<Vec<u8>, usize> = HashMap::new();
+                    let mut next_idx: usize = 0;
 
-                        for (_, lo_digests) in author_to_lo_digests_subdag.iter() {
-                            let mut author_indices: Vec<usize> = Vec::new();
-                            for lo_digest in lo_digests {
-
-                                let local_order = self.digest_to_local_order
-                                    .get(lo_digest)
-                                    .expect("Not able to retrieve local_order");
-                                for tx_digest in local_order {
-                                    author_indices.push(g.index_for_digest(tx_digest.clone()));
-                                }
-
+                    for (_author, lo_digests) in &author_to_lo_digests_subdag {
+                        for lo_digest in lo_digests {
+                            
+                            let local_order_opt = self.digest_to_local_order.remove(lo_digest);
+                            if local_order_opt.is_none() {
+                                log::warn!("LocalOrder {:?} missing in digest_to_local_order", lo_digest);
+                                continue;
                             }
-                            indices_sets.push(author_indices);
-                        }
 
+                            let local_order = local_order_opt.unwrap();
+                            let mut indices: Vec<usize> = Vec::with_capacity(local_order.len());
+
+                            for tx_digest in local_order {
+                                let idx = *digest_to_local.entry(tx_digest.clone()).or_insert_with(|| {
+                                    let curr = next_idx;
+                                    next_idx += 1;
+                                    curr
+                                });
+                                indices.push(idx);
+                            }
+
+                            indices_sets.push(indices);
+                        }
                     }
 
+                    let k = next_idx;
                     let t2 = start_time.elapsed().as_nanos() - t1;
                     log::info!(
-                        "t2 : {}", t2
+                        "t2 : {}\nunique txs (k): {}\nLocalOrders processed: {}",
+                        t2,
+                        k,
+                        indices_sets.len()
                     );
 
-                    let non_blank_threshold = self.non_blank_threshold;
-                    let solid_threshold = self.solid_threshold;
+                    let non_blank = self.non_blank_threshold;
+                    let solid = self.solid_threshold;
                     let tx_utig_results = self.tx_utig_results.clone();
 
-                    task::spawn_blocking(move || {
-                        run_utig(indices_sets, non_blank_threshold, solid_threshold, tx_utig_results);
+                    tokio::task::spawn_blocking(move || {
+                        run_utig(indices_sets, k, non_blank, solid, tx_utig_results);
                     });
 
                     log::info!(
-                        "spawn_blocking overhead: {} ns",
-                        start_time.elapsed().as_nanos() - t2
+                        "\nspawning UTIG: {}", start_time.elapsed().as_nanos() - t2
                     );
 
                 },
-                Some(final_order) = self.rx_utig_results.recv() => {
-                    let mut g = self.state.lock().expect("Failed to get lock");
-                    for idx in &final_order {
-                        g.remove_tx(*idx);
+
+                Some((author, round, lo_digests)) = self.rx_header_update.recv() => {
+                    
+                    let author_local_orders = self.author_to_lo_digests
+                        .get(&author)
+                        .expect("Header arrived for author, but we have not received LocalOrders?");
+
+                    let author_round_boundary = self.author_round_boundaries
+                        .entry(author.clone())
+                        .or_default();
+
+                    let prev_boundary_opt = author_round_boundary
+                        .iter()
+                        .rev()
+                        .find(|(r, _start, _end)| *r < round);
+
+                    let search_start = match prev_boundary_opt {
+                        Some((_prev_round, _prev_start, prev_end)) => prev_end + 1,
+                        None => 0,
+                    };
+
+                    let target_len = lo_digests.len();
+                    let lo_set: HashSet<Digest> = lo_digests.into_iter().collect();
+                    let mut found: Option<(usize, usize)> = None;
+                    let n = author_local_orders.len();
+
+                    'outer: for i in search_start..=n - target_len {
+                        
+                        if !lo_set.contains(&author_local_orders[i]) {
+                            continue;
+                        }
+
+                        let mut remaining = lo_set.clone();
+                        let mut ok = true;
+
+                        for j in i..i + target_len {
+                            let d = &author_local_orders[j];
+                            if !remaining.remove(d) {
+                                ok = false;
+                                break;
+                            }
+                        }
+
+                        if ok && remaining.is_empty() {
+                            let start_idx = i;
+                            let end_idx = i + target_len - 1;
+                            found = Some((start_idx, end_idx));
+                            break 'outer;
+                        }
                     }
+
+                    match found {
+                        Some((start_idx, end_idx)) => {
+                            author_round_boundary.push((round, start_idx, end_idx));
+                        }
+                        None => {
+                            log::warn!(
+                                "rx_header_update: could not find contiguous block for author {:?}, round {} \
+                                starting from index {}, with {} digests",
+                                author,
+                                round,
+                                search_start,
+                                target_len
+                            );
+                        }
+                    }
+                },
+
+                Some((author, lo_digest, local_order)) = self.rx_local_orders.recv() => {
+
+                    log::info!("rx_local_orders: {} {}", author, lo_digest);
+
+                    self.author_to_lo_digests
+                        .entry(author)
+                        .or_default()
+                        .push(lo_digest.clone());
+                    
+                    self.digest_to_local_order
+                        .insert(lo_digest, local_order);
+
+                },
+                Some(final_order) = self.rx_utig_results.recv() => {
+                    // TODO:
                 }
 
             }
@@ -337,164 +352,140 @@ impl GlobalOrder {
 }
 
 
-fn run_utig(
-    indices_sets: Vec<Vec<usize>>,  // GLOBAL indices
+pub fn run_utig(
+    indices_sets: Vec<Vec<usize>>,
+    k: usize,
     non_blank_threshold: u16,
     solid_threshold: u16,
-    tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>, // returns GLOBAL indices
+    tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>,
 ) {
+
     let start_total = Instant::now();
 
-    // 1) Build the set of active global indices and a compact mapping.
-    let mut global_to_local: HashMap<usize, usize> = HashMap::new();
-    let mut local_to_global: Vec<usize> = Vec::new();
-
-    for indices in &indices_sets {
-        for &g_idx in indices {
-            if !global_to_local.contains_key(&g_idx) {
-                let local_idx = local_to_global.len();
-                local_to_global.push(g_idx);
-                global_to_local.insert(g_idx, local_idx);
-            }
-        }
-    }
-
-    let k = local_to_global.len();
-    log::info!(
-        "unique txs in sub_dag: {}", k
-    );
-    if k == 0 {
-        log::info!("run_utig: empty sub-dag, nothing to do");
+    if k == 0 || indices_sets.is_empty() {
+        log::info!("UTIG: empty sub-dag (k=0 or no local orders), nothing to do");
         return;
     }
 
-    // Map each indices_set to local indices.
-    let local_indices_sets: Vec<Vec<usize>> = indices_sets
-        .into_iter()
-        .map(|indices| {
-            indices
-                .into_iter()
-                .map(|g_idx| *global_to_local.get(&g_idx).unwrap())
-                .collect()
-        })
-        .collect();
+    // ---- acquire matrix from global pool ----
+    let mut pool = UTIG_POOL
+        .lock()
+        .expect("UTIG_POOL mutex poisoned");
+    let matrix = pool.acquire();
 
-    let t_map = start_total.elapsed().as_nanos();
-    log::info!("UTIG: mapping global->local took {} ns", t_map);
-
-    // 2) Allocate UTIG structures sized by k (NOT MAX_TX).
-    let mut support: Vec<u16> = vec![0u16; k];
-    let mut is_non_blank: Vec<bool> = vec![false; k];
-    let mut is_solid: Vec<bool> = vec![false; k];
-    let mut dirty_nodes: Vec<usize> = Vec::new();
-    let mut dirty_pairs: Vec<(usize, usize)> = Vec::new();
-
-    // dense k×k matrix, but k is just "txs in this sub-dag", typically << MAX_TX
-    let mut weight: Vec<u16> = vec![0u16; k * k];
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); k];
+    // Aliases into the preallocated matrix.
+    let weight = &mut matrix.weight;
+    let support = &mut matrix.support;
+    let is_non_blank = &mut matrix.is_non_blank;
+    let is_solid = &mut matrix.is_solid;
+    let edges = &mut matrix.edges;
 
     #[inline]
     fn w_idx(i: usize, j: usize, k: usize) -> usize {
         i * k + j
     }
 
-    let t_alloc = start_total.elapsed().as_nanos() - t_map;
+    let t1 = start_total.elapsed().as_nanos();
     log::info!(
-        "t_alloc: {}", t_alloc
+        "UTIG t1: {}", t1
     );
 
-    // 3) Phase 2: support, weights, dirty_nodes/pairs
-    for indices in &local_indices_sets {
-        for (pos, &i) in indices.iter().enumerate() {
-            let old_sup = support[i];
-            let new_sup = old_sup.saturating_add(1);
-            support[i] = new_sup;
+    // ============================================================
+    // (3) For each non-blank tx, add a vertex tx to V
+    //     -> compute tx_count (support), non-blank set, solid set.
+    // ============================================================
+    for order in &indices_sets {
+        for &tx in order {
+            // tx in [0..k)
+            let new_sup = support[tx].saturating_add(1);
+            support[tx] = new_sup;
 
-            if !is_non_blank[i] && new_sup >= non_blank_threshold {
-                is_non_blank[i] = true;
-                dirty_nodes.push(i);
+            if new_sup >= non_blank_threshold {
+                is_non_blank[tx] = true;
             }
-
-            if !is_solid[i] && new_sup >= solid_threshold {
-                is_solid[i] = true;
-            }
-
-            for &j in &indices[pos + 1..] {
-                let idx_ij = w_idx(i, j, k);
-                let old_w = weight[idx_ij];
-                let new_w = old_w.saturating_add(1);
-                weight[idx_ij] = new_w;
-
-                if old_w < non_blank_threshold && new_w >= non_blank_threshold {
-                    let (a, b) = if i < j { (i, j) } else { (j, i) };
-                    dirty_pairs.push((a, b));
-                }
+            if new_sup >= solid_threshold {
+                is_solid[tx] = true;
             }
         }
     }
 
-    let t_weights = start_total.elapsed().as_nanos() - t_alloc - t_map;
-    log::info!("UTIG: weights+support took {} ns", t_weights);
-
-    // 4) Orientation predicate and edges
-    let predicate_p = |u: usize, v: usize, k: usize, weight: &Vec<u16>, t_edge: u16| -> bool {
-        let w_uv = weight[w_idx(u, v, k)];
-        let w_vu = weight[w_idx(v, u, k)];
-
-        if w_uv < t_edge {
-            return false;
-        }
-        if w_vu < t_edge {
-            return true;
-        }
-        if w_uv > w_vu {
-            return true;
-        }
-        if w_uv < w_vu {
-            return false;
-        }
-        u < v
-    };
-
-    for &(u, v) in &dirty_pairs {
-        if !is_non_blank[u] || !is_non_blank[v] {
-            continue;
-        }
-
-        let w_uv = weight[w_idx(u, v, k)];
-        let w_vu = weight[w_idx(v, u, k)];
-        if w_uv == 0 && w_vu == 0 {
-            continue;
-        }
-
-        let u_to_v = predicate_p(u, v, k, &weight, non_blank_threshold);
-        let v_to_u = predicate_p(v, u, k, &weight, non_blank_threshold);
-
-        if u_to_v {
-            edges[u].push(v);
-        } else if v_to_u {
-            edges[v].push(u);
-        }
-    }
-
-    let t_edges = start_total.elapsed().as_nanos() - t_map - t_alloc - t_weights;
-    log::info!("UTIG: edges/orientation took {} ns", t_edges);
-
-    let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
-
+    let mut active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
     if active.is_empty() {
         log::info!("UTIG: no non-blank txs in this sub-dag, nothing to propose");
         return;
     }
 
-    // 5) Tarjan SCC only on non-blank nodes
+    let t3 = start_total.elapsed().as_nanos() - t1;
+    log::info!(
+        "UTIG t3: {}", t3
+    );
+
+    // ============================================================
+    // (4) Add edges to E
+    //
+    // Here weight[u,v] acts like edge_count[u][v] in the C++ code:
+    //   edge_count[from][to]++ for every “from -> to” in local orders.
+    // Then we orient edges based on counts and thresholds.
+    // ============================================================
+
+    // First: fill edge_count via local orders.
+    for order in &indices_sets {
+        let len = order.len();
+        for from_pos in 0..len {
+            let from = order[from_pos];
+            for to_pos in (from_pos + 1)..len {
+                let to = order[to_pos];
+                let idx = w_idx(from, to, k);
+                weight[idx] = weight[idx].saturating_add(1);
+            }
+        }
+    }
+
+    // Now, build the directed graph on non-blank txs.
+    //
+    // We use a predicate similar in spirit to Themis:
+    //   - keep edges where count >= non_blank_threshold
+    //   - do not add edges between blank vertices
+    //
+    // Additionally, we avoid adding duplicate edges (cheap check).
+    for u in 0..k {
+        if !is_non_blank[u] {
+            continue;
+        }
+
+        for v in 0..k {
+            if u == v || !is_non_blank[v] {
+                continue;
+            }
+
+            let cnt = weight[w_idx(u, v, k)];
+            if cnt < non_blank_threshold {
+                continue;
+            }
+
+            // avoid duplicates
+            if !edges[u].contains(&v) {
+                edges[u].push(v);
+            }
+        }
+    }
+
+    let t4 = start_total.elapsed().as_nanos() - t3;
+    log::info!(
+        "UTIG t4: {}", t4
+    );
+
+    // ============================================================
+    // (5) Compute condensation graph G* (SCCs + topo sort)
+    //     -> Tarjan SCC on the non-blank subgraph
+    // ============================================================
+
     let mut index_counter: i32 = 0;
     let mut stack: Vec<usize> = Vec::new();
     let mut on_stack: Vec<bool> = vec![false; k];
     let mut dfn: Vec<i32> = vec![0; k];
     let mut low: Vec<i32> = vec![0; k];
     let mut scc_id: Vec<i32> = vec![-1; k];
-    let mut scc_count: i32 = 0;
     let mut sccs: Vec<Vec<usize>> = Vec::new();
 
     fn strongconnect(
@@ -506,7 +497,6 @@ fn run_utig(
         low: &mut [i32],
         edges: &Vec<Vec<usize>>,
         scc_id: &mut [i32],
-        scc_count: &mut i32,
         sccs: &mut Vec<Vec<usize>>,
     ) {
         *index_counter += 1;
@@ -517,10 +507,24 @@ fn run_utig(
 
         for &v in &edges[u] {
             if dfn[v] == 0 {
-                strongconnect(v, index_counter, stack, on_stack, dfn, low, edges, scc_id, scc_count, sccs);
-                low[u] = std::cmp::min(low[u], low[v]);
+                strongconnect(
+                    v,
+                    index_counter,
+                    stack,
+                    on_stack,
+                    dfn,
+                    low,
+                    edges,
+                    scc_id,
+                    sccs,
+                );
+                if low[v] < low[u] {
+                    low[u] = low[v];
+                }
             } else if on_stack[v] {
-                low[u] = std::cmp::min(low[u], dfn[v]);
+                if dfn[v] < low[u] {
+                    low[u] = dfn[v];
+                }
             }
         }
 
@@ -529,18 +533,17 @@ fn run_utig(
             loop {
                 let w = stack.pop().unwrap();
                 on_stack[w] = false;
-                scc_id[w] = *scc_count;
+                scc_id[w] = sccs.len() as i32;
                 comp.push(w);
                 if w == u {
                     break;
                 }
             }
             sccs.push(comp);
-            *scc_count += 1;
         }
     }
 
-    // **only start DFS from non-blank nodes**
+    // Run Tarjan only on non-blank nodes
     for &u in &active {
         if dfn[u] == 0 {
             strongconnect(
@@ -550,41 +553,65 @@ fn run_utig(
                 &mut on_stack,
                 &mut dfn,
                 &mut low,
-                &edges,
+                edges,
                 &mut scc_id,
-                &mut scc_count,
                 &mut sccs,
             );
         }
     }
 
-    // 6) Condensation graph + topo sort, again only over non-blank nodes
     let scc_n = sccs.len();
+    if scc_n == 0 {
+        log::info!("UTIG: SCC decomposition empty, nothing to propose");
+        return;
+    }
+
+    // Build condensation graph G* (over SCCs) and topo sort it.
     let mut gc: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
     let mut indegree: Vec<usize> = vec![0; scc_n];
 
     for &u in &active {
         let su = scc_id[u];
-        if su < 0 { continue; }
+        if su < 0 {
+            continue;
+        }
         let su = su as usize;
+
         for &v in &edges[u] {
-            if !is_non_blank[v] { continue; } // redundant but safe
+            if !is_non_blank[v] {
+                continue;
+            }
             let sv = scc_id[v];
-            if sv < 0 { continue; }
+            if sv < 0 {
+                continue;
+            }
             let sv = sv as usize;
-            if su == sv { continue; }
+            if su == sv {
+                continue;
+            }
             gc[su].push(sv);
-            indegree[sv] += 1;
         }
     }
 
+    // Deduplicate edges and compute indegrees
+    for u in 0..scc_n {
+        gc[u].sort_unstable();
+        gc[u].dedup();
+        for &v in &gc[u] {
+            indegree[v] = indegree[v].saturating_add(1);
+        }
+    }
+
+    // Topological sort over the SCC DAG.
     let mut topo: Vec<usize> = Vec::with_capacity(scc_n);
     let mut q: VecDeque<usize> = VecDeque::new();
+
     for s in 0..scc_n {
         if indegree[s] == 0 {
             q.push_back(s);
         }
     }
+
     while let Some(u) = q.pop_front() {
         topo.push(u);
         for &v in &gc[u] {
@@ -597,85 +624,91 @@ fn run_utig(
         }
     }
 
-    // 7) Anchor: last SCC in topo with at least one SOLID tx.
+    let t5 = start_total.elapsed().as_nanos() - t4;
+    log::info!(
+        "UTIG t5: {}", t5
+    );
+
+    // ============================================================
+    // (6) Find last vertex `V` in S that has a solid transaction
+    // ============================================================
+
     let mut anchor_idx: Option<usize> = None;
     for (idx, &scc_index) in topo.iter().enumerate() {
         let comp = &sccs[scc_index];
-        if comp.iter().any(|&v| is_solid[v]) {
+        if comp.iter().any(|&tx| is_solid[tx]) {
             anchor_idx = Some(idx);
         }
     }
 
-    if let Some(anchor) = anchor_idx {
-        let mut final_local: Vec<usize> = Vec::new();
-
-        for topo_pos in 0..=anchor {
-            let scc_index = topo[topo_pos];
-            let comp = &sccs[scc_index];
-
-            if comp.len() == 1 {
-                final_local.push(comp[0]);
-            } else {
-                let mut sorted = comp.clone();
-                sorted.sort_unstable();
-                final_local.extend(sorted);
-            }
-        }
-
-        let solid_nodes = is_solid.iter().filter(|&&solid| solid).count();
-        log::info!(
-            "solid_nodes : {} {}", solid_nodes, final_local.len()
-        );
-
-        let mut unordered_pairs_global: Vec<(usize, usize)> = Vec::new();
-        let p = final_local.len();
-
-        for a in 0..p {
-            let i = final_local[a];
-            if is_solid[i] {
-                continue;
-            }
-            for b in (a + 1)..p {
-                let j = final_local[b];
-                if is_solid[j] {
-                    continue;
-                }
-
-                let w_ij = weight[w_idx(i, j, k)];
-                let w_ji = weight[w_idx(j, i, k)];
-
-                if w_ij < non_blank_threshold && w_ji < non_blank_threshold {
-                    let gi = local_to_global[i];
-                    let gj = local_to_global[j];
-                    unordered_pairs_global.push((gi, gj));
-                }
-            }
-        }
-
-        log::info!(
-            "unordered len : {}", unordered_pairs_global.len()
-        );
-
-        // Map local indices back to GLOBAL tx indices.
-        let final_global: Vec<usize> = final_local
-            .into_iter()
-            .map(|li| local_to_global[li])
-            .collect();
-
+    if anchor_idx.is_none() {
         let total = start_total.elapsed().as_nanos();
         log::info!(
-            "UTIG: finalized prefix length = {}, anchor_scc_idx = {}, total ns = {}",
-            final_global.len(),
-            anchor,
+            "UTIG: no solid anchor in this sub-dag, total ns = {}",
             total
         );
-
-        let _ = tx_utig_results.blocking_send(final_global);
-    } else {
-        let total = start_total.elapsed().as_nanos();
-        log::info!(
-            "UTIG: no solid anchor in this sub_dag, total ns = {}",
-            total
-        );
+        return;
     }
+
+    let anchor = anchor_idx.unwrap();
+
+    let t6 = start_total.elapsed().as_nanos() - t5;
+    log::info!(
+        "UTIG t6: {}", t6
+    );
+
+    // ============================================================
+    // (7) Remove txs that are part of SCCs after V in S
+    //     (in our case: build the final ordered prefix of tx indices)
+    // ============================================================
+
+    let mut final_local: Vec<usize> = Vec::new();
+
+    // Keep SCCs topo[0..=anchor], discard the rest.
+    for topo_pos in 0..=anchor {
+        let scc_index = topo[topo_pos];
+        let comp = &sccs[scc_index];
+
+        if comp.len() == 1 {
+            final_local.push(comp[0]);
+        } else {
+            // Deterministic order inside SCC (e.g. by index).
+            let mut sorted = comp.clone();
+            sorted.sort_unstable();
+            final_local.extend(sorted);
+        }
+    }
+
+    let solid_nodes = is_solid
+        .iter()
+        .take(k)
+        .filter(|&&solid| solid)
+        .count();
+
+    let t7 = start_total.elapsed().as_nanos() - t6;
+    log::info!(
+        "UTIG t7: {}", t7
+    );
+
+    log::info!(
+        "UTIG: finalized prefix length = {}, solid_nodes = {}, anchor_scc_idx = {}, total ns = {}",
+        final_local.len(),
+        solid_nodes,
+        anchor,
+        start_total.elapsed().as_nanos()
+    );
+
+    // ============================================================
+    // (8) Output result: local tx indices to finalize
+    // ============================================================
+
+    let _ = tx_utig_results.blocking_send(final_local);
+
+    matrix.reset(k);
+
+    let t8 = start_total.elapsed().as_nanos() - t7;
+    log::info!(
+        "UTIG t8: {}", t8
+    );
+
 }

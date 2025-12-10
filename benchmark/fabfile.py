@@ -18,17 +18,17 @@ def local(ctx, debug=True):
         'faults': 1,
         'nodes': 5,
         'workers': 2,
-        'rate': 10_000,
+        'rate': 50_000,
         'tx_size': 512,
-        'duration': 30,
+        'duration': 3,
     }
     node_params = {
-        'header_size': 1_000,  # bytes
+        'header_size': 512,  # bytes
         'max_header_delay': 200,  # ms
         'gc_depth': 50,  # rounds
-        'sync_retry_delay': 10_000,  # ms
+        'sync_retry_delay': 5_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 50_000,  # bytes
+        'batch_size': 16_000,  # bytes
         'max_batch_delay': 200,  # ms
         "lo_size": 400, # number of entries in LocalOrder queue
         "lo_max_delay": 200, # ms
