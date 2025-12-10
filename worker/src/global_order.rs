@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use crate::batch_maker::Batch;
 
 const MAX_TX: usize = 10_000;
-const MATRIX_POOL_SIZE: usize = 4; // M
+const MATRIX_POOL_SIZE: usize = 6; // M
 
 pub struct UTIGMatrix {
     pub weight: Vec<u16>,          // N×N
@@ -49,23 +49,45 @@ impl UTIGMatrix {
 
 pub struct UTIGMatrixPool {
     pub pool: [UTIGMatrix; MATRIX_POOL_SIZE],
+    pub used: [bool; MATRIX_POOL_SIZE],
     pub next: usize,
 }
 
 impl UTIGMatrixPool {
     pub fn new() -> Self {
         UTIGMatrixPool {
-            pool: [UTIGMatrix::new(), UTIGMatrix::new(), UTIGMatrix::new(), UTIGMatrix::new()],
+            pool: [
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+            ],
+            used: [false; MATRIX_POOL_SIZE],
             next: 0,
         }
     }
 
-    pub fn acquire(&mut self) -> &mut UTIGMatrix {
-        let idx = self.next;
-        self.next = (self.next + 1) % MATRIX_POOL_SIZE;
-        &mut self.pool[idx]
+    pub fn acquire_slot(&mut self) -> Option<usize> {
+        for i in 0..MATRIX_POOL_SIZE {
+            let idx = (self.next + i) % MATRIX_POOL_SIZE;
+            if !self.used[idx] {
+                self.used[idx] = true;
+                self.next = (idx + 1) % MATRIX_POOL_SIZE;
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    pub fn release_slot(&mut self, idx: usize) {
+        debug_assert!(idx < MATRIX_POOL_SIZE);
+        debug_assert!(self.used[idx]);
+        self.used[idx] = false;
     }
 }
+
 
 static UTIG_POOL: Lazy<Mutex<UTIGMatrixPool>> =
     Lazy::new(|| Mutex::new(UTIGMatrixPool::new()));
@@ -255,6 +277,9 @@ impl GlobalOrder {
                     tokio::task::spawn_blocking(move || {
                         run_utig(indices_sets, k, non_blank, solid, tx_utig_results);
                     });
+                    // let _handler = tokio_rayon::spawn(move || {
+                    //     run_utig(indices_sets, k, non_blank, solid, tx_utig_results);
+                    // });
 
                     log::info!(
                         "\nspawning UTIG: {}", start_time.elapsed().as_nanos() - t2
@@ -361,17 +386,28 @@ pub fn run_utig(
 ) {
 
     let start_total = Instant::now();
+    let mut last = start_total;
 
     if k == 0 || indices_sets.is_empty() {
         log::info!("UTIG: empty sub-dag (k=0 or no local orders), nothing to do");
         return;
     }
 
-    // ---- acquire matrix from global pool ----
-    let mut pool = UTIG_POOL
-        .lock()
-        .expect("UTIG_POOL mutex poisoned");
-    let matrix = pool.acquire();
+    let (slot_idx, matrix_ptr) = {
+        let mut pool = UTIG_POOL
+            .lock()
+            .expect("UTIG_POOL mutex poisoned");
+
+        let idx = pool
+            .acquire_slot()
+            .expect("UTIGMatrixPool exhausted: no free matrices");
+
+        let matrix_ptr: *mut UTIGMatrix = &mut pool.pool[idx];
+
+        (idx, matrix_ptr)
+    };
+
+    let matrix: &mut UTIGMatrix = unsafe { &mut *matrix_ptr };
 
     // Aliases into the preallocated matrix.
     let weight = &mut matrix.weight;
@@ -385,7 +421,9 @@ pub fn run_utig(
         i * k + j
     }
 
-    let t1 = start_total.elapsed().as_nanos();
+    let now = Instant::now();
+    let t1 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t1: {}", t1
     );
@@ -415,7 +453,9 @@ pub fn run_utig(
         return;
     }
 
-    let t3 = start_total.elapsed().as_nanos() - t1;
+    let now = Instant::now();
+    let t3 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t3: {}", t3
     );
@@ -433,8 +473,18 @@ pub fn run_utig(
         let len = order.len();
         for from_pos in 0..len {
             let from = order[from_pos];
+
+            if !is_non_blank[from] {
+                continue;
+            }
+
             for to_pos in (from_pos + 1)..len {
                 let to = order[to_pos];
+
+                if !is_non_blank[to] {
+                    continue;
+                }
+
                 let idx = w_idx(from, to, k);
                 weight[idx] = weight[idx].saturating_add(1);
             }
@@ -470,7 +520,9 @@ pub fn run_utig(
         }
     }
 
-    let t4 = start_total.elapsed().as_nanos() - t3;
+    let now = Instant::now();
+    let t4 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t4: {}", t4
     );
@@ -624,7 +676,9 @@ pub fn run_utig(
         }
     }
 
-    let t5 = start_total.elapsed().as_nanos() - t4;
+    let now = Instant::now();
+    let t5 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t5: {}", t5
     );
@@ -652,7 +706,9 @@ pub fn run_utig(
 
     let anchor = anchor_idx.unwrap();
 
-    let t6 = start_total.elapsed().as_nanos() - t5;
+    let now = Instant::now();
+    let t6 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t6: {}", t6
     );
@@ -685,7 +741,9 @@ pub fn run_utig(
         .filter(|&&solid| solid)
         .count();
 
-    let t7 = start_total.elapsed().as_nanos() - t6;
+    let now = Instant::now();
+    let t7 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t7: {}", t7
     );
@@ -706,7 +764,16 @@ pub fn run_utig(
 
     matrix.reset(k);
 
-    let t8 = start_total.elapsed().as_nanos() - t7;
+    {
+        let mut pool = UTIG_POOL
+            .lock()
+            .expect("UTIG_POOL mutex poisoned");
+        pool.release_slot(slot_idx);
+    }
+
+    let now = Instant::now();
+    let t8 = now.duration_since(last).as_nanos();
+    last = now;
     log::info!(
         "UTIG t8: {}", t8
     );
