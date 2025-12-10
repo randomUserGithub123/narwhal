@@ -14,15 +14,15 @@ use once_cell::sync::Lazy;
 
 use crate::batch_maker::Batch;
 
-const MAX_TX: usize = 10_000;
+const MAX_TX: usize = 20_000;
 const MATRIX_POOL_SIZE: usize = 6; // M
 
 pub struct UTIGMatrix {
-    pub weight: Vec<u16>,          // N×N
-    pub support: Vec<u16>,         // N
+    pub weight: Vec<u8>,          // N×N
+    pub support: Vec<u8>,         // N
     pub is_non_blank: Vec<bool>,   // N
     pub is_solid: Vec<bool>,       // N
-    pub edges: Vec<Vec<usize>>,    // adjacency
+    pub edges: Vec<Vec<u16>>,    // adjacency
 }
 
 impl UTIGMatrix {
@@ -274,12 +274,12 @@ impl GlobalOrder {
                     let solid = self.solid_threshold;
                     let tx_utig_results = self.tx_utig_results.clone();
 
-                    tokio::task::spawn_blocking(move || {
-                        run_utig(indices_sets, k, non_blank, solid, tx_utig_results);
-                    });
-                    // let _handler = tokio_rayon::spawn(move || {
-                    //     run_utig(indices_sets, k, non_blank, solid, tx_utig_results);
+                    // tokio::task::spawn_blocking(move || {
+                    //     run_utig(indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
                     // });
+                    let _handler = tokio_rayon::spawn(move || {
+                        run_utig(indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
+                    });
 
                     log::info!(
                         "\nspawning UTIG: {}", start_time.elapsed().as_nanos() - t2
@@ -380,8 +380,8 @@ impl GlobalOrder {
 pub fn run_utig(
     indices_sets: Vec<Vec<usize>>,
     k: usize,
-    non_blank_threshold: u16,
-    solid_threshold: u16,
+    non_blank_threshold: u8,
+    solid_threshold: u8,
     tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>,
 ) {
 
@@ -514,8 +514,9 @@ pub fn run_utig(
             }
 
             // avoid duplicates
-            if !edges[u].contains(&v) {
-                edges[u].push(v);
+            let v16 = v as u16;
+            if !edges[u].contains(&v16) {
+                edges[u].push(v16);
             }
         }
     }
@@ -547,7 +548,7 @@ pub fn run_utig(
         on_stack: &mut [bool],
         dfn: &mut [i32],
         low: &mut [i32],
-        edges: &Vec<Vec<usize>>,
+        edges: &Vec<Vec<u16>>,
         scc_id: &mut [i32],
         sccs: &mut Vec<Vec<usize>>,
     ) {
@@ -557,7 +558,8 @@ pub fn run_utig(
         stack.push(u);
         on_stack[u] = true;
 
-        for &v in &edges[u] {
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
             if dfn[v] == 0 {
                 strongconnect(
                     v,
@@ -629,7 +631,8 @@ pub fn run_utig(
         }
         let su = su as usize;
 
-        for &v in &edges[u] {
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
             if !is_non_blank[v] {
                 continue;
             }
