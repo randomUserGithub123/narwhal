@@ -4,7 +4,7 @@ import datetime
 from math import ceil
 from os.path import basename, splitext
 from time import sleep
-from random import choice, randrange, sample
+from random import choice, randrange, sample, shuffle
 import traceback
 
 from benchmark.commands import CommandMaker
@@ -20,7 +20,7 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
-BANNED_NODES = []
+BANNED_NODES = ["node067", "node009", "node012", "node011"]
 
 class DASBench:
     BASE_PORT = 4000
@@ -39,14 +39,19 @@ class DASBench:
     def __getattr__(self, attr):
         return getattr(self.bench_parameters, attr)
 
-    def _background_run(self, command, log_file, hostname):
+    def _background_run(self, command, log_file, hostname, wait=False):
         # name = splitext(basename(log_file))[0]
         cmd = f"{command} 2> {log_file}"
         #subprocess.run(["tmux", "new", "-d", "-s", name, cmd], check=True)
         # Print.info(f"Running {cmd} on {hostname}")
         process = f"ssh {hostname} 'source /etc/profile; cd {self._wd}; {cmd}'"
         
-        subprocess.Popen(process, shell=True)
+        if wait:
+            # Show stdout and stderr
+            subprocess.call(process, shell=True)
+        else:
+            # Show stdout and stderr
+            subprocess.Popen(process, shell=True)
 
     def _kill_nodes(self):
         try:
@@ -56,13 +61,15 @@ class DASBench:
             for host in hosts:
                 self._background_run(cmd, "/dev/null", host)
 
+            sleep(5)
+
             self.preserve_manager.kill_reservation("LAST")
         except Exception as e:
             print(
                 f"""Exception : {str(e)}\nTraceback: {traceback.format_exc()}"""
             )
     
-    def _preserve_machines(self):
+    def _preserve_machines(self, nodes):
         # we need one machine per node (primary and workers are colocated) and 1 per 4 clients (which is nodes*workers)
         if self.collocate:
             self._amount_for_nodes = self.nodes[0]
@@ -72,7 +79,7 @@ class DASBench:
             self._amount_for_nodes = self.nodes[0] + self.nodes[0] * self.workers
             self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * self.workers / 4)
 
-        time_string = str(datetime.timedelta(seconds=self.duration + 30)) # extra time to set up things
+        time_string = str(datetime.timedelta(seconds=self.duration + 75 + nodes*2)) # extra time to set up things
         self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
 
     def _get_hostnames(self):
@@ -123,10 +130,14 @@ class DASBench:
 
             names = [x.name for x in keys]
 
-            self._preserve_machines()
-            sleep(1.5)
+            self._preserve_machines(nodes)
+            sleep(5)
             all_hostnames = self._get_hostnames()
+            for n in BANNED_NODES:
+                if n in all_hostnames:
+                    all_hostnames.remove(n)
             all_hostnames = all_hostnames[:self._num_machines]
+            shuffle(all_hostnames)
             nodes_amount = self._amount_for_nodes
 
             nodes_hostnames = all_hostnames[:nodes_amount]
@@ -192,40 +203,32 @@ class DASBench:
                             workers.append(w_address)
                             break
                 clients_workers_addresses.append((f"{worker_id}", workers))
-            
-            for i, (id, worker_list) in enumerate(clients_workers_addresses):
-                addresses = ",".join(worker_list)
-                cmd = CommandMaker.run_client(
-                    addresses,
-                    self.tx_size,
-                    rate_share,
-                    worker_list,
-                )
-                log_file = PathMaker.client_log_file(i, id)
-                print(f"Launching client on {clients_hostnames[i // 4]}")
-                self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
-            # Run the primaries.
+            for i, addresses in enumerate(workers_addresses):
+                for id, address in addresses:
+                    log_file = PathMaker.worker_log_file(i, id)
+                    print("BEFORE")
+                    cmd = f"ls -a /var/scratch/{self.username}/benchmark/"
+                    self._background_run(
+                        cmd, log_file, address.split(":")[0], wait=True
+                    )
+
+                    cmd = f"rm -rf /var/scratch/{self.username}/benchmark/.db-*"
+                    self._background_run(
+                        cmd, log_file, address.split(":")[0], wait=True
+                    )
+                    print("AFTER")
+
+                    cmd = f"ls -a /var/scratch/{self.username}/benchmark/"
+                    self._background_run(
+                        cmd, log_file, address.split(":")[0], wait=True
+                    )
+
+            # Run the workers.
             faulty_node_ids = sample(
                 list(range(0, nodes)),
                 self.faults
             )
-            for i, address in enumerate(committee.primary_addresses()):
-                cmd = CommandMaker.run_primary(
-                    PathMaker.key_file(i),
-                    PathMaker.committee_file(),
-                    PathMaker.db_path(i, username=self.username),
-                    PathMaker.parameters_file(),
-                    is_byzantine=int(
-                        i in faulty_node_ids
-                    ),
-                    debug=debug,
-                )
-                log_file = PathMaker.primary_log_file(i)
-                print(f"Launching primary on {address}")
-                self._background_run(cmd, log_file, address.split(":")[0])
-
-            # Run the workers.
             for i, addresses in enumerate(workers_addresses):
                 for id, address in addresses:
                     cmd = CommandMaker.run_worker(
@@ -243,12 +246,41 @@ class DASBench:
                     print(f"Launching worker on {address}")
                     self._background_run(cmd, log_file, address.split(":")[0])
 
+            # Run the primaries.
+            for i, address in enumerate(committee.primary_addresses()):
+                cmd = CommandMaker.run_primary(
+                    PathMaker.key_file(i),
+                    PathMaker.committee_file(),
+                    PathMaker.db_path(i, username=self.username),
+                    PathMaker.parameters_file(),
+                    is_byzantine=int(
+                        i in faulty_node_ids
+                    ),
+                    debug=debug,
+                )
+                log_file = PathMaker.primary_log_file(i)
+                print(f"Launching primary on {address}")
+                self._background_run(cmd, log_file, address.split(":")[0])
+
+            # Run the clients.
+            for i, (id, worker_list) in enumerate(clients_workers_addresses):
+                addresses = ",".join(worker_list)
+                cmd = CommandMaker.run_client(
+                    addresses,
+                    self.tx_size,
+                    rate_share,
+                    worker_list,
+                )
+                log_file = PathMaker.client_log_file(i, id)
+                print(f"Launching client on {clients_hostnames[i // 4]}")
+                self._background_run(cmd, log_file, clients_hostnames[i // 4])
+
             # Wait for all transactions to be processed.
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
             self._kill_nodes()
 
-            sleep(5)
+            sleep(nodes*2)
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")
