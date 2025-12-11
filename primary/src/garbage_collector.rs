@@ -125,6 +125,10 @@ impl GarbageCollector {
                             .expect("Failed to serialize our own CommittedSubDag message");
                         self.simple_network.send(self.of_worker_address, Bytes::from(serialized)).await;
 
+                        log::info!(
+                            "SUB-DAG MESSAGE SENT"
+                        );
+
                         if self.committed_headers_without_local_orders.len() > 0 {
                             log::info!(
                                 "committed_headers_without_local_orders : {}", self.committed_headers_without_local_orders.len()

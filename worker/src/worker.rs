@@ -461,18 +461,30 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
+
+        log::info!("{:?}", serialized);
         
         if !self.is_byzantine{
             // Deserialize the message and send it to the synchronizer.
             match bincode::deserialize(&serialized) {
                 Err(e) => error!("Failed to deserialize primary message: {}", e),
                 Ok(PrimaryWorkerMessage::NewHeader(author, round, local_order_digests)) => {
+
+                    log::info!(
+                        "NewHeader"
+                    );
+
                     self.tx_header_update
                         .send((author, round, local_order_digests))
                         .await
                         .expect("Failed forwarding header update to global_order.rs");
                 },
                 Ok(PrimaryWorkerMessage::CommittedSubDag(sub_dag)) => {
+
+                    log::info!(
+                        "CommittedSubDag"
+                    );
+
                     self.tx_consensus_update
                         .send(sub_dag)
                         .await
