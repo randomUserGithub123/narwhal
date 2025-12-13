@@ -9,7 +9,7 @@ class CommandMaker:
     @staticmethod
     def cleanup(username=None):
         if username:
-            return f'rm -r /var/scratch/{username}/narwhal/benchmark/.db-* ; rm .*.json ; mkdir -p {PathMaker.results_path()}'
+            return f'rm -r /var/scratch/{username}/narwhal/benchmark/.db-* ; rm /var/scratch/{username}/narwhal/benchmark/*.json ; mkdir -p {PathMaker.results_path()}'
         else:
             return f"rm .db-* ; rm .*.json ; mkdir -p {PathMaker.results_path()}"
 

@@ -56,7 +56,7 @@ class DASBench:
     def _kill_nodes(self):
         try:
             hosts = self._get_hostnames()
-            cmd = CommandMaker.cleanup()
+            cmd = CommandMaker.cleanup(username=self.username)
 
             for host in hosts:
                 self._background_run(cmd, "/dev/null", host)
@@ -73,14 +73,21 @@ class DASBench:
         # we need one machine per node (primary and workers are colocated) and 1 per 4 clients (which is nodes*workers)
         if self.collocate:
             self._amount_for_nodes = self.nodes[0]
-            self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * self.workers / 4)
+            self._num_machines = self._amount_for_nodes + ceil(
+                self.nodes[0] * self.workers / 4
+            )
         else:
             # one machine per primary, 1 machine per worker and 1 machine per 4 clients (same amount)
             self._amount_for_nodes = self.nodes[0] + self.nodes[0] * self.workers
-            self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * self.workers / 4)
-
-        time_string = str(datetime.timedelta(seconds=self.duration + 75 + nodes*2)) # extra time to set up things
-        self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
+            self._num_machines = self._amount_for_nodes + ceil(
+                self.nodes[0] * self.workers / 4
+            )
+        time_string = str(
+            datetime.timedelta(seconds=self.duration + 75 + nodes*2)
+        )  # extra time to set up things
+        self.reservation_id = self.preserve_manager.create_reservation(
+            self._num_machines + len(BANNED_NODES), time_string
+        )
 
     def _get_hostnames(self):
         if self._hostnames:
@@ -208,21 +215,21 @@ class DASBench:
                 for id, address in addresses:
                     log_file = PathMaker.worker_log_file(i, id)
                     print("BEFORE")
-                    cmd = f"ls -a /var/scratch/{self.username}/benchmark/"
+                    cmd = f"ls -a /var/scratch/{self.username}/"
                     self._background_run(
                         cmd, log_file, address.split(":")[0], wait=True
                     )
 
-                    cmd = f"rm -rf /var/scratch/{self.username}/benchmark/.db-*"
-                    self._background_run(
-                        cmd, log_file, address.split(":")[0], wait=True
-                    )
-                    print("AFTER")
+                    # cmd = f"rm -rf /var/scratch/{self.username}/benchmark/.db-*"
+                    # self._background_run(
+                    #     cmd, log_file, address.split(":")[0], wait=True
+                    # )
+                    # print("AFTER")
 
-                    cmd = f"ls -a /var/scratch/{self.username}/benchmark/"
-                    self._background_run(
-                        cmd, log_file, address.split(":")[0], wait=True
-                    )
+                    # cmd = f"ls -a /var/scratch/{self.username}/benchmark/"
+                    # self._background_run(
+                    #     cmd, log_file, address.split(":")[0], wait=True
+                    # )
 
             # Run the workers.
             faulty_node_ids = sample(
@@ -243,7 +250,7 @@ class DASBench:
                         debug=debug,
                     )
                     log_file = PathMaker.worker_log_file(i, id)
-                    print(f"Launching worker on {address}")
+                    print(f"Launching worker {i}-{id} on {address}")
                     self._background_run(cmd, log_file, address.split(":")[0])
 
             # Run the primaries.
@@ -294,5 +301,9 @@ class DASBench:
 
             return log_values
         except (subprocess.SubprocessError, ParseError) as e:
+
+            cmd = f"{CommandMaker.cleanup(username=self.username)}"
+            subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
+
             self._kill_nodes()
             raise BenchError("Failed to run benchmark", e)
