@@ -100,7 +100,7 @@ class CommandMaker:
             f"--idx {idx} "
             f"--iter {iter_count} "
             f"--max-async {max_async} "
-            f"--max-cli-msg {tx_size}"
+            f"--max-cli-msg {tx_size} "
             f"--fairness-parameter {fairness} "
             f"--sb-users {sb_users} "
             f"--sb-prob-choose_mtx {sb_prob} "
