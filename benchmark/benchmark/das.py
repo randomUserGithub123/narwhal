@@ -51,11 +51,16 @@ class DASBench:
     def _kill_nodes(self):
         try:
             hosts = self._get_hostnames()
-            cmd = CommandMaker.cleanup()
+            cmd = CommandMaker.cleanup(username=self.username)
 
             for host in hosts:
                 self._background_run(cmd, "/dev/null", host)
+        except Exception as e:
+            print(e)
 
+        sleep(5)
+
+        try:
             self.preserve_manager.kill_reservation("LAST")
         except Exception as e:
             print(
@@ -245,6 +250,10 @@ class DASBench:
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
             return log_values
-        except (subprocess.SubprocessError, ParseError) as e:
+        except subprocess.SubprocessError as e:
+            cmd = f"{CommandMaker.cleanup(username=self.username)}"
+            subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             self._kill_nodes()
             raise BenchError("Failed to run benchmark", e)
+        except ParseError as e:
+            raise BenchError("Error parsing logs, maybe panic", e)
