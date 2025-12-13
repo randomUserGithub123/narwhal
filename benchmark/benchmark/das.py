@@ -158,7 +158,7 @@ class DASBench:
                 nodes_hostnames
             )
             committee.print(PathMaker.committee_file())
-            # print(committee.json)
+            print(committee.json)
 
             self.node_parameters.print(PathMaker.parameters_file())
 
@@ -215,21 +215,21 @@ class DASBench:
                 for id, address in addresses:
                     log_file = PathMaker.worker_log_file(i, id)
                     print("BEFORE")
-                    cmd = f"ls -a /var/scratch/{self.username}/"
+                    cmd = f"ls -a /var/scratch/{self.username}/narwhal/benchmark"
                     self._background_run(
                         cmd, log_file, address.split(":")[0], wait=True
                     )
 
-                    # cmd = f"rm -rf /var/scratch/{self.username}/benchmark/.db-*"
-                    # self._background_run(
-                    #     cmd, log_file, address.split(":")[0], wait=True
-                    # )
-                    # print("AFTER")
+                    cmd = f"rm -rf /var/scratch/{self.username}/narwhal/benchmark/.db-*"
+                    self._background_run(
+                        cmd, log_file, address.split(":")[0], wait=True
+                    )
+                    print("AFTER")
 
-                    # cmd = f"ls -a /var/scratch/{self.username}/benchmark/"
-                    # self._background_run(
-                    #     cmd, log_file, address.split(":")[0], wait=True
-                    # )
+                    cmd = f"ls -a /var/scratch/{self.username}/narwhal/benchmark/"
+                    self._background_run(
+                        cmd, log_file, address.split(":")[0], wait=True
+                    )
 
             # Run the workers.
             faulty_node_ids = sample(
