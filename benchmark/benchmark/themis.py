@@ -3,6 +3,7 @@ import os
 import re
 import ast
 import subprocess
+from math import ceil
 import datetime
 from time import sleep
 
@@ -115,7 +116,7 @@ class ThemisBench:
             Print.warn(f"Error during kill: {e}")
 
     def _preserve_machines(self):
-        # we need one machine per node + one machine for client
+        # we need one machine per node + 1 for client
         self._amount_for_nodes = self.nodes[0]
         self._num_machines = self._amount_for_nodes + 1
 
@@ -134,17 +135,16 @@ class ThemisBench:
             return self._hostnames
         return []
 
-    def _parse_themis_logs(self):
-        log_file = PathMaker.themis_log_file("client")
-        abs_log_path = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), log_file)
-        )
-
-        if not os.path.exists(abs_log_path):
-            raise BenchError(
-                "Themis client log not found",
-                FileNotFoundError(abs_log_path),
+    def _parse_themis_logs(self, client_logs):
+        
+        abs_paths = []
+        for lf in client_logs:
+            abs_log_path = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.dirname(__file__)), lf)
             )
+            if not os.path.exists(abs_log_path):
+                raise BenchError("Themis client log not found", FileNotFoundError(abs_log_path))
+            abs_paths.append(abs_log_path)
 
         cmd = ["python", "./scripts/thr_hist.py", "--interval", "1"]
 
@@ -153,7 +153,7 @@ class ThemisBench:
             cwd=PathMaker.themis_code_path(
                 flavor=self.flavor
             ),
-            stdin=open(abs_log_path, "r"),
+            input="".join(open(p, "r").read() for p in abs_paths),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -235,7 +235,7 @@ class ThemisBench:
                 clients_hostnames = [None]
             else:
                 self._preserve_machines()
-                sleep(1.5)
+                sleep(5)
                 all_hostnames = self._get_hostnames()
                 all_hostnames = all_hostnames[:self._num_machines]
                 replica_IPs = all_hostnames[:self._amount_for_nodes]
@@ -289,18 +289,21 @@ class ThemisBench:
 
             sleep(5) # Wait for replicas to be spawned, otherwise client will silently exit
 
-            Print.info(f"Starting {flavor} Client ...")
-            client_cmd = CommandMaker.run_themis_client(
-                idx=0,
-                max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
-                tx_size=self.tx_size,
-                fairness=self.node_parameters.json['gamma'],
-                sb_users=sb_users,
-                sb_prob=sb_prob,
-                sb_skew_factor=sb_skew_factor,
-            )
-            client_log = PathMaker.themis_log_file("client")
-            self._background_run(client_cmd, client_log, clients_hostnames[0])
+            Print.info(f"Starting {flavor} Client(s) ...")
+            client_logs = []
+            for i, hostname in enumerate(clients_hostnames):
+                client_cmd = CommandMaker.run_themis_client(
+                    idx=0,
+                    max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
+                    tx_size=self.tx_size,
+                    fairness=self.node_parameters.json['gamma'],
+                    sb_users=sb_users,
+                    sb_prob=sb_prob,
+                    sb_skew_factor=sb_skew_factor,
+                )
+                client_log = PathMaker.themis_log_file(f"client-{i}")
+                client_logs.append(client_log)
+                self._background_run(client_cmd, client_log, hostname=hostname)
 
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
@@ -308,7 +311,7 @@ class ThemisBench:
             self._kill_nodes()
 
             Print.info(f"Parsing {flavor} logs...")
-            return self._parse_themis_logs()
+            return self._parse_themis_logs(client_logs)
 
         except Exception as e:
             try:
