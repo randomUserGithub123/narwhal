@@ -201,7 +201,9 @@ class ThemisBench:
         ]
         self.flavor = flavor
 
-        Print.heading("Starting Themis local benchmark")
+        Print.heading(
+            f"Starting {flavor} local benchmark"
+        )
 
         self._kill_nodes()
 
@@ -220,7 +222,7 @@ class ThemisBench:
 
             sleep(0.5)
 
-            Print.info("Compiling Themis ...")
+            Print.info(f"Compiling {flavor} ...")
             cmd = CommandMaker.compile_themis()
             subprocess.run(cmd, shell=True, check=True, cwd=PathMaker.themis_code_path(
                 flavor=self.flavor
@@ -239,7 +241,7 @@ class ThemisBench:
                 replica_IPs = all_hostnames[:self._amount_for_nodes]
                 clients_hostnames = all_hostnames[self._amount_for_nodes:]
 
-            Print.info("Generating Themis configuration files...")
+            Print.info(f"Generating {flavor} configuration files...")
             if(
                 flavor == "themis"
             ):
@@ -279,7 +281,7 @@ class ThemisBench:
             os.makedirs(logs_dir, exist_ok=True)
             Print.info(f"Logs directory ensured at {logs_dir}")
 
-            Print.info("Starting Themis Replicas ...")
+            Print.info(f"Starting {flavor} Replicas ...")
             replica_cmds = CommandMaker.run_themis_replicas(self.nodes[0])
             for i, cmd in enumerate(replica_cmds):
                 log_file = PathMaker.themis_log_file(f"replica-{i}")
@@ -287,10 +289,11 @@ class ThemisBench:
 
             sleep(5) # Wait for replicas to be spawned, otherwise client will silently exit
 
-            Print.info("Starting Themis Client ...")
+            Print.info(f"Starting {flavor} Client ...")
             client_cmd = CommandMaker.run_themis_client(
                 idx=0,
                 max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
+                tx_size=self.tx_size,
                 fairness=self.node_parameters.json['gamma'],
                 sb_users=sb_users,
                 sb_prob=sb_prob,
@@ -304,7 +307,7 @@ class ThemisBench:
 
             self._kill_nodes()
 
-            Print.info("Parsing Themis logs...")
+            Print.info(f"Parsing {flavor} logs...")
             return self._parse_themis_logs()
 
         except Exception as e:
@@ -312,4 +315,4 @@ class ThemisBench:
                 self._kill_nodes()
             except BenchError:
                 pass
-            raise BenchError("Failed to run Themis benchmark", e)
+            raise BenchError(f"Failed to run {flavor} benchmark", e)

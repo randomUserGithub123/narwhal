@@ -54,6 +54,7 @@ uint32_t cnt = 0;
 uint32_t nfaulty;
 
 static uint32_t starting_cnt;
+static size_t target_bytes_amount;
 
 struct Request {
     command_t cmd;
@@ -92,7 +93,7 @@ bool try_send(bool check = true) {
     auto next_tx = small_bank_manager->get_next_transaction_serialized();
     auto cmd = new CommandDummy(cid, cnt++, next_tx);
 
-    MsgReqCmd msg(*cmd);
+    MsgReqCmd msg(*cmd, target_bytes_amount);
 
     std::vector<Net::conn_t> shuffled_conns;
     shuffled_conns.reserve(conns.size());
@@ -193,6 +194,12 @@ int main(int argc, char **argv) {
     auto idx = opt_idx->get();
     max_iter_num = opt_max_iter_num->get();
     max_async_num = opt_max_async_num->get();
+
+    target_bytes_amount = opt_max_cli_msg->get();
+
+    HOTSTUFF_LOG_INFO(
+        "Message Size Bytes: %d", target_bytes_amount
+    );
 
     std::vector<std::string> raw;
     for (const auto &s: opt_replicas->get())

@@ -87,6 +87,7 @@ class CommandMaker:
     def run_themis_client(
         idx=0,
         max_async=400,
+        tx_size=512,
         fairness=1.0,
         sb_users=1000000,
         sb_prob=0.9,
@@ -99,6 +100,7 @@ class CommandMaker:
             f"--idx {idx} "
             f"--iter {iter_count} "
             f"--max-async {max_async} "
+            f"--max-cli-msg {tx_size}"
             f"--fairness-parameter {fairness} "
             f"--sb-users {sb_users} "
             f"--sb-prob-choose_mtx {sb_prob} "

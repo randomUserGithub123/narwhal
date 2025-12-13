@@ -17,6 +17,10 @@
 #ifndef _HOTSTUFF_CLIENT_H
 #define _HOTSTUFF_CLIENT_H
 
+#include <vector>
+#include <stdexcept>
+#include <cstdint>
+
 #include "salticidae/msg.h"
 #include "hotstuff/type.h"
 #include "hotstuff/entity.h"
@@ -30,7 +34,18 @@ struct MsgReqCmd {
     static const opcode_t opcode = 0x4;
     DataStream serialized;
     command_t cmd;
-    MsgReqCmd(const Command &cmd) { serialized << cmd; }
+    MsgReqCmd(const Command &cmd, size_t target_bytes) {
+        serialized << cmd;
+
+        auto cur = serialized.size();
+        if (cur > target_bytes)
+            throw std::runtime_error("MsgReqCmd: command too large to pad to target size");
+
+        if (cur < target_bytes) {
+            std::vector<uint8_t> pad(target_bytes - cur, 0);
+            serialized.put_data(pad.data(), pad.data() + pad.size());
+        }
+    }
     MsgReqCmd(DataStream &&s): serialized(std::move(s)) {}
 };
 
