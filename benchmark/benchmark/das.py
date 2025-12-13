@@ -20,7 +20,7 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
-BANNED_NODES = ["node067", "node009", "node012", "node011"]
+BANNED_NODES = ["node018"]
 
 class DASBench:
     BASE_PORT = 4000

@@ -68,7 +68,7 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 
     tx_header_arrival: Sender<(Round, PublicKey, Digest, Vec<Digest>)>,
-    simple_network: SimpleSender
+    simple_network: ReliableSender
 
 }
 
@@ -114,7 +114,7 @@ impl Core {
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 tx_header_arrival,
-                simple_network: SimpleSender::new(),
+                simple_network: ReliableSender::new(),
             }
             .run()
             .await;
