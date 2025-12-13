@@ -211,25 +211,38 @@ class DASBench:
                             break
                 clients_workers_addresses.append((f"{worker_id}", workers))
 
-            for i, addresses in enumerate(workers_addresses):
-                for id, address in addresses:
-                    log_file = PathMaker.worker_log_file(i, id)
-                    print("BEFORE")
-                    cmd = f"ls -a /var/scratch/{self.username}/narwhal/benchmark"
-                    self._background_run(
-                        cmd, log_file, address.split(":")[0], wait=True
-                    )
+            # for i, addresses in enumerate(workers_addresses):
+            #     for id, address in addresses:
+            #         log_file = PathMaker.worker_log_file(i, id)
+            #         print("BEFORE")
+            #         cmd = f"ls -a /var/scratch/{self.username}/narwhal/benchmark"
+            #         self._background_run(
+            #             cmd, log_file, address.split(":")[0], wait=True
+            #         )
 
-                    cmd = f"rm -rf /var/scratch/{self.username}/narwhal/benchmark/.db-*"
-                    self._background_run(
-                        cmd, log_file, address.split(":")[0], wait=True
-                    )
-                    print("AFTER")
+            #         cmd = f"rm -rf /var/scratch/{self.username}/narwhal/benchmark/.db-*"
+            #         self._background_run(
+            #             cmd, log_file, address.split(":")[0], wait=True
+            #         )
+            #         print("AFTER")
 
-                    cmd = f"ls -a /var/scratch/{self.username}/narwhal/benchmark/"
-                    self._background_run(
-                        cmd, log_file, address.split(":")[0], wait=True
-                    )
+            #         cmd = f"ls -a /var/scratch/{self.username}/narwhal/benchmark/"
+            #         self._background_run(
+            #             cmd, log_file, address.split(":")[0], wait=True
+            #         )
+
+            # Run the clients.
+            for i, (id, worker_list) in enumerate(clients_workers_addresses):
+                addresses = ",".join(worker_list)
+                cmd = CommandMaker.run_client(
+                    addresses,
+                    self.tx_size,
+                    rate_share,
+                    worker_list,
+                )
+                log_file = PathMaker.client_log_file(i, id)
+                print(f"Launching client on {clients_hostnames[i // 4]}")
+                self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
             # Run the workers.
             faulty_node_ids = sample(
@@ -268,21 +281,6 @@ class DASBench:
                 log_file = PathMaker.primary_log_file(i)
                 print(f"Launching primary on {address}")
                 self._background_run(cmd, log_file, address.split(":")[0])
-
-            sleep(10)
-
-            # Run the clients.
-            for i, (id, worker_list) in enumerate(clients_workers_addresses):
-                addresses = ",".join(worker_list)
-                cmd = CommandMaker.run_client(
-                    addresses,
-                    self.tx_size,
-                    rate_share,
-                    worker_list,
-                )
-                log_file = PathMaker.client_log_file(i, id)
-                print(f"Launching client on {clients_hostnames[i // 4]}")
-                self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
             # Wait for all transactions to be processed.
             Print.info(f"Running benchmark ({self.duration} sec)...")
