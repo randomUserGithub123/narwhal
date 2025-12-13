@@ -89,6 +89,19 @@ class DASBench:
             # print(v)
             # should be exactly one
             self._hostnames = v.assigned_machines
+
+            if(
+                self._hostnames == ['-']
+            ):
+                print("Number of nodes to reserve is larger than IDLE/AVAILABLE nodes")
+                try:
+                    self.preserve_manager.kill_reservation("LAST")
+                except Exception as e:
+                    print(
+                        f"""Exception : {str(e)}\nTraceback: {traceback.format_exc()}"""
+                    )
+                assert False, "'preserve' request returned PD (request wants more nodes than available)"
+
             return self._hostnames
         return []
 
