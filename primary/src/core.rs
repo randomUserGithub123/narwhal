@@ -68,7 +68,8 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 
     tx_header_arrival: Sender<(Round, PublicKey, Digest, Vec<Digest>)>,
-    simple_network: ReliableSender
+    simple_network: ReliableSender,
+    cancel_handlers_of_worker: HashMap<Round, Vec<CancelHandler>>,
 
 }
 
@@ -115,6 +116,7 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 tx_header_arrival,
                 simple_network: ReliableSender::new(),
+                cancel_handlers_of_worker: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
             .await;
@@ -201,7 +203,11 @@ impl Core {
             );
             let serialized = bincode::serialize(&message)
                 .expect("Failed to serialize our own NewHeader message");
-            self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
+            let cancel_handler = self.simple_network.send(of_worker_address, Bytes::from(serialized)).await;
+            self.cancel_handlers_of_worker
+                .entry(header.round)
+                .or_insert_with(Vec::new)
+                .push(cancel_handler);
         }
 
         // Send to GC to be sent to OF_worker
