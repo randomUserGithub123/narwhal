@@ -269,6 +269,8 @@ class DASBench:
                 print(f"Launching primary on {address}")
                 self._background_run(cmd, log_file, address.split(":")[0])
 
+            sleep(10)
+
             # Run the clients.
             for i, (id, worker_list) in enumerate(clients_workers_addresses):
                 addresses = ",".join(worker_list)
