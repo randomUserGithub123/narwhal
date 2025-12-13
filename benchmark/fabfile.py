@@ -89,7 +89,7 @@ def themis(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
         'workers': 2, # Not used in Themis
         'rate': 50_000,
         'tx_size': 512,
-        'duration': 60,
+        'duration': 120,
     }
     node_params = {
         'header_size': 1_000,  # bytes
