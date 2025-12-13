@@ -3,12 +3,16 @@
 # Requirements
 ## Libraries
 1. `Python`
+    - Install miniconda
+    - `cd "/var/scratch/$USER" & mkdir -p "/var/scratch/$USER/tmp" & cd "/var/scratch/$USER/tmp" & curl -L -o miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh & bash miniconda.sh -b -p "/var/scratch/$USER/miniconda3" & echo 'export PATH="/var/scratch/$USER/miniconda3/bin:$PATH"' >> "$HOME/.bashrc" & source "$HOME/.bashrc"`
+    - Use `spec-file.txt` to create same environment: `conda create --name workenv --file spec-file.txt`
+    - Install libraries: `conda install --name workenv --file spec-file.txt & pip install -r benchmark/requirements.txt`
 2. `Rust`
     - `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 3. `clang`
-    - `sudo apt install clang-20`
+    - `sudo apt install clang-20` (`conda install -y -c conda-forge "clang=20.*" "clangxx=20.*" "lld=20.*" "llvm-tools=20.*" "libclang=20.*"`)
 4. `tmux`
-    - `sudo apt install tmux`
+    - `sudo apt install tmux` (`conda install -y -c conda-forge tmux`)
 
 ## DAS Setup
 1. Contact `das-account@cs.vu.nl` for access (you will get credentials via email)
