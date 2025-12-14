@@ -35,6 +35,8 @@ class OFBench:
         self._wd = os.getcwd()
         self._hostnames = None
 
+        self.clients_hostnames = [None]
+
     def __getattr__(self, attr):
         return getattr(self.bench_parameters, attr)
 
@@ -71,30 +73,15 @@ class OFBench:
                 
                 hosts = self._get_hostnames()
 
-                client_host = hosts[-1]
-
-                pattern = f"[e]xamples/{app_name}-client"
-
-                subprocess.run(
-                    f"ssh {client_host} \"pgrep -af '{pattern}' || echo 'NO {app_name}-client PROC'\"",
-                    shell=True,
-                    stderr=subprocess.DEVNULL,
-                )
-
-                subprocess.run(
-                    f"ssh {client_host} \"pkill -TERM -f '{pattern}' || true\"",
-                    shell=True,
-                    stderr=subprocess.DEVNULL,
-                )
+                for client_host in self.clients_hostnames:
+                    if client_host is not None:
+                        subprocess.run(
+                            f"ssh {client_host} \"pkill -TERM -f 'examples/{app_name}-client' || true\"",
+                            shell=True,
+                            stderr=subprocess.DEVNULL,
+                        )
 
                 sleep(5)
-
-                subprocess.run(
-                    f"ssh {client_host} \"pgrep -af '{pattern}' || echo 'NO {app_name}-client PROC'\"",
-                    shell=True,
-                    stderr=subprocess.DEVNULL,
-                )
-
 
                 for host in hosts:
                     Print.info(f"[{host}] Checking for remaining processes (SIGKILL only if needed)")
@@ -252,7 +239,7 @@ class OFBench:
                 local
             ):
                 replica_IPs = ['127.0.0.1'] * self.nodes[0]
-                clients_hostnames = [None]
+                self.clients_hostnames = [None]
             else:
                 self._preserve_machines(self.nodes[0])
                 sleep(5)
@@ -263,7 +250,7 @@ class OFBench:
                 shuffle(all_hostnames)
                 all_hostnames = all_hostnames[:self._num_machines]
                 replica_IPs = all_hostnames[:self._amount_for_nodes]
-                clients_hostnames = all_hostnames[self._amount_for_nodes:]
+                self.clients_hostnames = all_hostnames[self._amount_for_nodes:]
 
             Print.info(f"Generating {flavor} configuration files...")
             if(
