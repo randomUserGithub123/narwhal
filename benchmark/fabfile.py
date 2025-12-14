@@ -58,7 +58,7 @@ def local(ctx, debug=True):
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for faults, workers_per_node, nodes, runs in [
         (1, 2, 5, 1),
-        (2, 2, 9, 1),
+        # (2, 2, 9, 1),
     ]:
         """Run benchmarks on DAS5"""
         bench_params = {

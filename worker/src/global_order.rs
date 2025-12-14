@@ -491,9 +491,16 @@ pub fn run_utig(
         }
     }
 
-    let mut active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
+    let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
     if active.is_empty() {
         log::info!("UTIG: no non-blank txs in this sub-dag, nothing to propose");
+        matrix.reset(k);
+        {
+            let mut pool = UTIG_POOL
+                .lock()
+                .expect("UTIG_POOL mutex poisoned");
+            pool.release_slot(slot_idx);
+        }
         return;
     }
 
@@ -661,6 +668,13 @@ pub fn run_utig(
     let scc_n = sccs.len();
     if scc_n == 0 {
         log::info!("UTIG: SCC decomposition empty, nothing to propose");
+        matrix.reset(k);
+        {
+            let mut pool = UTIG_POOL
+                .lock()
+                .expect("UTIG_POOL mutex poisoned");
+            pool.release_slot(slot_idx);
+        }
         return;
     }
 
@@ -743,6 +757,13 @@ pub fn run_utig(
     }
 
     if anchor_idx.is_none() {
+        matrix.reset(k);
+        {
+            let mut pool = UTIG_POOL
+                .lock()
+                .expect("UTIG_POOL mutex poisoned");
+            pool.release_slot(slot_idx);
+        }
         let total = start_total.elapsed().as_nanos();
         log::info!(
             "UTIG: no solid anchor in this sub-dag, total ns = {}",

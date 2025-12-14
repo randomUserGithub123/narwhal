@@ -2,15 +2,13 @@
 import subprocess, os
 import datetime
 from math import ceil
-from os.path import basename, splitext
 from time import sleep
-from random import choice, randrange, sample
+from random import shuffle, sample
 import traceback
 
 from benchmark.commands import CommandMaker
 from benchmark.config import (
     Key,
-    LocalCommittee,
     NodeParameters,
     BenchParameters,
     ConfigError,
@@ -20,7 +18,7 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
-BANNED_NODES = []
+BANNED_NODES = ["node018", "node056"]
 
 class DASBench:
     BASE_PORT = 4000
@@ -51,18 +49,21 @@ class DASBench:
     def _kill_nodes(self):
         try:
             hosts = self._get_hostnames()
-            cmd = CommandMaker.cleanup()
+            cmd = CommandMaker.cleanup(username=self.username)
 
             for host in hosts:
                 self._background_run(cmd, "/dev/null", host)
+        except Exception as e:
+            pass
 
+        try:
             self.preserve_manager.kill_reservation("LAST")
         except Exception as e:
             print(
                 f"""Exception : {str(e)}\nTraceback: {traceback.format_exc()}"""
             )
     
-    def _preserve_machines(self):
+    def _preserve_machines(self, nodes):
         # we need one machine per node (primary and workers are colocated) and 1 per 4 clients (which is nodes*workers)
         if self.collocate:
             self._amount_for_nodes = self.nodes[0]
@@ -72,7 +73,7 @@ class DASBench:
             self._amount_for_nodes = self.nodes[0] + self.nodes[0] * self.workers
             self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * self.workers / 4)
 
-        time_string = str(datetime.timedelta(seconds=self.duration + 30)) # extra time to set up things
+        time_string = str(datetime.timedelta(seconds=self.duration + 75 + 2 * nodes)) # extra time to set up things
         self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
 
     def _get_hostnames(self):
@@ -123,10 +124,14 @@ class DASBench:
 
             names = [x.name for x in keys]
 
-            self._preserve_machines()
-            sleep(1.5)
+            self._preserve_machines(nodes=nodes)
+            sleep(5)
             all_hostnames = self._get_hostnames()
+            for banned_node in BANNED_NODES:
+                if banned_node in all_hostnames:
+                    all_hostnames.remove(banned_node)
             all_hostnames = all_hostnames[:self._num_machines]
+            shuffle(all_hostnames)
             nodes_amount = self._amount_for_nodes
 
             nodes_hostnames = all_hostnames[:nodes_amount]
@@ -140,7 +145,7 @@ class DASBench:
                 nodes_hostnames
             )
             committee.print(PathMaker.committee_file())
-            # print(committee.json)
+            print(committee.json)
 
             self.node_parameters.print(PathMaker.parameters_file())
 
@@ -240,7 +245,7 @@ class DASBench:
                         debug=debug,
                     )
                     log_file = PathMaker.worker_log_file(i, id)
-                    print(f"Launching worker on {address}")
+                    print(f"Launching worker {i}-{id} on {address}")
                     self._background_run(cmd, log_file, address.split(":")[0])
 
             # Wait for all transactions to be processed.
@@ -248,7 +253,7 @@ class DASBench:
             sleep(self.duration)
             self._kill_nodes()
 
-            sleep(5)
+            sleep(nodes * 2)
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")
@@ -261,6 +266,10 @@ class DASBench:
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
             return log_values
-        except (subprocess.SubprocessError, ParseError) as e:
+        except subprocess.SubprocessError as e:
+            cmd = f"{CommandMaker.cleanup(username=self.username)}"
+            subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             self._kill_nodes()
             raise BenchError("Failed to run benchmark", e)
+        except ParseError as e:
+            raise BenchError("Error parsing logs, maybe panic", e)
