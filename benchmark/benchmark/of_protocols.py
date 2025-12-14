@@ -143,60 +143,82 @@ class OFBench:
         return []
 
     def _parse_hotstuff_logs(self, client_logs):
-        
-        abs_paths = []
-        for lf in client_logs:
-            abs_log_path = os.path.abspath(
-                os.path.join(os.path.dirname(os.path.dirname(__file__)), lf)
-            )
-            if not os.path.exists(abs_log_path):
-                raise BenchError("Themis client log not found", FileNotFoundError(abs_log_path))
-            abs_paths.append(abs_log_path)
 
-        cmd = ["python", "./scripts/thr_hist.py", "--interval", "1"]
+        if self.flavor != "pompe": 
+            abs_paths = []
+            for lf in client_logs:
+                abs_log_path = os.path.abspath(
+                    os.path.join(os.path.dirname(os.path.dirname(__file__)), lf)
+                )
+                if not os.path.exists(abs_log_path):
+                    raise BenchError("Themis client log not found", FileNotFoundError(abs_log_path))
+                abs_paths.append(abs_log_path)
 
-        proc = subprocess.run(
-            cmd,
-            cwd=PathMaker.hotstuff_code_path(
-                flavor=self.flavor
-            ),
-            input="".join(open(p, "r").read() for p in abs_paths),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+            cmd = ["python", "./scripts/thr_hist.py", "--interval", "1"]
 
-        if proc.returncode != 0:
-            print(proc.stderr)
-            raise BenchError(
-                "Failed to parse Themis logs with thr_hist.py",
-                proc.stderr,
+            proc = subprocess.run(
+                cmd,
+                cwd=PathMaker.hotstuff_code_path(
+                    flavor=self.flavor
+                ),
+                input="".join(open(p, "r").read() for p in abs_paths),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
 
-        throughput = None
-        lat_raw = None
-        lat_wo = None
+            if proc.returncode != 0:
+                print(proc.stderr)
+                raise BenchError(
+                    "Failed to parse Themis logs with thr_hist.py",
+                    proc.stderr,
+                )
 
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("[") and line.endswith("]") and throughput is None:
-                try:
-                    throughput = ast.literal_eval(line)
-                except Exception:
-                    pass
-            m = re.match(r"lat = ([0-9.]+)ms", line)
-            if m:
-                val = float(m.group(1))
-                if lat_raw is None:
-                    lat_raw = val
-                elif lat_wo is None:
-                    lat_wo = val
+            throughput = None
+            lat_raw = None
+            lat_wo = None
 
-        print(
-            "\nthroughput: ", throughput,
-            "\nlatency_avg_ms: ", lat_raw,
-            "\nlatency_avg_wo_outliers_ms: ", lat_wo,
-        )
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]") and throughput is None:
+                    try:
+                        throughput = ast.literal_eval(line)
+                    except Exception:
+                        pass
+                m = re.match(r"lat = ([0-9.]+)ms", line)
+                if m:
+                    val = float(m.group(1))
+                    if lat_raw is None:
+                        lat_raw = val
+                    elif lat_wo is None:
+                        lat_wo = val
+
+            print(
+                "\nthroughput: ", throughput,
+                "\nlatency_avg_ms: ", lat_raw,
+                "\nlatency_avg_wo_outliers_ms: ", lat_wo,
+            )
+        else:
+            mode = "exec"
+            
+            results_dir = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.dirname(__file__)), PathMaker.logs_path())
+            )
+
+            cmd = ["python", "./scripts/process.py", mode, results_dir]
+
+            proc = subprocess.run(
+                cmd,
+                cwd=PathMaker.hotstuff_code_path(flavor=self.flavor),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            print(proc.stdout)
+
+            if proc.returncode != 0:
+                raise BenchError("process.py failed", proc.stderr)
 
     def run(self, debug=False, local=True, flavor="themis"):
         
