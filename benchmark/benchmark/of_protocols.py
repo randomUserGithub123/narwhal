@@ -321,7 +321,7 @@ class OFBench:
 
             Print.info(f"Starting {flavor} Client(s) ...")
             client_logs = []
-            for i, hostname in enumerate(clients_hostnames):
+            for i, hostname in enumerate(self.clients_hostnames):
                 client_cmd = CommandMaker.run_hotstuff_client(
                     idx=0,
                     max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
