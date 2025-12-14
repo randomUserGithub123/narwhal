@@ -72,6 +72,15 @@ class OFBench:
                 hosts = self._get_hostnames()
 
                 client_host = hosts[-1]
+
+                # BEFORE
+                Print.info(f"[{client_host}] BEFORE: checking if {app_name}-client is running")
+                subprocess.run(
+                    f"ssh {client_host} \"pgrep -af 'examples/{app_name}-client' || echo 'NO {app_name}-client PROC'\"",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
+
                 Print.info(f"[{client_host}] Sending SIGTERM to {app_name}-client (graceful shutdown)")
                 subprocess.run(
                     f"ssh {client_host} \"pkill -TERM -f 'examples/{app_name}-client' || true\"",
@@ -80,6 +89,15 @@ class OFBench:
                 )
 
                 sleep(5)
+
+                # AFTER
+                Print.info(f"[{client_host}] AFTER: checking if {app_name}-client is still running")
+                subprocess.run(
+                    f"ssh {client_host} \"pgrep -af 'examples/{app_name}-client' || echo 'NO {app_name}-client PROC'\"",
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                )
+
 
                 for host in hosts:
                     Print.info(f"[{host}] Checking for remaining processes (SIGKILL only if needed)")
@@ -120,12 +138,12 @@ class OFBench:
         except Exception as e:
             Print.warn(f"Error during kill: {e}")
 
-    def _preserve_machines(self):
+    def _preserve_machines(self, nodes):
         # we need one machine per node + 1 for client
         self._amount_for_nodes = self.nodes[0]
         self._num_machines = self._amount_for_nodes + 1
 
-        time_string = str(datetime.timedelta(seconds=self.duration + 60)) # extra time to set up things
+        time_string = str(datetime.timedelta(seconds=self.duration + 72 + nodes * 2)) # extra time to set up things
         self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
 
     def _get_hostnames(self):
@@ -239,7 +257,7 @@ class OFBench:
                 replica_IPs = ['127.0.0.1'] * self.nodes[0]
                 clients_hostnames = [None]
             else:
-                self._preserve_machines()
+                self._preserve_machines(self.nodes[0])
                 sleep(5)
                 all_hostnames = self._get_hostnames()
                 for banned_node in BANNED_NODES:
@@ -350,7 +368,7 @@ class OFBench:
                 )
             )
 
-            sleep(5)
+            sleep(2 * self.nodes[0])
 
             Print.info(f"Parsing {flavor} logs...")
             return self._parse_hotstuff_logs(client_logs)
