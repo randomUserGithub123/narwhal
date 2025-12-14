@@ -22,7 +22,7 @@ class CommandMaker:
         return 'cargo build --quiet --release --features benchmark'
     
     @staticmethod
-    def compile_themis():
+    def compile_hotstuff():
         return (
             'rm -f CMakeCache.txt '
             '&& rm -rf CMakeFiles cmake_install.cmake Makefile build '
@@ -70,21 +70,25 @@ class CommandMaker:
     
     # Themis
     @staticmethod
-    def run_themis_replicas(n_replicas):
+    def run_hotstuff_replicas(
+        n_replicas,
+        is_pompe_variant: bool = False
+    ):
 
         assert isinstance(n_replicas, int) and n_replicas > 0
 
         cmds = []
         for i in range(n_replicas):
-            cmd = (
-                f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf"
-            )
+            if not is_pompe_variant:
+                cmd = f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf"
+            else:
+                cmd = f"./examples/pompe-app ./conf-gen/hotstuff.conf ./server{i}.log --conf ./conf-gen/hotstuff-sec{i}.conf"
             cmds.append(cmd)
         return cmds
 
     # Themis
     @staticmethod
-    def run_themis_client(
+    def run_hotstuff_client(
         idx=0,
         max_async=400,
         tx_size=512,
@@ -93,24 +97,35 @@ class CommandMaker:
         sb_prob=0.9,
         sb_skew_factor=0.1,
         iter_count=-1,
+        is_pompe_variant: bool = False
     ):
     
-        cmd = (
-            f"./examples/hotstuff-client "
-            f"--idx {idx} "
-            f"--iter {iter_count} "
-            f"--max-async {max_async} "
-            f"--max-cli-msg {tx_size} "
-            f"--fairness-parameter {fairness} "
-            f"--sb-users {sb_users} "
-            f"--sb-prob-choose_mtx {sb_prob} "
-            f"--sb-skew-factor {sb_skew_factor} "
-        )
+        if not is_pompe_variant:
+            cmd = (
+                f"./examples/hotstuff-client "
+                f"--idx {idx} "
+                f"--iter {iter_count} "
+                f"--max-async {max_async} "
+                f"--max-cli-msg {tx_size} "
+                f"--fairness-parameter {fairness} "
+                f"--sb-users {sb_users} "
+                f"--sb-prob-choose_mtx {sb_prob} "
+                f"--sb-skew-factor {sb_skew_factor} "
+            )
+        else:
+            cmd = (
+                f"./examples/pompe-client "
+                f"./conf-gen/hotstuff.conf ./client{idx}.order.log ./client{idx}.exec.log "
+                f"--cid {idx} "
+                f"--iter {iter_count} "
+                f"--max-async {max_async} "
+                # f"--max-cli-msg {tx_size} "
+            )
         return cmd
 
     # Themis
     @staticmethod
-    def generate_themis_config(
+    def generate_hotstuff_config(
         n_replica_ips: list,
         base_port=10000,
         block_size=100,
@@ -118,11 +133,13 @@ class CommandMaker:
         sb_users=1000000,
         sb_prob=0.9,
         sb_skew_factor=0.1,
+        is_pompe_variant: bool = False,
+        flavor: str = "themis"
     ):
         
         assert isinstance(base_port, int)
 
-        ips_path = join(PathMaker.themis_code_path(), "ips.txt")
+        ips_path = join(PathMaker.hotstuff_code_path(flavor), "ips.txt")
         with open(ips_path, "w") as f:
             for replica_ip in n_replica_ips:
                 f.write(f"{replica_ip}\n")
@@ -133,12 +150,15 @@ class CommandMaker:
             f"--pport {base_port} "
             f"--cport {base_port + 10000} "
             f"--block-size {block_size} "
-            f"--sb-users {sb_users} "
-            f"--sb-prob-choose_mtx {sb_prob} "
-            f"--sb-skew-factor {sb_skew_factor} "
-            f"--fairness-parameter {fairness} "
-            f" --ips {ips_path} "
+            f"--ips {ips_path} "
         )
+        if not is_pompe_variant:
+            cmd += (
+                f"--sb-users {sb_users} "
+                f"--sb-prob-choose_mtx {sb_prob} "
+                f"--sb-skew-factor {sb_skew_factor} "
+                f"--fairness-parameter {fairness} "
+            )
 
         return cmd
 

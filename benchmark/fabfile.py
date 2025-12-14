@@ -10,7 +10,7 @@ from benchmark.plot import Ploter, PlotError
 from benchmark.instance import InstanceManager
 from benchmark.remote import Bench, BenchError
 from benchmark.das import DASBench
-from benchmark.themis import ThemisBench
+from benchmark.of_protocols import OFBench
 
 @task
 def local(ctx, debug=True):
@@ -81,13 +81,13 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def themis(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
+def of(ctx, debug=True, local=True, username="mputnik", flavor="themis"):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 4,
         'nodes': 17,
-        'workers': 2, # Not used in Themis
-        'rate': 50_000,
+        'workers': 2,
+        'rate': 10_000,
         'tx_size': 512,
         'duration': 30,
     }
@@ -110,6 +110,13 @@ def themis(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
         }
     )
 
+    assert flavor in [
+        "themis",
+        "rashnu",
+        "dikaios",
+        "pompe"
+    ]
+
     assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
     assert bench_params['nodes'] > (
         (4 * node_params['faults']) /
@@ -117,7 +124,7 @@ def themis(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
     )
 
     try:
-        ret = ThemisBench(bench_params, node_params, local, username).run(debug, local=local, flavor=flavor)
+        ret = OFBench(bench_params, node_params, local, username).run(debug, local=local, flavor=flavor)
         print(ret.result())
     except BenchError as e:
         Print.error(e)

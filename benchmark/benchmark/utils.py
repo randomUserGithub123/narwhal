@@ -19,7 +19,7 @@ class PathMaker:
         return join('..', 'node')
     
     @staticmethod
-    def themis_code_path(flavor=None):
+    def hotstuff_code_path(flavor=None):
         benchmark_dir = dirname(dirname(__file__))
         root_dir = abspath(join(benchmark_dir, '..'))
         dir_name = 'Themis_tx'
@@ -31,10 +31,14 @@ class PathMaker:
             flavor == "dikaios"
         ):
             dir_name = "dikaios"
-        return join(root_dir, 'Batch-OF', dir_name)
+        elif(
+            flavor == "pompe"
+        ):
+            dir_name = "Pompe-HS"
+        return join(root_dir, 'of_protocols', dir_name)
 
     @staticmethod
-    def themis_log_file(name: str) -> str:
+    def hotstuff_log_file(name: str) -> str:
         return join(PathMaker.logs_path(), f'themis-{name}.log')
 
     @staticmethod
