@@ -6,13 +6,14 @@ import subprocess
 from math import ceil
 import datetime
 from time import sleep
+from random import shuffle
 
 from benchmark.commands import CommandMaker
 from benchmark.config import BenchParameters, NodeParameters, ConfigError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
-BANNED_NODES = []
+BANNED_NODES = ["node018", "node056"]
 
 class OFBench:
     BASE_PORT = 4000
@@ -241,6 +242,10 @@ class OFBench:
                 self._preserve_machines()
                 sleep(5)
                 all_hostnames = self._get_hostnames()
+                for banned_node in BANNED_NODES:
+                    if banned_node in all_hostnames:
+                        all_hostnames.remove(banned_node)
+                shuffle(all_hostnames)
                 all_hostnames = all_hostnames[:self._num_machines]
                 replica_IPs = all_hostnames[:self._amount_for_nodes]
                 clients_hostnames = all_hostnames[self._amount_for_nodes:]
@@ -344,6 +349,8 @@ class OFBench:
                     self.flavor == "pompe"
                 )
             )
+
+            sleep(5)
 
             Print.info(f"Parsing {flavor} logs...")
             return self._parse_hotstuff_logs(client_logs)
