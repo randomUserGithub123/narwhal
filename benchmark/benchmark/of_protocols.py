@@ -73,27 +73,24 @@ class OFBench:
 
                 client_host = hosts[-1]
 
-                # BEFORE
-                Print.info(f"[{client_host}] BEFORE: checking if {app_name}-client is running")
+                pattern = f"[e]xamples/{app_name}-client"
+
                 subprocess.run(
-                    f"ssh {client_host} \"pgrep -af 'examples/{app_name}-client' || echo 'NO {app_name}-client PROC'\"",
+                    f"ssh {client_host} \"pgrep -af '{pattern}' || echo 'NO {app_name}-client PROC'\"",
                     shell=True,
                     stderr=subprocess.DEVNULL,
                 )
 
-                Print.info(f"[{client_host}] Sending SIGTERM to {app_name}-client (graceful shutdown)")
                 subprocess.run(
-                    f"ssh {client_host} \"pkill -TERM -f 'examples/{app_name}-client' || true\"",
+                    f"ssh {client_host} \"pkill -TERM -f '{pattern}' || true\"",
                     shell=True,
                     stderr=subprocess.DEVNULL,
                 )
 
                 sleep(5)
 
-                # AFTER
-                Print.info(f"[{client_host}] AFTER: checking if {app_name}-client is still running")
                 subprocess.run(
-                    f"ssh {client_host} \"pgrep -af 'examples/{app_name}-client' || echo 'NO {app_name}-client PROC'\"",
+                    f"ssh {client_host} \"pgrep -af '{pattern}' || echo 'NO {app_name}-client PROC'\"",
                     shell=True,
                     stderr=subprocess.DEVNULL,
                 )
