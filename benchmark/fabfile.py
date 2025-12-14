@@ -84,8 +84,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
 def of(ctx, debug=True, local=True, username="mputnik", flavor="themis"):
     ''' Run benchmarks on localhost '''
     bench_params = {
-        'faults': 4,
-        'nodes': 17,
+        'faults': 1,
+        'nodes': 5,
         'workers': 2,
         'rate': 10_000,
         'tx_size': 512,

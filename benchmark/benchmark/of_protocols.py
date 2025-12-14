@@ -139,7 +139,7 @@ class OFBench:
             return self._hostnames
         return []
 
-    def _parse_themis_logs(self, client_logs):
+    def _parse_hotstuff_logs(self, client_logs):
         
         abs_paths = []
         for lf in client_logs:
@@ -328,7 +328,12 @@ class OFBench:
                     )
                 )
                 client_log = PathMaker.hotstuff_log_file(f"client-{i}")
-                client_logs.append(client_log)
+                if self.flavor != "pompe":
+                    client_logs.append(client_log)
+                else:
+                    client_logs.append(
+                        os.path.join("logs", f"client{i}.exec.log")
+                    )
                 self._background_run(client_cmd, client_log, hostname=hostname)
 
             Print.info(f"Running benchmark ({self.duration} sec)...")
@@ -341,7 +346,7 @@ class OFBench:
             )
 
             Print.info(f"Parsing {flavor} logs...")
-            return self._parse_themis_logs(client_logs)
+            return self._parse_hotstuff_logs(client_logs)
 
         except Exception as e:
             try:

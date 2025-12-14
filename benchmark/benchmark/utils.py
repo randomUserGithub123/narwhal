@@ -39,7 +39,7 @@ class PathMaker:
 
     @staticmethod
     def hotstuff_log_file(name: str) -> str:
-        return join(PathMaker.logs_path(), f'themis-{name}.log')
+        return join(PathMaker.logs_path(), f'hotstuff-{name}.log')
 
     @staticmethod
     def committee_file():

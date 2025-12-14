@@ -1,5 +1,5 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
-from os.path import join
+from os.path import join, dirname
 
 from benchmark.utils import PathMaker
 
@@ -82,7 +82,8 @@ class CommandMaker:
             if not is_pompe_variant:
                 cmd = f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf"
             else:
-                cmd = f"./examples/pompe-app ./conf-gen/hotstuff.conf ./server{i}.log --conf ./conf-gen/hotstuff-sec{i}.conf"
+                benchmark_log_dir = join(dirname(dirname(__file__)), "logs")
+                cmd = f"./examples/pompe-app ./conf-gen/hotstuff.conf {benchmark_log_dir}/server{i}.log --conf ./conf-gen/hotstuff-sec{i}.conf"
             cmds.append(cmd)
         return cmds
 
@@ -113,9 +114,12 @@ class CommandMaker:
                 f"--sb-skew-factor {sb_skew_factor} "
             )
         else:
+
+            benchmark_log_dir = join(dirname(dirname(__file__)), "logs")
+
             cmd = (
                 f"./examples/pompe-client "
-                f"./conf-gen/hotstuff.conf ./client{idx}.order.log ./client{idx}.exec.log "
+                f"./conf-gen/hotstuff.conf {benchmark_log_dir}/client{idx}.order.log {benchmark_log_dir}/client{idx}.exec.log "
                 f"--cid {idx} "
                 f"--iter {iter_count} "
                 f"--max-async {max_async} "
