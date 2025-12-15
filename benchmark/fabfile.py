@@ -118,11 +118,15 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
         "pompe"
     ]
 
-    assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
-    assert bench_params['nodes'] > (
-        (4 * node_params['faults']) /
-        (2 * node_params['gamma'] - 1)
-    )
+    if flavor not in [
+        "hotstuff",
+        "pompe"
+    ]:
+        assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+        assert bench_params['nodes'] > (
+            (4 * node_params['faults']) /
+            (2 * node_params['gamma'] - 1)
+        )
 
     try:
         ret = OFBench(bench_params, node_params, local, username).run(debug, local=local, flavor=flavor)
