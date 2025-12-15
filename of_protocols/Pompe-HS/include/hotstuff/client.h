@@ -70,7 +70,21 @@ struct MsgOrdering1ReqCmd {
     static const opcode_t opcode = 0x9;
     DataStream serialized;
     command_t cmd;
-    MsgOrdering1ReqCmd(const Command &cmd) { serialized << cmd; }
+    MsgOrdering1ReqCmd(const Command &cmd, size_t target_bytes = 0) { 
+        if (target_bytes == 0) {
+            serialized << cmd;
+            return;
+        }
+        serialized << cmd;
+        auto cur = serialized.size();
+        if (cur > target_bytes)
+            throw std::runtime_error("MsgReqCmd: command too large to pad to target size");
+
+        if (cur < target_bytes) {
+            std::vector<uint8_t> pad(target_bytes - cur, 0);
+            serialized.put_data(pad.data(), pad.data() + pad.size());
+        }
+    }
     MsgOrdering1ReqCmd(DataStream &&s): serialized(std::move(s)) {}
 };
 

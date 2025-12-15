@@ -126,7 +126,7 @@ class CommandMaker:
                 f"--cid {idx} "
                 f"--iter {iter_count} "
                 f"--max-async {max_async} "
-                # f"--max-cli-msg {tx_size} "
+                f"--max-cli-msg {tx_size} "
             )
         else:
             cmd = (
@@ -157,6 +157,9 @@ class CommandMaker:
         with open(ips_path, "w") as f:
             for replica_ip in n_replica_ips:
                 f.write(f"{replica_ip}\n")
+
+        if flavor == "pompe":
+            block_size = 1
 
         cmd = (
             f"python3 scripts/gen_conf.py " # There are other default params in 'gen_conf.py'

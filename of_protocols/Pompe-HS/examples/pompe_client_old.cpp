@@ -55,9 +55,6 @@ uint32_t cid;
 uint32_t cnt = 0;
 uint32_t nfaulty;
 
-static uint32_t starting_cnt;
-static size_t target_bytes_amount;
-
 struct Request {
     command_t cmd;
     size_t confirmed;
@@ -76,7 +73,6 @@ int BATCH_SIZE, STABLE_PERIOD;
 int count_backoff, total_backoff;
 struct timespec last_exec_resp_ts;
 using Net = salticidae::MsgNetwork<opcode_t>;
-using TimerEvent = salticidae::TimerEvent;
 
 std::unordered_map<ReplicaID, Net::conn_t> conns;
 std::unordered_map<const uint256_t, Request> waiting, waiting_exec;
@@ -90,43 +86,26 @@ void connect_all() {
 }
 
 bool try_send(bool check = true) {
-
-    (void)check;
-
-    if (!max_iter_num)
-        return false;
-
-    auto cmd = new CommandDummy(cid, cnt++);
-    MsgOrdering1ReqCmd msg(*cmd, target_bytes_amount);
-
-    for (auto &p: conns) mn.send_msg(msg, p.second);
-
-    waiting.insert(std::make_pair(
-        cmd->get_hash(), Request(cmd)));
-    if (max_iter_num > 0)
-        max_iter_num--;
-    return true;
-
-//     if ((!check || waiting.size() < max_async_num) && max_iter_num)
-//     {
-//         auto cmd = new CommandDummy(cid, cnt++);
-//         MsgOrdering1ReqCmd msg(*cmd);
-//         //for (auto &p: conns) mn.send_msg(msg, p.second);
+    if ((!check || waiting.size() < max_async_num) && max_iter_num)
+    {
+        auto cmd = new CommandDummy(cid, cnt++);
+        MsgOrdering1ReqCmd msg(*cmd);
+        //for (auto &p: conns) mn.send_msg(msg, p.second);
         
-//         for (int i = 0; i < BATCH_SIZE; i++) {
-//             for (auto &p: conns) mn.send_msg(msg, p.second);
-//         }
-// #ifndef HOTSTUFF_ENABLE_BENCHMARK
-//         HOTSTUFF_LOG_INFO("send new cmd %.10s",
-//                             get_hex(cmd->get_hash()).c_str());
-// #endif
-//         waiting.insert(std::make_pair(
-//             cmd->get_hash(), Request(cmd)));
-//         if (max_iter_num > 0)
-//             max_iter_num--;
-//         return true;
-//     }
-//     return false;
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            for (auto &p: conns) mn.send_msg(msg, p.second);
+        }
+#ifndef HOTSTUFF_ENABLE_BENCHMARK
+        HOTSTUFF_LOG_INFO("send new cmd %.10s",
+                            get_hex(cmd->get_hash()).c_str());
+#endif
+        waiting.insert(std::make_pair(
+            cmd->get_hash(), Request(cmd)));
+        if (max_iter_num > 0)
+            max_iter_num--;
+        return true;
+    }
+    return false;
 }
 
 void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
@@ -140,11 +119,17 @@ void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     if (++it->second.confirmed <= nfaulty) return; // wait for f + 1 ack
     et.stop();
 
+#ifndef HOTSTUFF_ENABLE_BENCHMARK
+    HOTSTUFF_LOG_INFO("got %s, wall: %.3f, cpu: %.3f",
+                        std::string(fin).c_str(),
+                        et.elapsed_sec, et.cpu_elapsed_sec);
+#else
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
-
+#endif
     waiting.erase(it);
+    while (try_send());
 }
 
 void client_ordering1_resp_cmd_handler(MsgOrdering1RespCmd &&msg, const Net::conn_t &) {
@@ -181,6 +166,12 @@ void client_ordering2_resp_cmd_handler(MsgOrdering2RespCmd &&msg, const Net::con
     if (++it->second.ordering_rtt2 != nfaulty*2+1) return; // wait for 2f + 1 ack
     et.stop();
 
+#ifndef HOTSTUFF_ENABLE_BENCHMARK
+    HOTSTUFF_LOG_INFO("got %s, wall: %.3f, cpu: %.3f, timestamps: %s",
+                        std::string(get_hex10(cmd_hash)).c_str(),
+                      et.elapsed_sec, et.cpu_elapsed_sec),
+                        std::string(get_hex10(msg.timestamp)).c_str();
+#else
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     //elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
@@ -190,35 +181,35 @@ void client_ordering2_resp_cmd_handler(MsgOrdering2RespCmd &&msg, const Net::con
 
     // for debug
     //fprintf(stdout, "got %s, timestamps: %s\n", std::string(get_hex10(cmd_hash)).c_str(), std::string(get_hex10(msg.timestamp)).c_str());
-
+#endif
     waiting_exec.insert(std::make_pair(it->first, it->second));
     waiting.erase(it);
 
-    // // slowdown if waiting too long for the consensus phase
-    // struct timespec now;
-    // clock_gettime(CLOCK_MONOTONIC, &now);
-    // uint64_t now_clock_us = now.tv_sec;
-    // now_clock_us *= 1000 * 1000;
-    // now_clock_us += now.tv_nsec/1000;
+    // slowdown if waiting too long for the consensus phase
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t now_clock_us = now.tv_sec;
+    now_clock_us *= 1000 * 1000;
+    now_clock_us += now.tv_nsec/1000;
 
-    // uint64_t last_clock_us = last_exec_resp_ts.tv_sec;
-    // last_clock_us *= 1000 * 1000;
-    // last_clock_us += last_exec_resp_ts.tv_nsec / 1000;
+    uint64_t last_clock_us = last_exec_resp_ts.tv_sec;
+    last_clock_us *= 1000 * 1000;
+    last_clock_us += last_exec_resp_ts.tv_nsec / 1000;
 
-    // const int ONE_SEC = 1000000;
-    // if (last_clock_us == 0 || now_clock_us - last_clock_us < std::max(ONE_SEC * 5, STABLE_PERIOD * 30)) {
-    //     // last consensus response less than 1sec ago
-    //     count_backoff = 0;
-    //     while (try_send());
-    // } else {
-    //     // slowdown the speed of sending requests
-    //     count_backoff++;
-    //     total_backoff++;
-    //     usleep(ONE_SEC * 3);
-    //     // usleep(ONE_SEC * (1 << count_backoff));
-    //     clock_gettime(CLOCK_MONOTONIC, &last_exec_resp_ts);
-    //     while (try_send());
-    // }
+    const int ONE_SEC = 1000000;
+    if (last_clock_us == 0 || now_clock_us - last_clock_us < std::max(ONE_SEC * 5, STABLE_PERIOD * 30)) {
+        // last consensus response less than 1sec ago
+        count_backoff = 0;
+        while (try_send());
+    } else {
+        // slowdown the speed of sending requests
+        count_backoff++;
+        total_backoff++;
+        usleep(ONE_SEC * 3);
+        // usleep(ONE_SEC * (1 << count_backoff));
+        clock_gettime(CLOCK_MONOTONIC, &last_exec_resp_ts);
+        while (try_send());
+    }
 }
 
 
@@ -234,6 +225,11 @@ void client_ordering_exec_resp_handler(MsgConsensusRespClientCmd &&msg, const Ne
     if (++it->second.ordering_rtt3 != 1) return; // wait for 1 exec ack
     et_exec.stop();
 
+#ifndef HOTSTUFF_ENABLE_BENCHMARK
+    // HOTSTUFF_LOG_INFO("executed %s, wall: %.3f, cpu: %.3f",
+    //                     std::string(get_hex10(cmd_hash)).c_str(),
+    //                   et.elapsed_sec, et.cpu_elapsed_sec)).c_str();
+#else
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     //elapsed_exec.push_back(std::make_pair(tv, et_exec.elapsed_sec));
@@ -243,7 +239,7 @@ void client_ordering_exec_resp_handler(MsgConsensusRespClientCmd &&msg, const Ne
 
     // for debug
     //fprintf(stdout, "got %s, timestamps: %s\n", std::string(get_hex10(cmd_hash)).c_str(), "303030000");
-
+#endif
     waiting_exec.erase(it);
 
 }
@@ -267,7 +263,6 @@ int main(int argc, char **argv) {
     auto opt_replicas = Config::OptValStrVec::create();
     auto opt_max_iter_num = Config::OptValInt::create(100);
     auto opt_max_async_num = Config::OptValInt::create(10);
-    auto opt_max_cli_msg = Config::OptValInt::create(65536); // 64K by default
     auto opt_cid = Config::OptValInt::create(-1);
 
     auto shutdown = [&](int) { ec.stop(); };
@@ -297,12 +292,6 @@ int main(int argc, char **argv) {
     auto idx = opt_idx->get();
     max_iter_num = opt_max_iter_num->get();
     max_async_num = opt_max_async_num->get();
-
-    target_bytes_amount = opt_max_cli_msg->get();
-    HOTSTUFF_LOG_INFO(
-        "Message Size Bytes: %d", target_bytes_amount
-    );
-
     std::vector<std::string> raw;
     for (const auto &s: opt_replicas->get())
     {
@@ -315,11 +304,6 @@ int main(int argc, char **argv) {
     if (!(0 <= idx && (size_t)idx < raw.size() && raw.size() > 0))
         throw std::invalid_argument("out of range");
     cid = opt_cid->get() != -1 ? opt_cid->get() : idx;
-
-    std::mt19937_64 rng(std::random_device{}());
-    starting_cnt = std::uniform_int_distribution<uint32_t>()(rng);
-    cnt = starting_cnt;
-
     for (const auto &p: raw)
     {
         auto _p = split_ip_port_cport(p);
@@ -330,55 +314,10 @@ int main(int argc, char **argv) {
     nfaulty = (replicas.size() - 1) / 3;
     HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
     connect_all();
-    
-    const uint64_t PRECISION = 1;
-    const double BURST_DURATION_SEC = 1.0 / PRECISION;
-    const double BURST_DURATION_MS  = BURST_DURATION_SEC * 1000.0;
-    const uint64_t burst = static_cast<uint64_t>(max_async_num) / PRECISION;
-
-    HOTSTUFF_LOG_INFO("Transactions rate: %zu tx/s (max-async)", max_async_num);
-    if (burst == 0) {
-        HOTSTUFF_LOG_WARN("burst == 0 (max-async == 0): no transactions will be sent");
-    }
-    HOTSTUFF_LOG_INFO("Start sending transactions");
-
-    TimerEvent send_timer(ec, [&](TimerEvent &te) {
-        if (!max_iter_num) {
-            HOTSTUFF_LOG_INFO("client finished sending all transactions, stopping event loop");
-            ec.stop();
-            return;
-        }
-
-        salticidae::ElapsedTime loop_et;
-        loop_et.start();
-
-        uint64_t sent_in_burst = 0;
-        for (uint64_t x = 0; x < burst && max_iter_num; x++) {
-            // if (x == (cnt - starting_cnt) % burst) {
-            //     HOTSTUFF_LOG_INFO("Sending sample transaction #%u", cnt);
-            // }
-            if (!try_send())
-                break;
-            sent_in_burst++;
-        }
-
-        loop_et.stop();
-        double elapsed_ms = loop_et.elapsed_sec * 1000.0;
-
-        if (sent_in_burst > 0 && elapsed_ms > BURST_DURATION_MS) {
-            HOTSTUFF_LOG_INFO("Transaction rate too high for this client: "
-                            "burst of %lu tx took %.3f ms (target %.3f ms)",
-                            (unsigned long)sent_in_burst,
-                            elapsed_ms,
-                            BURST_DURATION_MS);
-        }
-
-        te.add(BURST_DURATION_SEC);
-    });
-
-    send_timer.add(BURST_DURATION_SEC);
-
+    while (try_send());
     ec.dispatch();
+
+#ifdef HOTSTUFF_ENABLE_BENCHMARK
 
     printf("client backoff %d times\n", total_backoff);
     printf("client write to order log file %s, %lu entries\n", orderlogfile.c_str(), elapsed.size());
@@ -408,5 +347,6 @@ int main(int argc, char **argv) {
 
     fclose(stdout);
 
+#endif
     return 0;
 }
