@@ -81,7 +81,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def of(ctx, debug=True, local=True, username="mputnik", flavor="themis"):
+def of(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 1,
@@ -89,7 +89,7 @@ def of(ctx, debug=True, local=True, username="mputnik", flavor="themis"):
         'workers': 2,
         'rate': 10_000,
         'tx_size': 512,
-        'duration': 30,
+        'duration': 60,
     }
     node_params = {
         'header_size': 1_000,  # bytes
@@ -99,7 +99,7 @@ def of(ctx, debug=True, local=True, username="mputnik", flavor="themis"):
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 50_000,  # bytes
         'max_batch_delay': 200,  # ms
-        "lo_size": 25, # number of entries in LocalOrder queue
+        "lo_size": 100, # number of entries in LocalOrder queue
         "lo_max_delay": 200, # ms
         "gamma": 1.0, # batch-OF parameter
     }
