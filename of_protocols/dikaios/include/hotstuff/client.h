@@ -34,9 +34,14 @@ struct MsgReqCmd {
     static const opcode_t opcode = 0x4;
     DataStream serialized;
     command_t cmd;
-    MsgReqCmd(const Command &cmd, size_t target_bytes) {
-        serialized << cmd;
+    MsgReqCmd(const Command &cmd, size_t target_bytes = 0) {
+        
+        if (target_bytes == 0) {
+            serialized << cmd;
+            return;
+        }
 
+        serialized << cmd;
         auto cur = serialized.size();
         if (cur > target_bytes)
             throw std::runtime_error("MsgReqCmd: command too large to pad to target size");

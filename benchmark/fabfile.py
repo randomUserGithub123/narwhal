@@ -81,7 +81,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def of(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
+def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 1,
@@ -111,6 +111,7 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="themis"):
     )
 
     assert flavor in [
+        "hotstuff",
         "themis",
         "rashnu",
         "dikaios",

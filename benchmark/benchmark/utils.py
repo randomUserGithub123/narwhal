@@ -22,8 +22,12 @@ class PathMaker:
     def hotstuff_code_path(flavor=None):
         benchmark_dir = dirname(dirname(__file__))
         root_dir = abspath(join(benchmark_dir, '..'))
-        dir_name = 'Themis_tx'
+        dir_name = 'libhotstuff'
         if(
+            flavor == "themis"
+        ):
+            dir_name = 'Themis_tx'
+        elif(
             flavor == "rashnu"
         ):
             dir_name = "Rashnu"

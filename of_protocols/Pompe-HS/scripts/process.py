@@ -1,4 +1,5 @@
 import sys
+import re
 from os import listdir
 from os.path import isfile, join
 
@@ -9,20 +10,24 @@ if (len(sys.argv) != 3):
 files = [f for f in listdir(sys.argv[2]) if isfile(join(sys.argv[2], f))]
 #print onlyfiles
 
+latency_pattern = r'\[hotstuff info\] (\d+\.\d+)'
+
 count = 0
 latencies = []
 average = 0.0
 for file in files:
     if sys.argv[1] in file:
-        f = open(sys.argv[2] + "/" + file, "r")
-        for line in f.readlines():
-            try:
-                latency = float(line.split()[-1])
-                count = count + 1
-                latencies.append(latency)
-                average = average + float(latency)
-            except Exception as e:
-                pass
+        with open(sys.argv[2] + "/" + file, "r") as f:
+            for line in f:
+                match = re.search(latency_pattern, line)
+                if match:
+                    try:
+                        latency = float(match.group(1))
+                        count += 1
+                        latencies.append(latency)
+                        average += latency
+                    except Exception as e:
+                        pass
 
 latencies.sort()
 

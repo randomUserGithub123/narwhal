@@ -98,10 +98,13 @@ class CommandMaker:
         sb_prob=0.9,
         sb_skew_factor=0.1,
         iter_count=-1,
-        is_pompe_variant: bool = False
+        flavor: str = "hotstuff"
     ):
     
-        if not is_pompe_variant:
+        if flavor not in [
+            "hotstuff",
+            "pompe"
+        ]:
             cmd = (
                 f"./examples/hotstuff-client "
                 f"--idx {idx} "
@@ -113,7 +116,7 @@ class CommandMaker:
                 f"--sb-prob-choose_mtx {sb_prob} "
                 f"--sb-skew-factor {sb_skew_factor} "
             )
-        else:
+        elif flavor == "pompe":
 
             benchmark_log_dir = join(dirname(dirname(__file__)), "logs")
 
@@ -124,6 +127,14 @@ class CommandMaker:
                 f"--iter {iter_count} "
                 f"--max-async {max_async} "
                 # f"--max-cli-msg {tx_size} "
+            )
+        else:
+            cmd = (
+                f"./examples/hotstuff-client "
+                f"--idx {idx} "
+                f"--iter {iter_count} "
+                f"--max-async {max_async} "
+                f"--max-cli-msg {tx_size} "
             )
         return cmd
 
@@ -137,7 +148,6 @@ class CommandMaker:
         sb_users=1000000,
         sb_prob=0.9,
         sb_skew_factor=0.1,
-        is_pompe_variant: bool = False,
         flavor: str = "themis"
     ):
         
@@ -156,7 +166,10 @@ class CommandMaker:
             f"--block-size {block_size} "
             f"--ips {ips_path} "
         )
-        if not is_pompe_variant:
+        if flavor not in [
+            "hotstuff",
+            "pompe",
+        ]:
             cmd += (
                 f"--sb-users {sb_users} "
                 f"--sb-prob-choose_mtx {sb_prob} "

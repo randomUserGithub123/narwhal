@@ -60,8 +60,9 @@ class OFBench:
             print(f"[remote-run] {ssh_cmd}")
             subprocess.Popen(ssh_cmd, shell=True)
 
-    def _kill_nodes(self, is_pompe_flavor: bool = False):
+    def _kill_nodes(self):
 
+        is_pompe_flavor = self.flavor == "pompe"
         app_name = "hotstuff"
         if is_pompe_flavor:
             app_name = "pompe"
@@ -243,11 +244,7 @@ class OFBench:
             f"Starting {flavor} local benchmark"
         )
 
-        self._kill_nodes(
-            is_pompe_flavor=(
-                self.flavor == "pompe"
-            )
-        )
+        self._kill_nodes()
 
         try:
 
@@ -289,32 +286,17 @@ class OFBench:
 
             Print.info(f"Generating {flavor} configuration files...")
             if(
-                flavor == "themis"
-            ):
-                # The params do not apply, so it does not matter
-                sb_users = 1000000
-                sb_prob = 0.9
-                sb_skew_factor = 0.1
-            elif(
                 flavor == "rashnu"
             ):
                 sb_users = int(self.node_parameters.json['lo_size'])
                 sb_prob = 0.95
                 sb_skew_factor = 0.99
-            elif(
-                flavor == "dikaios"
-            ):
+            else:
                 # The params do not apply, so it does not matter
                 sb_users = 1000000
                 sb_prob = 0.9
                 sb_skew_factor = 0.1
-            elif(
-                flavor == "pompe"
-            ):
-                # The params do not apply, so it does not matter
-                sb_users = 1000000
-                sb_prob = 0.9
-                sb_skew_factor = 0.1
+            
 
             cmd = CommandMaker.generate_hotstuff_config(
                 n_replica_ips=replica_IPs,
@@ -323,9 +305,6 @@ class OFBench:
                 sb_users=sb_users,
                 sb_prob=sb_prob,
                 sb_skew_factor=sb_skew_factor,
-                is_pompe_variant=(
-                    flavor == "pompe"
-                ),
                 flavor=self.flavor
             )
             subprocess.run(
@@ -365,9 +344,7 @@ class OFBench:
                     sb_users=sb_users,
                     sb_prob=sb_prob,
                     sb_skew_factor=sb_skew_factor,
-                    is_pompe_variant=(
-                        flavor == "pompe"
-                    )
+                    flavor=self.flavor
                 )
                 client_log = PathMaker.hotstuff_log_file(f"client-{i}")
                 if self.flavor != "pompe":
@@ -381,11 +358,7 @@ class OFBench:
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
 
-            self._kill_nodes(
-                is_pompe_flavor=(
-                    self.flavor == "pompe"
-                )
-            )
+            self._kill_nodes()
 
             sleep(2 * self.nodes[0])
 
@@ -394,11 +367,7 @@ class OFBench:
 
         except Exception as e:
             try:
-                self._kill_nodes(
-                    is_pompe_flavor=(
-                        self.flavor == "pompe"
-                    )
-                )
+                self._kill_nodes()
             except BenchError:
                 pass
             raise BenchError(f"Failed to run {flavor} benchmark", e)
