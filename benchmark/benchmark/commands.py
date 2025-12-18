@@ -158,8 +158,8 @@ class CommandMaker:
             for replica_ip in n_replica_ips:
                 f.write(f"{replica_ip}\n")
 
-        if flavor == "pompe":
-            block_size = 1
+        # if flavor == "pompe":
+        #     block_size = 1
 
         cmd = (
             f"python3 scripts/gen_conf.py " # There are other default params in 'gen_conf.py'

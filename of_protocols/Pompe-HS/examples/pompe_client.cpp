@@ -99,53 +99,35 @@ bool try_send(bool check = true) {
     auto cmd = new CommandDummy(cid, cnt++);
     MsgOrdering1ReqCmd msg(*cmd, target_bytes_amount);
 
-    for (auto &p: conns) mn.send_msg(msg, p.second);
-
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        for (auto &p: conns) mn.send_msg(msg, p.second);
+    }
+    
     waiting.insert(std::make_pair(
         cmd->get_hash(), Request(cmd)));
     if (max_iter_num > 0)
         max_iter_num--;
     return true;
-
-//     if ((!check || waiting.size() < max_async_num) && max_iter_num)
-//     {
-//         auto cmd = new CommandDummy(cid, cnt++);
-//         MsgOrdering1ReqCmd msg(*cmd);
-//         //for (auto &p: conns) mn.send_msg(msg, p.second);
-        
-//         for (int i = 0; i < BATCH_SIZE; i++) {
-//             for (auto &p: conns) mn.send_msg(msg, p.second);
-//         }
-// #ifndef HOTSTUFF_ENABLE_BENCHMARK
-//         HOTSTUFF_LOG_INFO("send new cmd %.10s",
-//                             get_hex(cmd->get_hash()).c_str());
-// #endif
-//         waiting.insert(std::make_pair(
-//             cmd->get_hash(), Request(cmd)));
-//         if (max_iter_num > 0)
-//             max_iter_num--;
-//         return true;
-//     }
-//     return false;
 }
 
-void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
-    auto &fin = msg.fin;
-    HOTSTUFF_LOG_DEBUG("got %s", std::string(msg.fin).c_str());
-    const uint256_t &cmd_hash = fin.cmd_hash;
-    auto it = waiting.find(cmd_hash);
-    auto &et = it->second.et;
-    if (it == waiting.end()) return;
+// NOT USED
+// void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
+//     auto &fin = msg.fin;
+//     SALTICIDAE_LOG_INFO("got %s", std::string(msg.fin).c_str());
+//     const uint256_t &cmd_hash = fin.cmd_hash;
+//     auto it = waiting.find(cmd_hash);
+//     auto &et = it->second.et;
+//     if (it == waiting.end()) return;
 
-    if (++it->second.confirmed <= nfaulty) return; // wait for f + 1 ack
-    et.stop();
+//     if (++it->second.confirmed <= nfaulty) return; // wait for f + 1 ack
+//     et.stop();
 
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
+//     struct timeval tv;
+//     gettimeofday(&tv, nullptr);
+//     elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
 
-    waiting.erase(it);
-}
+//     waiting.erase(it);
+// }
 
 void client_ordering1_resp_cmd_handler(MsgOrdering1RespCmd &&msg, const Net::conn_t &) {
     //HOTSTUFF_LOG_DEBUG("got %s", std::string(msg.fin).c_str());
