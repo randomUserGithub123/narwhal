@@ -36,6 +36,9 @@ pub struct LocalOrderMaker {
 
     /// Holds the size of the current LocalOrder (in bytes).
     current_lo_size: usize,
+
+    sequence_number: u64,
+
     /// A network sender to broadcast the LocalOrders to the other workers.
     network: ReliableSender,
 
@@ -64,6 +67,7 @@ impl LocalOrderMaker {
                 current_local_order: LocalOrder::with_capacity(lo_size * 2),
                 seen_tx_digests: HashSet::new(),
                 current_lo_size: 0,
+                sequence_number: 0,
                 network: ReliableSender::new(),
                 our_public_key,
             }
@@ -109,7 +113,11 @@ impl LocalOrderMaker {
 
         // Serialize the local order.
         self.current_lo_size = 0;
-        let local_order: Vec<_> = self.current_local_order.drain(..).collect();
+        let mut local_order: Vec<_> = self.current_local_order.drain(..).collect();
+
+        let seq_bytes = self.sequence_number.to_le_bytes().to_vec();
+        local_order.insert(0, seq_bytes);
+        self.sequence_number += 1;
 
         let message = WorkerMessage::Batch(self.our_public_key, local_order.clone());
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");

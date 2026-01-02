@@ -105,8 +105,6 @@ static UTIG_POOL: Lazy<Mutex<UTIGMatrixPool>> =
 mod global_order_tests;
 
 pub struct GlobalOrder {
-
-    // The persistent storage.
     store: Store,
     
     rx_local_orders: Receiver<(PublicKey, Digest, Batch)>,
@@ -119,17 +117,18 @@ pub struct GlobalOrder {
     non_blank_threshold: u16,
     solid_threshold: u16,
 
-    author_to_lo_digests: HashMap<PublicKey, Vec<Digest>>,
-    digest_to_local_order: HashMap<Digest, Vec<Vec<u8>>>,
+    author_to_lo_digests: HashMap<PublicKey, Vec<Option<Digest>>>,
+    digest_to_seq: HashMap<PublicKey, HashMap<Digest, usize>>,
     author_round_boundaries: HashMap<PublicKey, Vec<(Round, usize, usize)>>,
+    pending_headers: HashMap<PublicKey, Vec<(Round, Vec<Digest>)>>,
+    
+    pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
 
     tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>,
     rx_utig_results: tokio::sync::mpsc::Receiver<Vec<usize>>,
-
 }
 
 impl GlobalOrder {
-
     pub fn new(
         store: Store,
         rx_local_orders: Receiver<(PublicKey, Digest, Batch)>,
@@ -139,7 +138,6 @@ impl GlobalOrder {
         f: u64,
         gamma: f64,
     ) -> Self {
-
         let non_blank_threshold =
             ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
         let solid_threshold = (n - 2 * f) as u16;
@@ -157,8 +155,10 @@ impl GlobalOrder {
             non_blank_threshold,
             solid_threshold,
             author_to_lo_digests: HashMap::new(),
-            digest_to_local_order: HashMap::new(),
+            digest_to_seq: HashMap::new(),
             author_round_boundaries: HashMap::new(),
+            pending_headers: HashMap::new(),
+            pending_subdags: VecDeque::new(),
             rx_utig_results,
             tx_utig_results,
         }
@@ -170,251 +170,300 @@ impl GlobalOrder {
         });
     }
 
-    async fn run(mut self) {
+    #[inline]
+    fn parse_seq_le(local_order: &Batch) -> Option<usize> {
+        let first = local_order.get(0)?;
+        if first.len() != 8 {
+            panic!("seq prefix wrong length: expected 8, got {}", first.len());
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&first[..8]);
+        let seq_u64 = u64::from_le_bytes(arr);
 
+        if (seq_u64 as usize) as u64 != seq_u64 {
+            panic!("seq {} does not fit into usize", seq_u64);
+        }
+        Some(seq_u64 as usize)
+    }
+
+    fn has_full_range(&self, author: &PublicKey, start: usize, end: usize) -> bool {
+        let Some(v) = self.author_to_lo_digests.get(author) else { return false; };
+        if end >= v.len() { return false; }
+        v[start..=end].iter().all(|x| x.is_some())
+    }
+
+    fn can_process_subdag(&self, sub_dag: &[(Round, Vec<PublicKey>)]) -> bool {
+        for (round, authors) in sub_dag {
+            for author in authors {
+                let Some(bounds) = self.author_round_boundaries.get(author) else { return false; };
+                let Some((_, start, end)) = bounds.iter().find(|(r,_,_)| r == round) else { return false; };
+                if !self.has_full_range(author, *start, *end) { return false; }
+            }
+        }
+        true
+    }
+
+    async fn process_subdag(&mut self, sub_dag: Vec<(Round, Vec<PublicKey>)>) {
+        let start_time = Instant::now();
+        let mut author_to_lo_digests_subdag: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
+
+        for (round, authors) in sub_dag.iter() {
+            for author in authors {
+                let round_boundaries = self.author_round_boundaries.get(author).unwrap();
+                let Some((_r, start_idx, end_idx)) = round_boundaries.iter().find(|(r, _, _)| r == round) else {
+                    panic!("Missing boundary for author {:?}, round {} (should have been checked)", author, round);
+                };
+
+                let Some(author_local_orders) = self.author_to_lo_digests.get(author) else {
+                    panic!("Author {:?} not found in author_to_lo_digests", author);
+                };
+
+                if *end_idx >= author_local_orders.len() {
+                    panic!(
+                        "Invalid boundary ({},{}) for author {:?} - only {} local orders",
+                        start_idx, end_idx, author, author_local_orders.len()
+                    );
+                }
+
+                let lo_slice = &author_local_orders[*start_idx..=*end_idx];
+                
+                for maybe_digest in lo_slice {
+                    if let Some(digest) = maybe_digest {
+                        author_to_lo_digests_subdag
+                            .entry(*author)
+                            .or_default()
+                            .push(digest.clone());
+                    } else {
+                        panic!("None digest in boundary for author {:?}, round {}", author, round);
+                    }
+                }
+            }
+        }
+
+        let t1 = start_time.elapsed().as_nanos();
+        log::info!("t1 (boundary extraction): {}", t1);
+
+        let mut indices_sets: Vec<Vec<usize>> = Vec::new();
+        let mut digest_to_local: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut next_idx: usize = 0;
+
+        let mut authors: Vec<PublicKey> = author_to_lo_digests_subdag.keys().cloned().collect();
+        authors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        for author in authors {
+            let lo_digests = &author_to_lo_digests_subdag[&author];
+            for lo_digest in lo_digests {
+                let read_res = self.store.notify_read(lo_digest.to_vec()).await;
+                let serialized = match read_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        panic!("Error reading LocalOrder {:?} from store: {}", lo_digest, e);
+                    }
+                };
+
+                let local_order: Vec<Vec<u8>> = match bincode::deserialize(&serialized) {
+                    Ok(WorkerMessage::Batch(_author, batch)) => batch,
+                    Ok(_) => {
+                        panic!("Unexpected WorkerMessage type for {:?}", lo_digest);
+                    }
+                    Err(e) => {
+                        panic!("Failed to deserialize LocalOrder {:?} from store: {}", lo_digest, e);
+                    }
+                };
+
+                // Skip the first element (sequence number)
+                let mut indices: Vec<usize> = Vec::with_capacity(local_order.len() - 1);
+                for tx_digest in local_order.iter().skip(1) {
+                    let idx = *digest_to_local.entry(tx_digest.clone()).or_insert_with(|| {
+                        let curr = next_idx;
+                        next_idx += 1;
+                        curr
+                    });
+                    indices.push(idx);
+                }
+
+                indices_sets.push(indices);
+            }
+        }
+
+        let k = next_idx;
+        let t2 = start_time.elapsed().as_nanos() - t1;
+        log::info!(
+            "t2 (store reads + indexing): {}\nunique txs (k): {}\nLocalOrders processed: {}",
+            t2, k, indices_sets.len()
+        );
+
+        let non_blank = self.non_blank_threshold;
+        let solid = self.solid_threshold;
+        let tx_utig_results = self.tx_utig_results.clone();
+
+        let _handler = tokio_rayon::spawn(move || {
+            run_utig(indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
+        });
+
+        log::info!("spawning UTIG: {}", start_time.elapsed().as_nanos() - t2);
+    }
+
+    async fn try_process_pending_subdags(&mut self) {
+        let mut i = 0;
+        while i < self.pending_subdags.len() {
+            if self.can_process_subdag(&self.pending_subdags[i]) {
+                let sub_dag = self.pending_subdags.remove(i).unwrap();
+                log::info!("Processing previously pending sub-dag with {} rounds", sub_dag.len());
+                self.process_subdag(sub_dag).await;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    async fn run(mut self) {
         loop {
             tokio::select! {
-
                 Some(sub_dag) = self.rx_consensus_update.recv() => {
-
                     log::info!("Received sub-dag : {:?}", sub_dag);
 
-                    let start_time = Instant::now();
-
-                    let mut author_to_lo_digests_subdag: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
-
-                    for (round, authors) in sub_dag.iter() {
-                        for author in authors {
-
-                            let round_boundaries_opt = self.author_round_boundaries.get(author);
-                            if round_boundaries_opt.is_none() {
-                                log::warn!("Missing round boundaries for author {:?} at round {}", author, round);
-                                continue;
-                            }
-
-                            let round_boundaries = round_boundaries_opt.unwrap();
-                            let boundary_opt = round_boundaries.iter().find(|(r, _, _)| r == round);
-
-                            if boundary_opt.is_none() {
-                                log::warn!(
-                                    "No boundary recorded for author {:?} in round {}",
-                                    author, round
-                                );
-                                continue;
-                            }
-
-                            let (_r, start_idx, end_idx) = *boundary_opt.unwrap();
-
-                            let author_local_orders_opt = self.author_to_lo_digests.get(author);
-                            if author_local_orders_opt.is_none() {
-                                log::warn!("Author {:?} not found in author_to_lo_digests", author);
-                                continue;
-                            }
-
-                            let author_local_orders = author_local_orders_opt.unwrap();
-                            if end_idx >= author_local_orders.len() {
-                                log::warn!(
-                                    "Invalid boundary ({},{}) for author {:?} - only {} local orders",
-                                    start_idx,
-                                    end_idx,
-                                    author,
-                                    author_local_orders.len()
-                                );
-                                continue;
-                            }
-
-                            let lo_slice = &author_local_orders[start_idx..=end_idx];
-
-                            for lo_digest in lo_slice {
-                                author_to_lo_digests_subdag
-                                    .entry(*author)
-                                    .or_default()
-                                    .push(lo_digest.clone());
-                            }
-
-                        }
+                    if self.can_process_subdag(&sub_dag) {
+                        log::info!("Sub-dag ready for immediate processing");
+                        self.process_subdag(sub_dag).await;
+                    } else {
+                        log::warn!("Sub-dag missing data, adding to pending queue (queue size: {})", 
+                                  self.pending_subdags.len() + 1);
+                        self.pending_subdags.push_back(sub_dag);
                     }
-
-                    let t1 = start_time.elapsed().as_nanos();
-                    log::info!(
-                        "t1 : {}", t1
-                    );
-
-                    let mut indices_sets: Vec<Vec<usize>> = Vec::new();
-                    let mut digest_to_local: HashMap<Vec<u8>, usize> = HashMap::new();
-                    let mut next_idx: usize = 0;
-
-                    for (_author, lo_digests) in &author_to_lo_digests_subdag {
-                        for lo_digest in lo_digests {
-                            
-                            let read_res = self.store.read(lo_digest.to_vec()).await;
-                            let serialized = match read_res {
-                                Ok(Some(v)) => v,
-                                Ok(None) => {
-                                    log::warn!(
-                                        "LocalOrder {:?} missing in RocksDB store",
-                                        lo_digest
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "Error reading LocalOrder {:?} from store: {}",
-                                        lo_digest, e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let local_order: Vec<Vec<u8>> = match bincode::deserialize(&serialized) {
-                                Ok(WorkerMessage::Batch(_author, batch)) => batch,
-                                Ok(WorkerMessage::TxDigest(..)) => {
-                                    log::error!(
-                                        "Got TxDigest?"
-                                    );
-                                    continue;
-                                },
-                                Ok(WorkerMessage::BatchRequest(..)) => {
-                                    log::error!(
-                                        "Got BatchRequest?"
-                                    );
-                                    continue;
-                                },
-                                Err(e) => {
-                                    log::error!(
-                                        "Failed to deserialize LocalOrder {:?} from store: {}",
-                                        lo_digest, e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let mut indices: Vec<usize> = Vec::with_capacity(local_order.len());
-
-                            for tx_digest in local_order {
-                                let idx = *digest_to_local.entry(tx_digest.clone()).or_insert_with(|| {
-                                    let curr = next_idx;
-                                    next_idx += 1;
-                                    curr
-                                });
-                                indices.push(idx);
-                            }
-
-                            indices_sets.push(indices);
-
-                        }
-                    }
-
-                    let k = next_idx;
-                    let t2 = start_time.elapsed().as_nanos() - t1;
-                    log::info!(
-                        "t2 : {}\nunique txs (k): {}\nLocalOrders processed: {}",
-                        t2,
-                        k,
-                        indices_sets.len()
-                    );
-
-                    let non_blank = self.non_blank_threshold;
-                    let solid = self.solid_threshold;
-                    let tx_utig_results = self.tx_utig_results.clone();
-
-                    // tokio::task::spawn_blocking(move || {
-                    //     run_utig(indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
-                    // });
-                    let _handler = tokio_rayon::spawn(move || {
-                        run_utig(indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
-                    });
-
-                    log::info!(
-                        "\nspawning UTIG: {}", start_time.elapsed().as_nanos() - t2
-                    );
-
                 },
 
                 Some((author, round, lo_digests)) = self.rx_header_update.recv() => {
-                    
-                    let author_local_orders = self.author_to_lo_digests
-                        .get(&author)
-                        .expect("Header arrived for author, but we have not received LocalOrders?");
+                    log::info!("rx_header_update: author {:?}, round {}, {} digests",
+                              author, round, lo_digests.len());
 
-                    let author_round_boundary = self.author_round_boundaries
-                        .entry(author.clone())
-                        .or_default();
+                    let maybe_seq_map = self.digest_to_seq.get(&author);
 
-                    let prev_boundary_opt = author_round_boundary
-                        .iter()
-                        .rev()
-                        .find(|(r, _start, _end)| *r < round);
-
-                    let search_start = match prev_boundary_opt {
-                        Some((_prev_round, _prev_start, prev_end)) => prev_end + 1,
-                        None => 0,
+                    let Some(seq_map) = maybe_seq_map else {
+                        log::warn!(
+                            "rx_header_update: deferring header (author={:?}, round={}): no digest_to_seq yet; {} lo_digests",
+                            author, round, lo_digests.len()
+                        );
+                        self.pending_headers.entry(author).or_default().push((round, lo_digests));
+                        continue;
                     };
 
-                    let target_len = lo_digests.len();
-                    let lo_set: HashSet<Digest> = lo_digests.into_iter().collect();
-                    let mut found: Option<(usize, usize)> = None;
-                    let n = author_local_orders.len();
-
-                    'outer: for i in search_start..=n - target_len {
-                        
-                        if !lo_set.contains(&author_local_orders[i]) {
-                            continue;
-                        }
-
-                        let mut remaining = lo_set.clone();
-                        let mut ok = true;
-
-                        for j in i..i + target_len {
-                            let d = &author_local_orders[j];
-                            if !remaining.remove(d) {
-                                ok = false;
-                                break;
-                            }
-                        }
-
-                        if ok && remaining.is_empty() {
-                            let start_idx = i;
-                            let end_idx = i + target_len - 1;
-                            found = Some((start_idx, end_idx));
-                            break 'outer;
-                        }
+                    if lo_digests.iter().any(|d| !seq_map.contains_key(d)) {
+                        log::warn!(
+                            "rx_header_update: deferring header (author={:?}, round={}): missing lo_digests in digest_to_seq",
+                            author, round
+                        );
+                        self.pending_headers.entry(author).or_default().push((round, lo_digests));
+                        continue;
                     }
 
-                    match found {
-                        Some((start_idx, end_idx)) => {
-                            author_round_boundary.push((round, start_idx, end_idx));
-                        }
-                        None => {
-                            log::warn!(
-                                "rx_header_update: could not find contiguous block for author {:?}, round {} \
-                                starting from index {}, with {} digests",
-                                author,
-                                round,
-                                search_start,
-                                target_len
-                            );
-                        }
+                    let mut start = usize::MAX;
+                    let mut end = 0usize;
+                    let mut uniq = HashSet::with_capacity(lo_digests.len());
+
+                    for d in &lo_digests {
+                        uniq.insert(d.clone());
+                        let s = seq_map[d];
+                        start = start.min(s);
+                        end = end.max(s);
                     }
+
+                    if uniq.len() != lo_digests.len() {
+                        panic!("rx_header_update: duplicate LO digests in header for {:?}, round {}", author, round);
+                    }
+
+                    if end + 1 - start != lo_digests.len() {
+                        panic!(
+                            "rx_header_update: non-contiguous seq window for {:?}, round {} (start={}, end={}, count={})",
+                            author, round, start, end, lo_digests.len()
+                        );
+                    }
+
+                    self.author_round_boundaries
+                        .entry(author)
+                        .or_default()
+                        .push((round, start, end));
+                    
+                    // Check if any pending sub-dags can now be processed
+                    self.try_process_pending_subdags().await;
                 },
 
                 Some((author, lo_digest, local_order)) = self.rx_local_orders.recv() => {
+                    log::info!("rx_local_orders: author {:?}, digest {:?}", author, lo_digest);
 
-                    log::info!("rx_local_orders: {} {}", author, lo_digest);
+                    let Some(seq) = Self::parse_seq_le(&local_order) else {
+                        panic!("rx_local_orders: failed to parse seq for digest {:?}", lo_digest);
+                    };
 
-                    self.author_to_lo_digests
-                        .entry(author)
-                        .or_default()
-                        .push(lo_digest.clone());
-                    
-                    // self.digest_to_local_order
-                    //     .insert(lo_digest, local_order);
+                    {
+                        let v = self.author_to_lo_digests.entry(author).or_default();
+                        if v.len() <= seq {
+                            v.resize_with(seq + 1, || None);
+                        }
+                        v[seq] = Some(lo_digest.clone());
+                    }
 
+                    {
+                        let m = self.digest_to_seq.entry(author).or_default();
+                        m.insert(lo_digest, seq);
+                    }
+
+                    let mut pending = self.pending_headers.remove(&author).unwrap_or_default();
+                    if !pending.is_empty() {
+                        let seq_map = match self.digest_to_seq.get(&author) {
+                            Some(m) => m,
+                            None => {
+                                self.pending_headers.insert(author, pending);
+                                continue;
+                            }
+                        };
+
+                        let mut unresolved: Vec<(Round, Vec<Digest>)> = Vec::new();
+                        let mut newly_resolved: Vec<(Round, usize, usize)> = Vec::new();
+
+                        for (r, ds) in pending.drain(..) {
+                            if ds.iter().any(|d| !seq_map.contains_key(d)) {
+                                unresolved.push((r, ds));
+                                continue;
+                            }
+
+                            let mut start = usize::MAX;
+                            let mut end = 0usize;
+                            for d in &ds {
+                                let s = seq_map[d];
+                                start = start.min(s);
+                                end = end.max(s);
+                            }
+
+                            if end + 1 - start != ds.len() {
+                                panic!(
+                                    "pending header non-contiguous seq window for {:?}, round {} (start={}, end={}, count={})",
+                                    author, r, start, end, ds.len()
+                                );
+                            }
+
+                            newly_resolved.push((r, start, end));
+                        }
+
+                        if !unresolved.is_empty() {
+                            self.pending_headers.insert(author, unresolved);
+                        }
+
+                        if !newly_resolved.is_empty() {
+                            self.author_round_boundaries
+                                .entry(author)
+                                .or_default()
+                                .extend(newly_resolved);
+                            
+                            // Check if any pending sub-dags can now be processed
+                            self.try_process_pending_subdags().await;
+                        }
+                    }
                 },
+                
                 Some(final_order) = self.rx_utig_results.recv() => {
                     // TODO:
                 }
-
             }
         }
     }

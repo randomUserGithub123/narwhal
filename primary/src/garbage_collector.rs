@@ -99,38 +99,37 @@ impl GarbageCollector {
                         self.committed_headers_without_local_orders.insert(certificate.header.id.clone());
                     }
 
-                    self.current_subdag
-                        .entry(round)
-                        .or_default()
-                        .insert(author);
-
                     if is_leader {
 
-                        let mut entries: Vec<(Round, HashSet<PublicKey>)> =
-                            self.current_subdag.drain().collect();
-                        entries.sort_by_key(|(round, _)| *round);
+                        let mut entries: Vec<(Round, HashSet<PublicKey>)> = self.current_subdag.drain().collect();
+                        entries.sort_by_key(|(r, _)| *r);
 
                         let sub_dag: Vec<(Round, Vec<PublicKey>)> = entries
                             .into_iter()
-                            .map(|(round, authors_set)| {
-                                let authors: Vec<PublicKey> = authors_set.into_iter().collect();
-                                (round, authors)
+                            .map(|(r, authors_set)| {
+                                let mut v: Vec<PublicKey> = authors_set.into_iter().collect();
+                                v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                                (r, v)
                             })
                             .collect();
 
-                        let message = PrimaryWorkerMessage::CommittedSubDag(
-                            sub_dag
-                        );
+                        let message = PrimaryWorkerMessage::CommittedSubDag(sub_dag);
                         let serialized = bincode::serialize(&message)
                             .expect("Failed to serialize our own CommittedSubDag message");
-                        self.simple_network.send(self.of_worker_address, Bytes::from(serialized)).await;
+                        self.simple_network
+                            .send(self.of_worker_address, Bytes::from(serialized))
+                            .await;
 
-                        if self.committed_headers_without_local_orders.len() > 0 {
+                        if !self.committed_headers_without_local_orders.is_empty() {
                             log::info!(
-                                "committed_headers_without_local_orders : {}", self.committed_headers_without_local_orders.len()
+                                "committed_headers_without_local_orders : {}",
+                                self.committed_headers_without_local_orders.len()
                             );
                         }
-                        
+
+                        self.current_subdag.entry(round).or_default().insert(author);
+                    } else {
+                        self.current_subdag.entry(round).or_default().insert(author);
                     }
 
                     let round = certificate.round();
