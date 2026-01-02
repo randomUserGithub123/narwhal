@@ -1,5 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from os.path import join, dirname, abspath
+import traceback
 
 class BenchError(Exception):
     def __init__(self, message, error=None):
@@ -164,6 +165,9 @@ class Print:
         causes += [f'  {len(causes)}: {type(current_cause)}\n']
         causes += [f'  {len(causes)}: {current_cause}\n']
         print(f'Caused by: \n{"".join(causes)}\n')
+        print('-----------------')
+        print(f"TRACEBACK\n-----------------\n {traceback.format_exc()}")
+        print('-----------------')
 
 
 def progress_bar(iterable, prefix='', suffix='', decimals=1, length=30, fill='█', print_end='\r'):
