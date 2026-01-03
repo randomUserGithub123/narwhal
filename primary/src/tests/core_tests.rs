@@ -49,6 +49,8 @@ async fn process_header() {
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
+    let (tx_header_arrival, rx_header_arrival) = channel(1);
+
     // Spawn the core.
     Core::spawn(
         name,
@@ -64,6 +66,7 @@ async fn process_header() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_header_arrival
     );
 
     // Send a header to the core.
@@ -116,6 +119,8 @@ async fn process_header_missing_parent() {
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
+    let (tx_header_arrival, rx_header_arrival) = channel(1);
+
     // Spawn the core.
     Core::spawn(
         name,
@@ -131,6 +136,7 @@ async fn process_header_missing_parent() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_header_arrival
     );
 
     // Send a header to the core.
@@ -176,6 +182,8 @@ async fn process_header_missing_payload() {
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
+    let (tx_header_arrival, rx_header_arrival) = channel(1);
+
     // Spawn the core.
     Core::spawn(
         name,
@@ -191,6 +199,7 @@ async fn process_header_missing_payload() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_header_arrival
     );
 
     // Send a header to the core.
@@ -238,6 +247,8 @@ async fn process_votes() {
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
+    let (tx_header_arrival, rx_header_arrival) = channel(1);
+
     // Spawn the core.
     Core::spawn(
         name,
@@ -253,6 +264,7 @@ async fn process_votes() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_header_arrival
     );
 
     // Make the certificate we expect to receive.
@@ -310,6 +322,8 @@ async fn process_certificates() {
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
+    let (tx_header_arrival, rx_header_arrival) = channel(1);
+
     // Spawn the core.
     Core::spawn(
         name,
@@ -325,6 +339,7 @@ async fn process_certificates() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_header_arrival
     );
 
     // Send enough certificates to the core.

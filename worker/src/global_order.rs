@@ -124,8 +124,8 @@ pub struct GlobalOrder {
     
     pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
 
-    tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>,
-    rx_utig_results: tokio::sync::mpsc::Receiver<Vec<usize>>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, bool)>,
+    rx_utig_results: tokio::sync::mpsc::Receiver<(Vec<usize>, bool)>,
 }
 
 impl GlobalOrder {
@@ -461,8 +461,12 @@ impl GlobalOrder {
                     }
                 },
                 
-                Some(final_order) = self.rx_utig_results.recv() => {
-                    // TODO:
+                Some((final_order, is_complete)) = self.rx_utig_results.recv() => {
+                    if is_complete{
+
+                    }else{
+                        // TODO:
+                    }
                 }
             }
         }
@@ -475,7 +479,7 @@ pub fn run_utig(
     k: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
-    tx_utig_results: tokio::sync::mpsc::Sender<Vec<usize>>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, bool)>,
 ) {
 
     let start_total = Instant::now();
@@ -591,33 +595,26 @@ pub fn run_utig(
         }
     }
 
-    // Now, build the directed graph on non-blank txs.
-    //
-    // We use a predicate similar in spirit to Themis:
-    //   - keep edges where count >= non_blank_threshold
-    //   - do not add edges between blank vertices
-    //
-    // Additionally, we avoid adding duplicate edges (cheap check).
-    for u in 0..k {
-        if !is_non_blank[u] {
-            continue;
-        }
+    // Build the directed graph on non-blank txs.
+    for &u in &active {
+        for &v in &active {
+            if u >= v { continue; }
+            let kuv = weight[w_idx(u,v,k)];
+            let kvu = weight[w_idx(v,u,k)];
 
-        for v in 0..k {
-            if u == v || !is_non_blank[v] {
+            if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 continue;
             }
 
-            let cnt = weight[w_idx(u, v, k)];
-            if cnt < non_blank_threshold {
-                continue;
-            }
+            let dir_uv =
+                if kuv > kvu { true }
+                else if kvu > kuv { false }
+                else {
+                    u < v
+                };
 
-            // avoid duplicates
-            let v16 = v as u16;
-            if !edges[u].contains(&v16) {
-                edges[u].push(v16);
-            }
+            if dir_uv { edges[u].push(v as u16); }
+            else      { edges[v].push(u as u16); }
         }
     }
 
@@ -852,6 +849,33 @@ pub fn run_utig(
         }
     }
 
+    #[inline]
+    fn pair_key(u: usize, v: usize) -> u64 {
+        let (a, b) = if u < v { (u as u32, v as u32) } else { (v as u32, u as u32) };
+        ((a as u64) << 32) | (b as u64)
+    }
+
+    let kept_shaded: Vec<usize> = final_local
+        .iter()
+        .copied()
+        .filter(|&u| !is_solid[u])
+        .collect();
+
+    let mut missing_edges: Vec<u64> = Vec::new();
+    for i in 0..kept_shaded.len() {
+        let u = kept_shaded[i];
+        for j in (i + 1)..kept_shaded.len() {
+            let v = kept_shaded[j];
+
+            let kuv = weight[w_idx(u, v, k)];
+            let kvu = weight[w_idx(v, u, k)];
+
+            if kuv < non_blank_threshold && kvu < non_blank_threshold {
+                missing_edges.push(pair_key(u, v));
+            }
+        }
+    }
+
     let solid_nodes = is_solid
         .iter()
         .take(k)
@@ -866,9 +890,11 @@ pub fn run_utig(
     );
 
     log::info!(
-        "UTIG: finalized prefix length = {}, solid_nodes = {}, anchor_scc_idx = {}, total ns = {}",
+        "UTIG: finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
         final_local.len(),
         solid_nodes,
+        kept_shaded.len(),
+        missing_edges.len(),
         anchor,
         start_total.elapsed().as_nanos()
     );
@@ -877,7 +903,7 @@ pub fn run_utig(
     // (8) Output result: local tx indices to finalize
     // ============================================================
 
-    let _ = tx_utig_results.blocking_send(final_local);
+    let _ = tx_utig_results.blocking_send((final_local, missing_edges.len() == 0));
 
     matrix.reset(k);
 
