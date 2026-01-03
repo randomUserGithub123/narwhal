@@ -204,7 +204,7 @@ use tokio::sync::mpsc;
 
 static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-type UtigOut = (Vec<usize>, Vec<u16>, Vec<(u16, u16)>, Vec<u64>);
+type UtigOut = (u64, Vec<usize>, Vec<u16>, Vec<(u16, u16)>, Vec<u64>);
 
 fn thresholds(n: u64, f: u64, gamma: f64) -> (u16, u16) {
     let non_blank_threshold =
@@ -247,7 +247,7 @@ fn run_case(indices_sets: Vec<Vec<usize>>, n: u64, f: u64, gamma: f64) -> Option
     let k = compute_k(&indices_sets);
 
     let (tx, mut rx) = mpsc::channel(1);
-    run_utig(indices_sets, k, nb as u8, solid as u8, tx);
+    run_utig(0, indices_sets, k, nb as u8, solid as u8, tx);
     rx.blocking_recv()
 }
 
@@ -260,7 +260,7 @@ fn utig_empty_input_no_output() {
     let k = 0;
 
     let (tx, mut rx) = mpsc::channel(1);
-    run_utig(indices_sets, k, nb as u8, solid as u8, tx);
+    run_utig(0, indices_sets, k, nb as u8, solid as u8, tx);
 
     assert!(rx.blocking_recv().is_none());
 }
@@ -282,7 +282,7 @@ fn utig_single_solid_only_complete() {
     let indices_sets = vec![vec![0], vec![0], vec![0], vec![0], vec![0]];
     let k = compute_k(&indices_sets);
 
-    let (finalized_now, region_b_v, region_b_e, missing_edges) =
+    let (sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edges) =
         run_case(indices_sets, 9, 2, 1.0).expect("expected output");
 
     assert_usize_vec_sane(&finalized_now, k);
@@ -300,7 +300,7 @@ fn utig_tie_breaker_prefers_lower_index() {
     let indices_sets = vec![vec![0, 1], vec![0, 1], vec![1, 0], vec![1, 0]];
     let k = compute_k(&indices_sets);
 
-    let (finalized_now, region_b_v, region_b_e, missing_edges) =
+    let (sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edges) =
         run_case(indices_sets, 4, 1, 1.0).expect("expected output");
 
     assert_usize_vec_sane(&finalized_now, k);
@@ -325,7 +325,7 @@ fn utig_incomplete_when_two_kept_shaded_have_no_edge() {
     ];
     let k = compute_k(&indices_sets);
 
-    let (finalized_now, region_b_v, region_b_e, missing_edges) =
+    let (sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edges) =
         run_case(indices_sets, 9, 2, 1.0).expect("expected output");
 
     assert_usize_vec_sane(&finalized_now, k);
@@ -346,7 +346,7 @@ fn utig_complete_when_two_kept_shaded_have_edge() {
     let indices_sets = vec![vec![1, 2, 0], vec![1, 2, 0], vec![1, 2, 0], vec![0], vec![0]];
     let k = compute_k(&indices_sets);
 
-    let (finalized_now, region_b_v, region_b_e, missing_edges) =
+    let (sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edges) =
         run_case(indices_sets, 9, 2, 1.0).expect("expected output");
 
     assert_usize_vec_sane(&finalized_now, k);
@@ -374,7 +374,7 @@ fn utig_excluded_shaded_do_not_affect_completeness() {
     ];
     let k = compute_k(&indices_sets);
 
-    let (finalized_now, region_b_v, region_b_e, missing_edges) =
+    let (sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edges) =
         run_case(indices_sets, 9, 2, 1.0).expect("expected output");
 
     assert_usize_vec_sane(&finalized_now, k);
@@ -392,7 +392,7 @@ fn utig_multi_node_scc_is_sorted_in_output() {
     let indices_sets = vec![vec![1, 2, 3, 0], vec![2, 3, 1, 0], vec![3, 1, 2, 0]];
     let k = compute_k(&indices_sets);
 
-    let (finalized_now, region_b_v, region_b_e, missing_edges) =
+    let (sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edges) =
         run_case(indices_sets, 4, 1, 1.0).expect("expected output");
 
     assert_usize_vec_sane(&finalized_now, k);

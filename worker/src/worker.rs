@@ -289,6 +289,8 @@ impl Worker {
         );
 
         if own_worker_id == 0 {
+
+            let (tx_fair_propose, rx_fair_propose) = channel(CHANNEL_CAPACITY);
             
             LocalOrderMaker::spawn(
                 self.parameters.lo_size, 
@@ -301,7 +303,8 @@ impl Worker {
                     .iter()
                     .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                     .collect(),
-                self.name
+                self.name,
+                rx_fair_propose
             );
 
             let go = GlobalOrder::new(
@@ -311,7 +314,8 @@ impl Worker {
                 rx_consensus_update,
                 self.committee.size() as u64,
                 self.parameters.faults,
-                self.parameters.gamma
+                self.parameters.gamma,
+                tx_fair_propose
             );
             go.start();
 

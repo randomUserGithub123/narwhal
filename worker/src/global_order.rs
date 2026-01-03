@@ -4,6 +4,7 @@ use store::Store;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use tokio::sync::mpsc::Receiver;
 use tokio::task;
+use std::convert::TryInto as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
@@ -117,6 +118,9 @@ pub struct GlobalOrder {
     non_blank_threshold: u16,
     solid_threshold: u16,
 
+    tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u32>, Vec<Digest>, Vec<u64>)>,
+    sub_dag_count: u64,
+
     author_to_lo_digests: HashMap<PublicKey, Vec<Option<Digest>>>,
     digest_to_seq: HashMap<PublicKey, HashMap<Digest, usize>>,
     author_round_boundaries: HashMap<PublicKey, Vec<(Round, usize, usize)>>,
@@ -124,11 +128,23 @@ pub struct GlobalOrder {
     
     pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
 
-    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u64>)>,
-    rx_utig_results: tokio::sync::mpsc::Receiver<(Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u64>)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
+    rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
+
+    subdag_index_to_digest: HashMap<u64, Vec<Vec<u8>>>,
+
+    finalized_subdags: HashSet<u64>,
+    pending_subdags_fair: HashSet<u64>,
 }
 
 impl GlobalOrder {
+
+    fn region_data_key(sub_dag_id: u64) -> Vec<u8> {
+        let mut key = vec![0xFF; 8];
+        key.extend_from_slice(&sub_dag_id.to_le_bytes());
+        key
+    }
+
     pub fn new(
         store: Store,
         rx_local_orders: Receiver<(PublicKey, Digest, Batch)>,
@@ -137,6 +153,7 @@ impl GlobalOrder {
         n: u64,
         f: u64,
         gamma: f64,
+        tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u32>, Vec<Digest>, Vec<u64>)>,
     ) -> Self {
         let non_blank_threshold =
             ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
@@ -152,6 +169,8 @@ impl GlobalOrder {
             n,
             f,
             gamma,
+            tx_fair_propose,
+            sub_dag_count: 0,
             non_blank_threshold,
             solid_threshold,
             author_to_lo_digests: HashMap::new(),
@@ -161,6 +180,9 @@ impl GlobalOrder {
             pending_subdags: VecDeque::new(),
             rx_utig_results,
             tx_utig_results,
+            subdag_index_to_digest: HashMap::new(),
+            finalized_subdags: HashSet::new(),
+            pending_subdags_fair: HashSet::new(),
         }
     }
 
@@ -207,6 +229,10 @@ impl GlobalOrder {
         let start_time = Instant::now();
         let mut author_to_lo_digests_subdag: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
 
+        // Find the final (maximum) round
+        let final_round = sub_dag.iter().map(|(r, _)| *r).max().unwrap_or(0);
+        log::info!("process_subdag: final_round={}", final_round);
+
         for (round, authors) in sub_dag.iter() {
             for author in authors {
                 let round_boundaries = self.author_round_boundaries.get(author).unwrap();
@@ -245,14 +271,30 @@ impl GlobalOrder {
 
         let mut indices_sets: Vec<Vec<usize>> = Vec::new();
         let mut digest_to_local: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut index_to_digest: Vec<Vec<u8>> = Vec::new();
         let mut next_idx: usize = 0;
+
+        // Track updated edges: sub_dag_id -> author -> Vec<edge>
+        let mut updated_edges_map: HashMap<u64, HashMap<PublicKey, Vec<u64>>> = HashMap::new();
 
         let mut authors: Vec<PublicKey> = author_to_lo_digests_subdag.keys().cloned().collect();
         authors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         for author in authors {
             let lo_digests = &author_to_lo_digests_subdag[&author];
-            for lo_digest in lo_digests {
+            
+            // Determine which LocalOrders to extract fair proposals from
+            // Option 1: Only from final round
+            // Get the author's round boundaries to find which LOs belong to final round
+            let round_boundaries = self.author_round_boundaries.get(&author).unwrap();
+            let final_round_boundary = round_boundaries.iter().find(|(r, _, _)| *r == final_round);
+            
+            let (final_round_start, final_round_end) = match final_round_boundary {
+                Some((_r, start, end)) => (*start, *end),
+                None => (usize::MAX, 0), // Author not in final round
+            };
+            
+            for (lo_idx, lo_digest) in lo_digests.iter().enumerate() {
                 let read_res = self.store.notify_read(lo_digest.to_vec()).await;
                 let serialized = match read_res {
                     Ok(v) => v,
@@ -271,34 +313,224 @@ impl GlobalOrder {
                     }
                 };
 
-                // Skip the first element (sequence number)
-                let mut indices: Vec<usize> = Vec::with_capacity(local_order.len() - 1);
-                for tx_digest in local_order.iter().skip(1) {
+                // Determine the sequence number of this LocalOrder
+                let seq_num = match Self::parse_seq_le(&local_order) {
+                    Some(seq) => seq,
+                    None => {
+                        log::warn!("Could not parse seq for LocalOrder {:?}", lo_digest);
+                        0 // Fallback, but this shouldn't happen
+                    }
+                };
+
+                // Check if this LocalOrder is from the final round
+                let is_final_round = seq_num >= final_round_start && seq_num <= final_round_end;
+
+                let mut tx_idx = 0;
+                let mut indices: Vec<usize> = Vec::new();
+                
+                while tx_idx < local_order.len() {
+                    if tx_idx == 0 {
+                        // Skip sequence number
+                        tx_idx += 1;
+                        continue;
+                    }
+                    
+                    let tx_digest = &local_order[tx_idx];
+                    
+                    // Check if this is a sentinel marker (32 bytes of 0xFF)
+                    if tx_digest.len() == 32 && tx_digest.iter().all(|&b| b == 0xFF) {
+                        // Only extract fair proposals from final round LocalOrders
+                        if is_final_round {
+                            log::info!(
+                                "Found sentinel from author {:?} (seq={}) in final round LocalOrder {:?}",
+                                author, seq_num, lo_digest
+                            );
+                            
+                            // Extract fair proposal metadata
+                            if tx_idx + 2 >= local_order.len() {
+                                log::error!(
+                                    "Sentinel found but not enough data after it in LocalOrder {:?}",
+                                    lo_digest
+                                );
+                                break;
+                            }
+                            
+                            // Read sub_dag_id (8 bytes)
+                            let sub_dag_id_bytes = &local_order[tx_idx + 1];
+                            if sub_dag_id_bytes.len() != 8 {
+                                log::error!(
+                                    "Invalid sub_dag_id length: expected 8, got {}",
+                                    sub_dag_id_bytes.len()
+                                );
+                                break;
+                            }
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(sub_dag_id_bytes);
+                            let sub_dag_id = u64::from_le_bytes(arr);
+                            
+                            // Read edge count (8 bytes)
+                            let edge_count_bytes = &local_order[tx_idx + 2];
+                            if edge_count_bytes.len() != 8 {
+                                log::error!(
+                                    "Invalid edge_count length: expected 8, got {}",
+                                    edge_count_bytes.len()
+                                );
+                                break;
+                            }
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(edge_count_bytes);
+                            let edge_count = u64::from_le_bytes(arr) as usize;
+                            
+                            log::info!(
+                                "Fair proposal from author {:?}: sub_dag_id={}, edge_count={}",
+                                author, sub_dag_id, edge_count
+                            );
+                            
+                            // Read edges (8 bytes each)
+                            let mut edges: Vec<u64> = Vec::with_capacity(edge_count);
+                            for i in 0..edge_count {
+                                let edge_idx = tx_idx + 3 + i;
+                                if edge_idx >= local_order.len() {
+                                    log::error!(
+                                        "Not enough edge data: expected {} edges, got {}",
+                                        edge_count, i
+                                    );
+                                    break;
+                                }
+                                
+                                let edge_bytes = &local_order[edge_idx];
+                                if edge_bytes.len() != 8 {
+                                    log::error!(
+                                        "Invalid edge length: expected 8, got {}",
+                                        edge_bytes.len()
+                                    );
+                                    continue;
+                                }
+                                
+                                let mut arr = [0u8; 8];
+                                arr.copy_from_slice(edge_bytes);
+                                let edge = u64::from_le_bytes(arr);
+                                edges.push(edge);
+                            }
+                            
+                            // Store edges for this sub_dag_id and author
+                            updated_edges_map
+                                .entry(sub_dag_id)
+                                .or_insert_with(HashMap::new)
+                                .insert(author, edges);
+                        } else {
+                            log::debug!(
+                                "Skipping sentinel from author {:?} (seq={}) - not in final round",
+                                author, seq_num
+                            );
+                        }
+                        
+                        // Skip past the sentinel + metadata + edges regardless
+                        // Need to read edge_count even if not final round to skip correctly
+                        if tx_idx + 2 < local_order.len() {
+                            let edge_count_bytes = &local_order[tx_idx + 2];
+                            if edge_count_bytes.len() == 8 {
+                                let mut arr = [0u8; 8];
+                                arr.copy_from_slice(edge_count_bytes);
+                                let edge_count = u64::from_le_bytes(arr) as usize;
+                                tx_idx += 3 + edge_count;
+                                continue;
+                            }
+                        }
+                        // If we can't parse edge_count, just skip sentinel + 2 fields
+                        tx_idx += 3;
+                        continue;
+                    }
+                    
+                    // Regular tx_digest - add to indices (ALWAYS, regardless of round)
                     let idx = *digest_to_local.entry(tx_digest.clone()).or_insert_with(|| {
                         let curr = next_idx;
+                        index_to_digest.push(tx_digest.clone());
                         next_idx += 1;
                         curr
                     });
                     indices.push(idx);
+                    tx_idx += 1;
                 }
 
-                indices_sets.push(indices);
+                if !indices.is_empty() {
+                    indices_sets.push(indices);
+                }
             }
         }
 
         let k = next_idx;
         let t2 = start_time.elapsed().as_nanos() - t1;
         log::info!(
-            "t2 (store reads + indexing): {}\nunique txs (k): {}\nLocalOrders processed: {}",
-            t2, k, indices_sets.len()
+            "t2 (store reads + indexing): {}\nunique txs (k): {}\nLocalOrders processed: {}\nupdated_edges found for {} subdags",
+            t2, k, indices_sets.len(), updated_edges_map.len()
         );
+        
+        // Process updated edges: check quorum and merge
+        let quorum_threshold = (self.n - self.f) as usize;
+        
+        for (sub_dag_id, author_edges_map) in &updated_edges_map {
+            let num_authors = author_edges_map.len();
+            
+            log::info!(
+                "sub_dag_id={}: received updated edges from {} authors (quorum threshold: {})",
+                sub_dag_id, num_authors, quorum_threshold
+            );
+            
+            if num_authors >= quorum_threshold {
+                
+                log::info!("MADE IT {}", sub_dag_id);
+                let _ = self.tx_fair_propose
+                    .send((*sub_dag_id, vec![], vec![], vec![]))
+                    .await;
+
+                self.pending_subdags_fair.remove(sub_dag_id);
+
+                // Read region_b data from store NOW, before spawning
+                let combined_data = self.store.read(Self::region_data_key(*sub_dag_id))
+                    .await
+                    .expect("Store read failed")
+                    .expect("Data not found in store");
+                
+                let tx_utig_results = self.tx_utig_results.clone();
+                let n = self.n;
+                let f = self.f;
+                let gamma = self.gamma;
+                let sub_dag_id_val = *sub_dag_id;
+                let author_edges_map_clone = author_edges_map.clone();
+                
+                tokio_rayon::spawn(move || {
+                    apply_fair_update_and_finalize(
+                        combined_data,
+                        sub_dag_id_val,
+                        author_edges_map_clone,
+                        n,
+                        f,
+                        gamma,
+                        tx_utig_results,
+                    );
+                });
+
+            } else {
+                log::warn!(
+                    "sub_dag_id={}: insufficient authors for quorum ({} < {}), ignoring updated edges",
+                    sub_dag_id, num_authors, quorum_threshold
+                );
+            }
+        }
 
         let non_blank = self.non_blank_threshold;
         let solid = self.solid_threshold;
         let tx_utig_results = self.tx_utig_results.clone();
 
+        let sub_dag_id = self.sub_dag_count;
+        self.subdag_index_to_digest.insert(sub_dag_id, index_to_digest);
+        self.sub_dag_count += 1;
+        
+        // TODO: Pass finalized_updated_edges to run_utig or use it to update existing UTIG results
+        
         let _handler = tokio_rayon::spawn(move || {
-            run_utig(indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
+            run_utig(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
         });
 
         log::info!("spawning UTIG: {}", start_time.elapsed().as_nanos() - t2);
@@ -461,26 +693,317 @@ impl GlobalOrder {
                     }
                 },
                 
-                Some((finalized_now, region_b_v, region_b_e, missing_edges)) = self.rx_utig_results.recv() => {
+                Some((sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edge_vertices, missing_edges)) = self.rx_utig_results.recv() => {
+                    log::info!(
+                        "rx_utig_results: sub_dag_id={}, finalized={}, region_b_v={}, region_b_e={}, missing_edges={}",
+                        sub_dag_id, finalized_now.len(), region_b_v.len(), region_b_e.len(), missing_edges.len()
+                    );
 
-                    // TODO: Handle finalized_now
+                    // TODO: Output finalized transactions
+                    log::info!("FINALIZED TX COUNT : {}\nsub_dag_id : {}", finalized_now.len(), sub_dag_id);
 
-                    if !missing_edges.is_empty(){
-                        // TODO:
+                    // Check if this is a FairFinalize result (finalized_now full, rest empty)
+                    if !finalized_now.is_empty() && region_b_v.is_empty() && region_b_e.is_empty() && missing_edges.is_empty() {
+                        log::info!("sub_dag_id={}: FairFinalize completed, {} transactions finalized", sub_dag_id, finalized_now.len());
+                        self.finalized_subdags.insert(sub_dag_id);
+                        self.pending_subdags_fair.remove(&sub_dag_id);
+
+                        continue;  // Skip the rest - no index_to_digest to remove
                     }
+
+                    // This is from run_utig - has region_b data
+                    let index_to_digest: Vec<Vec<u8>> = self.subdag_index_to_digest
+                        .remove(&sub_dag_id)
+                        .expect("missing index_to_digest for sub_dag_id");
+
+                    // Store region_b data to disk
+                    let mut combined_data: Vec<u8> = Vec::new();
+                    let region_b_v_ser = bincode::serialize(&region_b_v).expect("Failed to serialize region_b_v");
+                    combined_data.extend_from_slice(&(region_b_v_ser.len() as u64).to_le_bytes());
+                    combined_data.extend_from_slice(&region_b_v_ser);
+                    combined_data.extend_from_slice(&[0xFF; 8]);
+                    let region_b_e_ser = bincode::serialize(&region_b_e).expect("Failed to serialize region_b_e");
+                    combined_data.extend_from_slice(&(region_b_e_ser.len() as u64).to_le_bytes());
+                    combined_data.extend_from_slice(&region_b_e_ser);
+                    combined_data.extend_from_slice(&[0xFF; 8]);
+                    let index_ser = bincode::serialize(&index_to_digest).expect("Failed to serialize index_to_digest");
+                    combined_data.extend_from_slice(&(index_ser.len() as u64).to_le_bytes());
+                    combined_data.extend_from_slice(&index_ser);
+                    self.store.write(Self::region_data_key(sub_dag_id), combined_data).await;
+                    
+                    log::info!("sub_dag_id={}: stored region_b data to disk", sub_dag_id);
+
+                    if !missing_edges.is_empty() {
+                        let mut missing_tx_digests: Vec<Digest> = Vec::with_capacity(missing_edge_vertices.len());
+                        for &vid in &missing_edge_vertices {
+                            let idx = vid as usize;
+                            if idx >= index_to_digest.len() {
+                                panic!("missing edge vertex idx {} out of bounds", idx);
+                            }
+                            let arr: [u8; 32] = index_to_digest[idx].clone().try_into().unwrap();
+                            missing_tx_digests.push(Digest(arr));
+                        }
+                        self.pending_subdags_fair.insert(sub_dag_id);
+                        let _ = self.tx_fair_propose
+                            .send((sub_dag_id, missing_edge_vertices, missing_tx_digests, missing_edges))
+                            .await;
+                    }
+                    
+                    // TODO: Handle finalized_now from run_utig
                 }
             }
         }
     }
 }
 
+fn apply_fair_update_and_finalize(
+    combined_data: Vec<u8>,
+    sub_dag_id: u64,
+    author_edges_map: HashMap<PublicKey, Vec<u64>>,
+    n: u64,
+    f: u64,
+    gamma: f64,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
+) {
+    let start_time = Instant::now();
+    
+    // Deserialize region_b data
+    let mut offset = 0;
+    let mut len_bytes = [0u8; 8];
+    
+    len_bytes.copy_from_slice(&combined_data[offset..offset + 8]);
+    offset += 8;
+    let region_b_v_len = u64::from_le_bytes(len_bytes) as usize;
+    let region_b_v: Vec<u16> = bincode::deserialize(&combined_data[offset..offset + region_b_v_len]).unwrap();
+    offset += region_b_v_len + 8;
+    
+    len_bytes.copy_from_slice(&combined_data[offset..offset + 8]);
+    offset += 8;
+    let region_b_e_len = u64::from_le_bytes(len_bytes) as usize;
+    let mut region_b_e: Vec<(u16, u16)> = bincode::deserialize(&combined_data[offset..offset + region_b_e_len]).unwrap();
+    
+    log::info!(
+        "apply_fair_update: sub_dag_id={}, region_b_v={}, region_b_e={}, authors={}",
+        sub_dag_id, region_b_v.len(), region_b_e.len(), author_edges_map.len()
+    );
+    
+    if region_b_v.is_empty() {
+        log::info!("apply_fair_update: sub_dag_id={}, empty region_b", sub_dag_id);
+        return;
+    }
+    
+    // Thresholds per paper
+    let non_blank_threshold = ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
+    let solid_threshold = (n - 2 * f) as u16;  // n-2f for "tx ∈_{n-2f} L_updates"
+    
+    let k = region_b_v.iter().map(|&v| v as usize + 1).max().unwrap_or(0);
+    
+    let mut existing_edges: HashSet<(u16, u16)> = region_b_e.iter().cloned().collect();
+    
+    // weight[from][to] = number of votes for directed edge from -> to
+    let mut weight: Vec<Vec<u16>> = vec![vec![0; k]; k];
+    
+    // Track how many authors voted on edges involving each tx
+    let mut tx_author_count: Vec<HashSet<usize>> = vec![HashSet::new(); k];
+    
+    for (author_idx, (_author, edges_vec)) in author_edges_map.iter().enumerate() {
+        for &directed_edge in edges_vec {
+            let from = (directed_edge >> 32) as u16;
+            let to = (directed_edge & 0xFFFFFFFF) as u16;
+            
+            if (from as usize) < k && (to as usize) < k {
+                weight[from as usize][to as usize] += 1;
+                tx_author_count[from as usize].insert(author_idx);
+                tx_author_count[to as usize].insert(author_idx);
+            }
+        }
+    }
+    
+    let mut new_edges_count = 0;
+    
+    for &u in &region_b_v {
+        for &v in &region_b_v {
+            if u >= v { continue; }
+            
+            // Skip if edge already exists
+            if existing_edges.contains(&(u, v)) || existing_edges.contains(&(v, u)) {
+                continue;
+            }
+            
+            let kuv = weight[u as usize][v as usize];
+            let kvu = weight[v as usize][u as usize];
+            
+            // Per FairUpdate: determine direction based on weight, then check source condition
+            // "If tx ∈_{n-2f} L_updates, k ≥ k′ and k ≥ n(1−γ)+f+1 then add edge (tx, tx')"
+            
+            let u_in_enough = tx_author_count[u as usize].len() as u16 >= solid_threshold;
+            let v_in_enough = tx_author_count[v as usize].len() as u16 >= solid_threshold;
+            
+            // Determine which direction has higher weight (k >= k' condition)
+            // Then check if SOURCE of that direction is in enough updates
+            if kuv > kvu {
+                // Direction would be u → v
+                if u_in_enough && kuv >= non_blank_threshold {
+                    region_b_e.push((u, v));
+                    existing_edges.insert((u, v));
+                    new_edges_count += 1;
+                }
+            } else if kvu > kuv {
+                // Direction would be v → u
+                if v_in_enough && kvu >= non_blank_threshold {
+                    region_b_e.push((v, u));
+                    existing_edges.insert((v, u));
+                    new_edges_count += 1;
+                }
+            } else {
+                // kuv == kvu: tiebreaker by smaller vertex index (deterministic choice)
+                // Per paper: "If k = k', then one of the two edges can be added deterministically"
+                if u < v {
+                    if u_in_enough && kuv >= non_blank_threshold {
+                        region_b_e.push((u, v));
+                        existing_edges.insert((u, v));
+                        new_edges_count += 1;
+                    }
+                } else {
+                    if v_in_enough && kvu >= non_blank_threshold {
+                        region_b_e.push((v, u));
+                        existing_edges.insert((v, u));
+                        new_edges_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    log::info!(
+        "apply_fair_update: sub_dag_id={}, added {} new edges, total={}, elapsed={}ns",
+        sub_dag_id, new_edges_count, region_b_e.len(), start_time.elapsed().as_nanos()
+    );
+    
+    // FairFinalize: SCC + topo sort (rest unchanged)
+    let mut edges: Vec<Vec<u16>> = vec![Vec::new(); k];
+    for &(u, v) in &region_b_e {
+        edges[u as usize].push(v);
+    }
+    
+    // ... Tarjan SCC algorithm (unchanged from your current code) ...
+    
+    let mut index_counter: i32 = 0;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut on_stack: Vec<bool> = vec![false; k];
+    let mut dfn: Vec<i32> = vec![0; k];
+    let mut low: Vec<i32> = vec![0; k];
+    let mut scc_id: Vec<i32> = vec![-1; k];
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    
+    fn strongconnect(
+        u: usize, index_counter: &mut i32, stack: &mut Vec<usize>, on_stack: &mut [bool],
+        dfn: &mut [i32], low: &mut [i32], edges: &[Vec<u16>], scc_id: &mut [i32], sccs: &mut Vec<Vec<usize>>,
+    ) {
+        *index_counter += 1;
+        dfn[u] = *index_counter;
+        low[u] = *index_counter;
+        stack.push(u);
+        on_stack[u] = true;
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
+            if dfn[v] == 0 {
+                strongconnect(v, index_counter, stack, on_stack, dfn, low, edges, scc_id, sccs);
+                if low[v] < low[u] { low[u] = low[v]; }
+            } else if on_stack[v] && dfn[v] < low[u] {
+                low[u] = dfn[v];
+            }
+        }
+        if low[u] == dfn[u] {
+            let mut comp = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack[w] = false;
+                scc_id[w] = sccs.len() as i32;
+                comp.push(w);
+                if w == u { break; }
+            }
+            sccs.push(comp);
+        }
+    }
+    
+    for &v in &region_b_v {
+        let u = v as usize;
+        if dfn[u] == 0 {
+            strongconnect(u, &mut index_counter, &mut stack, &mut on_stack, &mut dfn, &mut low, &edges, &mut scc_id, &mut sccs);
+        }
+    }
+    
+    let scc_n = sccs.len();
+    let mut gc: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
+    let mut indegree: Vec<usize> = vec![0; scc_n];
+    
+    for &v in &region_b_v {
+        let u = v as usize;
+        let su = scc_id[u];
+        if su < 0 { continue; }
+        let su = su as usize;
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
+            let sv = scc_id[v];
+            if sv < 0 || su == sv as usize { continue; }
+            gc[su].push(sv as usize);
+        }
+    }
+    
+    for u in 0..scc_n {
+        gc[u].sort_unstable();
+        gc[u].dedup();
+        for &v in &gc[u] {
+            indegree[v] += 1;
+        }
+    }
+    
+    let mut topo: Vec<usize> = Vec::with_capacity(scc_n);
+    let mut q: VecDeque<usize> = VecDeque::new();
+    for s in 0..scc_n {
+        if indegree[s] == 0 {
+            q.push_back(s);
+        }
+    }
+    while let Some(u) = q.pop_front() {
+        topo.push(u);
+        for &v in &gc[u] {
+            indegree[v] -= 1;
+            if indegree[v] == 0 {
+                q.push_back(v);
+            }
+        }
+    }
+    
+    let mut finalized_now: Vec<usize> = Vec::new();
+    for &scc_idx in &topo {
+        let comp = &sccs[scc_idx];
+        if comp.len() == 1 {
+            finalized_now.push(comp[0]);
+        } else {
+            // TODO: Hamiltonian cycle for proper ordering per paper
+            let mut sorted = comp.clone();
+            sorted.sort_unstable();
+            finalized_now.extend(sorted);
+        }
+    }
+    
+    log::info!(
+        "apply_fair_finalize: sub_dag_id={}, finalized {} txs in {}ns",
+        sub_dag_id, finalized_now.len(), start_time.elapsed().as_nanos()
+    );
+    
+    let _ = tx_utig_results.blocking_send((sub_dag_id, finalized_now, vec![], vec![], vec![], vec![]));
+}
 
 pub fn run_utig(
+    sub_dag_id: u64,
     indices_sets: Vec<Vec<usize>>,
     k: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
-    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u64>)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
 ) {
 
     let start_total = Instant::now();
@@ -866,9 +1389,7 @@ pub fn run_utig(
             if comp.len() == 1 {
                 region_b_local.push(comp[0]);
             } else {
-                let mut sorted = comp.clone();
-                sorted.sort_unstable();
-                region_b_local.extend(sorted);
+                region_b_local.extend(comp.clone());
             }
         }
     }
@@ -890,8 +1411,6 @@ pub fn run_utig(
             }
         }
     }
-
-    region_b_e.sort_unstable();
 
     #[inline]
     fn pair_key(u: usize, v: usize) -> u64 {
@@ -919,13 +1438,17 @@ pub fn run_utig(
         }
     }
 
-    missing_edges.sort_unstable();
+    let mut missing_edge_vertices: Vec<u32> = Vec::with_capacity(missing_edges.len() * 2);
 
-    let solid_nodes = is_solid
-        .iter()
-        .take(k)
-        .filter(|&&solid| solid)
-        .count();
+    for &key in &missing_edges {
+        let u = (key >> 32) as u32;
+        let v = (key & 0xFFFF_FFFF) as u32;
+        missing_edge_vertices.push(u);
+        missing_edge_vertices.push(v);
+    }
+
+    missing_edge_vertices.sort_unstable();
+    missing_edge_vertices.dedup();
 
     let now = Instant::now();
     let t7 = now.duration_since(last).as_nanos();
@@ -937,7 +1460,7 @@ pub fn run_utig(
     log::info!(
         "finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
         finalized_now.len(),
-        solid_nodes,
+        region_b_local.len() - kept_shaded.len(),
         kept_shaded.len(),
         missing_edges.len(),
         anchor,
@@ -948,7 +1471,7 @@ pub fn run_utig(
     // (8) Output result: local tx indices to finalize
     // ============================================================
 
-    let _ = tx_utig_results.blocking_send((finalized_now, region_b_v, region_b_e, missing_edges));
+    let _ = tx_utig_results.blocking_send((sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edge_vertices, missing_edges));
 
     matrix.reset(k);
 
