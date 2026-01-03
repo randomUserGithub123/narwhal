@@ -124,8 +124,8 @@ pub struct GlobalOrder {
     
     pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
 
-    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, bool)>,
-    rx_utig_results: tokio::sync::mpsc::Receiver<(Vec<usize>, bool)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u64>)>,
+    rx_utig_results: tokio::sync::mpsc::Receiver<(Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u64>)>,
 }
 
 impl GlobalOrder {
@@ -461,10 +461,11 @@ impl GlobalOrder {
                     }
                 },
                 
-                Some((final_order, is_complete)) = self.rx_utig_results.recv() => {
-                    if is_complete{
+                Some((finalized_now, region_b_v, region_b_e, missing_edges)) = self.rx_utig_results.recv() => {
 
-                    }else{
+                    // TODO: Handle finalized_now
+
+                    if !missing_edges.is_empty(){
                         // TODO:
                     }
                 }
@@ -479,25 +480,25 @@ pub fn run_utig(
     k: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
-    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, bool)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u64>)>,
 ) {
 
     let start_total = Instant::now();
     let mut last = start_total;
 
     if k == 0 || indices_sets.is_empty() {
-        log::info!("UTIG: empty sub-dag (k=0 or no local orders), nothing to do");
+        log::info!(": empty sub-dag (k=0 or no local orders), nothing to do");
         return;
     }
 
     let (slot_idx, matrix_ptr) = {
         let mut pool = UTIG_POOL
             .lock()
-            .expect("UTIG_POOL mutex poisoned");
+            .expect("_POOL mutex poisoned");
 
         let idx = pool
             .acquire_slot()
-            .expect("UTIGMatrixPool exhausted: no free matrices");
+            .expect("MatrixPool exhausted: no free matrices");
 
         let matrix_ptr: *mut UTIGMatrix = &mut pool.pool[idx];
 
@@ -522,7 +523,7 @@ pub fn run_utig(
     let t1 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t1: {}", t1
+        " t1: {}", t1
     );
 
     // ============================================================
@@ -546,12 +547,12 @@ pub fn run_utig(
 
     let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
     if active.is_empty() {
-        log::info!("UTIG: no non-blank txs in this sub-dag, nothing to propose");
+        log::info!(": no non-blank txs in this sub-dag, nothing to propose");
         matrix.reset(k);
         {
             let mut pool = UTIG_POOL
                 .lock()
-                .expect("UTIG_POOL mutex poisoned");
+                .expect("_POOL mutex poisoned");
             pool.release_slot(slot_idx);
         }
         return;
@@ -561,7 +562,7 @@ pub fn run_utig(
     let t3 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t3: {}", t3
+        " t3: {}", t3
     );
 
     // ============================================================
@@ -622,7 +623,7 @@ pub fn run_utig(
     let t4 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t4: {}", t4
+        " t4: {}", t4
     );
 
     // ============================================================
@@ -713,12 +714,12 @@ pub fn run_utig(
 
     let scc_n = sccs.len();
     if scc_n == 0 {
-        log::info!("UTIG: SCC decomposition empty, nothing to propose");
+        log::info!(": SCC decomposition empty, nothing to propose");
         matrix.reset(k);
         {
             let mut pool = UTIG_POOL
                 .lock()
-                .expect("UTIG_POOL mutex poisoned");
+                .expect("_POOL mutex poisoned");
             pool.release_slot(slot_idx);
         }
         return;
@@ -787,7 +788,7 @@ pub fn run_utig(
     let t5 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t5: {}", t5
+        " t5: {}", t5
     );
 
     // ============================================================
@@ -807,12 +808,12 @@ pub fn run_utig(
         {
             let mut pool = UTIG_POOL
                 .lock()
-                .expect("UTIG_POOL mutex poisoned");
+                .expect("_POOL mutex poisoned");
             pool.release_slot(slot_idx);
         }
         let total = start_total.elapsed().as_nanos();
         log::info!(
-            "UTIG: no solid anchor in this sub-dag, total ns = {}",
+            ": no solid anchor in this sub-dag, total ns = {}",
             total
         );
         return;
@@ -824,30 +825,73 @@ pub fn run_utig(
     let t6 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t6: {}", t6
+        " t6: {}", t6
     );
+
+    // ============================================================
+    // OPTIMIZATION: "As an optimization, transactions whose SCC as well as all
+    //   SCCs that precede it contains only solid transactions can also
+    //   be finalized immediately"~\cite{Themis}
+    // ============================================================
+    let mut start_b: usize = anchor + 1;
+    for topo_pos in 0..=anchor {
+        let comp = &sccs[topo[topo_pos]];
+        if comp.iter().any(|&tx| !is_solid[tx]) {
+            start_b = topo_pos;
+            break;
+        }
+    }
+
+    let mut finalized_now: Vec<usize> = Vec::new();
+    for topo_pos in 0..start_b {
+        let comp = &sccs[topo[topo_pos]];
+        if comp.len() == 1 {
+            finalized_now.push(comp[0]);
+        } else {
+            let mut sorted = comp.clone();
+            sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+            finalized_now.extend(sorted);
+        }
+    }
 
     // ============================================================
     // (7) Remove txs that are part of SCCs after V in S
     //     (in our case: build the final ordered prefix of tx indices)
     // ============================================================
 
-    let mut final_local: Vec<usize> = Vec::new();
-
-    // Keep SCCs topo[0..=anchor], discard the rest.
-    for topo_pos in 0..=anchor {
-        let scc_index = topo[topo_pos];
-        let comp = &sccs[scc_index];
-
-        if comp.len() == 1 {
-            final_local.push(comp[0]);
-        } else {
-            // Deterministic order inside SCC (e.g. by index).
-            let mut sorted = comp.clone();
-            sorted.sort_unstable();
-            final_local.extend(sorted);
+    let mut region_b_local: Vec<usize> = Vec::new();
+    if start_b <= anchor {
+        for topo_pos in start_b..=anchor {
+            let comp = &sccs[topo[topo_pos]];
+            if comp.len() == 1 {
+                region_b_local.push(comp[0]);
+            } else {
+                let mut sorted = comp.clone();
+                sorted.sort_unstable();
+                region_b_local.extend(sorted);
+            }
         }
     }
+
+    let region_b_v: Vec<u16> = region_b_local.iter().map(|&u| u as u16).collect();
+
+    let mut in_b: Vec<bool> = vec![false; k];
+    for &u in &region_b_local {
+        in_b[u] = true;
+    }
+
+    let mut region_b_e: Vec<(u16, u16)> = Vec::new();
+    for &u in &region_b_local {
+        let u16 = u as u16;
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
+            if v < k && in_b[v] {
+                region_b_e.push((u16, v16));
+            }
+        }
+    }
+
+    region_b_e.sort_unstable();
 
     #[inline]
     fn pair_key(u: usize, v: usize) -> u64 {
@@ -855,7 +899,8 @@ pub fn run_utig(
         ((a as u64) << 32) | (b as u64)
     }
 
-    let kept_shaded: Vec<usize> = final_local
+    // Only shaded vertices in Region B can be missing edges (paper property).
+    let kept_shaded: Vec<usize> = region_b_local
         .iter()
         .copied()
         .filter(|&u| !is_solid[u])
@@ -866,15 +911,15 @@ pub fn run_utig(
         let u = kept_shaded[i];
         for j in (i + 1)..kept_shaded.len() {
             let v = kept_shaded[j];
-
             let kuv = weight[w_idx(u, v, k)];
             let kvu = weight[w_idx(v, u, k)];
-
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 missing_edges.push(pair_key(u, v));
             }
         }
     }
+
+    missing_edges.sort_unstable();
 
     let solid_nodes = is_solid
         .iter()
@@ -886,12 +931,12 @@ pub fn run_utig(
     let t7 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t7: {}", t7
+        "t7: {}", t7
     );
 
     log::info!(
-        "UTIG: finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
-        final_local.len(),
+        "finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
+        finalized_now.len(),
         solid_nodes,
         kept_shaded.len(),
         missing_edges.len(),
@@ -903,14 +948,14 @@ pub fn run_utig(
     // (8) Output result: local tx indices to finalize
     // ============================================================
 
-    let _ = tx_utig_results.blocking_send((final_local, missing_edges.len() == 0));
+    let _ = tx_utig_results.blocking_send((finalized_now, region_b_v, region_b_e, missing_edges));
 
     matrix.reset(k);
 
     {
         let mut pool = UTIG_POOL
             .lock()
-            .expect("UTIG_POOL mutex poisoned");
+            .expect("_POOL mutex poisoned");
         pool.release_slot(slot_idx);
     }
 
@@ -918,7 +963,7 @@ pub fn run_utig(
     let t8 = now.duration_since(last).as_nanos();
     last = now;
     log::info!(
-        "UTIG t8: {}", t8
+        " t8: {}", t8
     );
 
 }
