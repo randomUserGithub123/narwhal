@@ -118,7 +118,7 @@ pub struct GlobalOrder {
     non_blank_threshold: u16,
     solid_threshold: u16,
 
-    tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u32>, Vec<Digest>, Vec<u64>)>,
+    tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u16>, Vec<Digest>, Vec<u32>)>,
     sub_dag_count: u64,
 
     author_to_lo_digests: HashMap<PublicKey, Vec<Option<Digest>>>,
@@ -128,8 +128,8 @@ pub struct GlobalOrder {
     
     pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
 
-    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
-    rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 
     finalized_subdags: HashSet<u64>,
     pending_subdags_fair: HashSet<u64>,
@@ -174,7 +174,7 @@ impl GlobalOrder {
         n: u64,
         f: u64,
         gamma: f64,
-        tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u32>, Vec<Digest>, Vec<u64>)>,
+        tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u16>, Vec<Digest>, Vec<u32>)>,
     ) -> Self {
         let non_blank_threshold =
             ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
@@ -488,7 +488,7 @@ impl GlobalOrder {
         self.pending_subdags_fair.remove(&sub_dag_id);
         
         // Fetch edges from each LocalOrder
-        let mut author_edges_map: HashMap<PublicKey, Vec<u64>> = HashMap::new();
+        let mut author_edges_map: HashMap<PublicKey, Vec<u32>> = HashMap::new();
         
         for (author, lo_digest) in votes {
             let edges = match self.extract_fair_update_edges(&lo_digest, sub_dag_id).await {
@@ -549,7 +549,7 @@ impl GlobalOrder {
     }
 
     /// Extract FairUpdate edges for a specific sub_dag_id from a LocalOrder
-    async fn extract_fair_update_edges(&mut self, lo_digest: &Digest, target_sub_dag_id: u64) -> Option<Vec<u64>> {
+    async fn extract_fair_update_edges(&mut self, lo_digest: &Digest, target_sub_dag_id: u64) -> Option<Vec<u32>> {
         let serialized = self.store.read(lo_digest.to_vec()).await.ok()??;
         
         let local_order: Vec<Vec<u8>> = match bincode::deserialize(&serialized) {
@@ -589,17 +589,17 @@ impl GlobalOrder {
                 
                 // If this is the target sub_dag_id, extract edges
                 if sub_dag_id == target_sub_dag_id {
-                    let mut edges: Vec<u64> = Vec::with_capacity(edge_count);
+                    let mut edges: Vec<u32> = Vec::with_capacity(edge_count);
                     for i in 0..edge_count {
                         let edge_idx = tx_idx + 3 + i;
                         if edge_idx >= local_order.len() {
                             break;
                         }
                         let edge_bytes = &local_order[edge_idx];
-                        if edge_bytes.len() == 8 {
-                            let mut arr = [0u8; 8];
+                        if edge_bytes.len() == 4 {
+                            let mut arr = [0u8; 4];
                             arr.copy_from_slice(edge_bytes);
-                            edges.push(u64::from_le_bytes(arr));
+                            edges.push(u32::from_le_bytes(arr));
                         }
                     }
                     return Some(edges);
@@ -975,11 +975,11 @@ impl GlobalOrder {
 fn apply_fair_update_and_finalize(
     combined_data: Vec<u8>,
     sub_dag_id: u64,
-    author_edges_map: HashMap<PublicKey, Vec<u64>>,
+    author_edges_map: HashMap<PublicKey, Vec<u32>>,
     n: u64,
     f: u64,
     gamma: f64,
-    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 ) {
     let start_time = Instant::now();
     
@@ -1024,8 +1024,8 @@ fn apply_fair_update_and_finalize(
     
     for (author_idx, (_author, edges_vec)) in author_edges_map.iter().enumerate() {
         for &directed_edge in edges_vec {
-            let from = (directed_edge >> 32) as u16;
-            let to = (directed_edge & 0xFFFFFFFF) as u16;
+            let from = (directed_edge >> 16) as u16;
+            let to = (directed_edge & 0xFFFF) as u16;
             
             if (from as usize) < k && (to as usize) < k {
                 weight[from as usize][to as usize] += 1;
@@ -1219,7 +1219,7 @@ pub fn run_utig(
     k: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
-    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 ) {
 
     let start_total = Instant::now();
@@ -1629,9 +1629,9 @@ pub fn run_utig(
     }
 
     #[inline]
-    fn pair_key(u: usize, v: usize) -> u64 {
-        let (a, b) = if u < v { (u as u32, v as u32) } else { (v as u32, u as u32) };
-        ((a as u64) << 32) | (b as u64)
+    fn pair_key(u: usize, v: usize) -> u32 {
+        let (a, b) = if u < v { (u as u16, v as u16) } else { (v as u16, u as u16) };
+        ((a as u32) << 16) | (b as u32)
     }
 
     // Only shaded vertices in Region B can be missing edges (paper property).
@@ -1641,7 +1641,7 @@ pub fn run_utig(
         .filter(|&u| !is_solid[u])
         .collect();
 
-    let mut missing_edges: Vec<u64> = Vec::new();
+    let mut missing_edges: Vec<u32> = Vec::new();
     for i in 0..kept_shaded.len() {
         let u = kept_shaded[i];
         for j in (i + 1)..kept_shaded.len() {
@@ -1654,11 +1654,11 @@ pub fn run_utig(
         }
     }
 
-    let mut missing_edge_vertices: Vec<u32> = Vec::with_capacity(missing_edges.len() * 2);
+    let mut missing_edge_vertices: Vec<u16> = Vec::with_capacity(missing_edges.len() * 2);
 
     for &key in &missing_edges {
-        let u = (key >> 32) as u32;
-        let v = (key & 0xFFFF_FFFF) as u32;
+        let u = (key >> 16) as u16;
+        let v = (key & 0xFFFF) as u16;
         missing_edge_vertices.push(u);
         missing_edge_vertices.push(v);
     }

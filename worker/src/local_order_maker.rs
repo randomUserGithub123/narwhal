@@ -48,15 +48,15 @@ pub struct LocalOrderMaker {
 
     our_public_key: PublicKey,
 
-    rx_fair_propose: Receiver<(u64, Vec<u32>, Vec<Digest>, Vec<u64>)>,
+    rx_fair_propose: Receiver<(u64, Vec<u16>, Vec<Digest>, Vec<u32>)>,
 
     // Track pending fair proposals: subdag_id -> (pending_edges, digest_to_vertex_map, missing_digests_set)
-    pending_fair_proposals: HashMap<u64, (Vec<u64>, HashMap<Digest, u32>, HashSet<Digest>)>,
+    pending_fair_proposals: HashMap<u64, (Vec<u32>, HashMap<Digest, u16>, HashSet<Digest>)>,
     
     // Queue of ready directed edge votes to include in seals: Vec<(sub_dag_id, directed_edges)>
     // Each edge is encoded as (from << 32 | to) where from -> to is the voted direction
     // These persist until cleanup signal is received from global_order
-    ready_fair_proposals: Vec<(u64, Vec<u64>)>,
+    ready_fair_proposals: Vec<(u64, Vec<u32>)>,
 }
 
 impl LocalOrderMaker {
@@ -68,7 +68,7 @@ impl LocalOrderMaker {
         tx_local_orders: Sender<(PublicKey, Digest, Batch)>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         our_public_key: PublicKey,
-        rx_fair_propose: Receiver<(u64, Vec<u32>, Vec<Digest>, Vec<u64>)>,
+        rx_fair_propose: Receiver<(u64, Vec<u16>, Vec<Digest>, Vec<u32>)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -99,11 +99,11 @@ impl LocalOrderMaker {
     /// If we don't know the order, use vertex index as tiebreaker.
     fn vote_edge_direction(
         &self,
-        u_vertex: u32,
-        v_vertex: u32,
+        u_vertex: u16,
+        v_vertex: u16,
         u_digest: &Digest,
         v_digest: &Digest,
-    ) -> (u32, u32) {
+    ) -> (u16, u16) {
         let u_order = self.tx_digest_to_order.get(u_digest);
         let v_order = self.tx_digest_to_order.get(v_digest);
         
@@ -135,8 +135,8 @@ impl LocalOrderMaker {
     }
 
     #[inline]
-    fn pack_directed_edge(from: u32, to: u32) -> u64 {
-        ((from as u64) << 32) | (to as u64)
+    fn pack_directed_edge(from: u16, to: u16) -> u32 {
+        ((from as u32) << 16) | (to as u32)
     }
 
     async fn run(&mut self) {
@@ -195,8 +195,8 @@ impl LocalOrderMaker {
                         continue;
                     }
                     
-                    let mut digest_to_vertex: HashMap<Digest, u32> = HashMap::new();
-                    let mut vertex_to_digest: HashMap<u32, Digest> = HashMap::new();
+                    let mut digest_to_vertex: HashMap<Digest, u16> = HashMap::new();
+                    let mut vertex_to_digest: HashMap<u16, Digest> = HashMap::new();
                     let mut missing_digests_set: HashSet<Digest> = HashSet::new();
                     
                     for i in 0..missing_edge_vertices.len() {
@@ -211,12 +211,12 @@ impl LocalOrderMaker {
                         }
                     }
                     
-                    let mut directed_edge_votes: Vec<u64> = Vec::new();
-                    let mut pending_edges: Vec<u64> = Vec::new();
+                    let mut directed_edge_votes: Vec<u32> = Vec::new();
+                    let mut pending_edges: Vec<u32> = Vec::new();
                     
                     for &edge in &missing_edges {
-                        let u = (edge >> 32) as u32;
-                        let v = (edge & 0xFFFFFFFF) as u32;
+                        let u = (edge >> 16) as u16;
+                        let v = (edge & 0xFFFF) as u16;
                         
                         let u_digest = vertex_to_digest.get(&u);
                         let v_digest = vertex_to_digest.get(&v);
@@ -273,7 +273,7 @@ impl LocalOrderMaker {
     }
 
     fn check_pending_proposals(&mut self, tx_digest: &Digest) {
-        let mut new_ready: Vec<(u64, Vec<u64>)> = Vec::new();
+        let mut new_ready: Vec<(u64, Vec<u32>)> = Vec::new();
         
         // Extract reference before mutable borrow of pending_fair_proposals
         let tx_digest_to_order = &self.tx_digest_to_order;
@@ -293,15 +293,15 @@ impl LocalOrderMaker {
                 sub_dag_id, vertex_idx, missing_digests_set.len()
             );
             
-            let vertex_to_digest: HashMap<u32, Digest> = digest_to_vertex
+            let vertex_to_digest: HashMap<u16, Digest> = digest_to_vertex
                 .iter()
                 .map(|(d, &v)| (v, d.clone()))
                 .collect();
             
-            let mut newly_voted: Vec<u64> = Vec::new();
+            let mut newly_voted: Vec<u32> = Vec::new();
             pending_edges.retain(|&edge| {
-                let u = (edge >> 32) as u32;
-                let v = (edge & 0xFFFFFFFF) as u32;
+                let u = (edge >> 16) as u16;
+                let v = (edge & 0xFFFF) as u16;
                 
                 let (u_digest, v_digest) = match (vertex_to_digest.get(&u), vertex_to_digest.get(&v)) {
                     (Some(ud), Some(vd)) => (ud, vd),
