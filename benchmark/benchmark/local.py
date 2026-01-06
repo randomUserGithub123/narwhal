@@ -112,7 +112,7 @@ class LocalBench:
             )  # list of lists, contains addressess of each worker each client should connect to
 
             # Exclude OF_worker as clients do not send txs to it
-            rate_share = ceil(rate / ((committee.workers() - committee.size()) * committee.size()))
+            rate_share = ceil(rate / (committee.workers() - committee.size()))
 
             # For each client, choose one worker id. communicate with all workers with that id
             for c_id in range(committee.workers() - committee.size()):

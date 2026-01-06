@@ -181,7 +181,7 @@ class DASBench:
             # assuming each node has the same amount of workers, we will spawn W*N clients and each of them communicates with N workers
 
             # Exclude OF_worker as clients do not send txs to it
-            rate_share = ceil(rate / ((committee.workers() - committee.size()) * committee.size()))
+            rate_share = ceil(rate / (committee.workers() - committee.size()))
 
             clients_workers_addresses = (
                 []
