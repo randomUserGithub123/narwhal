@@ -13,6 +13,8 @@ from benchmark.config import BenchParameters, NodeParameters, ConfigError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
+from types import SimpleNamespace
+
 BANNED_NODES = ["node009", "node018", "node056", "node058"]
 
 class OFBench:
@@ -234,6 +236,10 @@ class OFBench:
         print(f"Average latency: {average_latency} ms")
         print("=================================\n")
 
+        return SimpleNamespace(
+            result=lambda: f"{self.bench_parameters.rate[0]} {count / self.duration} {average_latency}"
+        )
+
     def run(self, debug=False, local=True, flavor="themis"):
         
         assert isinstance(debug, bool)
@@ -338,7 +344,7 @@ class OFBench:
             for i, hostname in enumerate(self.clients_hostnames):
                 client_cmd = CommandMaker.run_hotstuff_client(
                     idx=0,
-                    max_async=int(self.bench_parameters.rate[0] / self.nodes[0]),
+                    max_async=int(self.bench_parameters.rate[0]),
                     tx_size=self.tx_size,
                     fairness=self.node_parameters.json['gamma'],
                     sb_users=sb_users,

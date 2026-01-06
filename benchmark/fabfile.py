@@ -83,56 +83,77 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
 @task
 def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
     ''' Run benchmarks on localhost '''
-    bench_params = {
-        'faults': 1,
-        'nodes': 5,
-        'workers': 2,
-        'rate': 10_000,
-        'tx_size': 512,
-        'duration': 60,
-    }
-    node_params = {
-        'header_size': 1_000,  # bytes
-        'max_header_delay': 200,  # ms
-        'gc_depth': 50,  # rounds
-        'sync_retry_delay': 10_000,  # ms
-        'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 50_000,  # bytes
-        'max_batch_delay': 200,  # ms
-        "lo_size": 100, # number of entries in LocalOrder queue
-        "lo_max_delay": 200, # ms
-        "gamma": 1.0, # batch-OF parameter
-    }
 
-    node_params.update(
-        {
-            "faults": bench_params["faults"]
-        }
-    )
-
-    assert flavor in [
-        "hotstuff",
-        "themis",
-        "rashnu",
-        "dikaios",
-        "pompe"
-    ]
-
-    if flavor not in [
-        "hotstuff",
-        "pompe"
+    for ff, wks, nds, rs, rate in [ #faults, workers, nodes, runs
+        (0,1,16,5,1_000),
+        #(0,1,16,5,2_000),
     ]:
-        assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
-        assert bench_params['nodes'] > (
-            (4 * node_params['faults']) /
-            (2 * node_params['gamma'] - 1)
+        runs = rs  
+        faults = ff  
+        workers = wks
+        nodes = nds
+
+        bench_params = {
+            'faults': faults,
+            'nodes': nodes,
+            'workers': workers,
+            'rate': 10_000,
+            'tx_size': 200,
+            'duration': 60,
+        }
+        node_params = {
+            'header_size': 1_000,  # bytes
+            'max_header_delay': 200,  # ms
+            'gc_depth': 50,  # rounds
+            'sync_retry_delay': 10_000,  # ms
+            'sync_retry_nodes': 3,  # number of nodes
+            'batch_size': 50_000,  # bytes
+            'max_batch_delay': 200,  # ms
+            "lo_size": 100, # number of entries in LocalOrder queue
+            "lo_max_delay": 200, # ms
+            "gamma": 1.0, # batch-OF parameter
+        }
+
+        node_params.update(
+            {
+                "faults": bench_params["faults"]
+            }
         )
 
-    try:
-        ret = OFBench(bench_params, node_params, local, username).run(debug, local=local, flavor=flavor)
-        print(ret.result())
-    except BenchError as e:
-        Print.error(e)
+        assert flavor in [
+            "hotstuff",
+            "themis",
+            "rashnu",
+            "dikaios",
+            "pompe"
+        ]
+
+        if flavor not in [
+            "hotstuff",
+            "pompe"
+        ]:
+            assert bench_params['tx_size'] >= 200, "Small bank manager tx byte size requirement"
+            assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+            assert bench_params['nodes'] > (
+                (4 * node_params['faults']) /
+                (2 * node_params['gamma'] - 1)
+            )
+
+        try:
+            filename = PathMaker.local_result_file(
+                faults, 
+                workers,
+                nodes,
+            )
+            for i in range(runs):
+                print(f"\nDAS run {i}\n")
+                ret = OFBench(bench_params, node_params, local, username).run(debug, local=local, flavor=flavor)
+                print(ret.result())
+                assert isinstance(filename, str)
+                with open(filename, 'a') as f:
+                    f.write(ret.result())
+        except BenchError as e:
+            Print.error(e)
 
 @task
 def create(ctx, nodes=2):
