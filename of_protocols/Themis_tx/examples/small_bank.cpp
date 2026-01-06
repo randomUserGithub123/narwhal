@@ -152,7 +152,7 @@ std::vector<uint64_t> SmallBankManager::get_next_transaction_serialized(){
         tx_type = TX_TYPES-1;
     }
 
-    return get_next_transaction_by_type(tx_type);
+    return get_next_transaction_by_type(6);
 }
 
 std::vector<uint64_t> SmallBankManager::get_next_transaction_by_type(uint64_t tx_type){
