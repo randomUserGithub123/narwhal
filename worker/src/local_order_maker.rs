@@ -171,14 +171,13 @@ impl LocalOrderMaker {
                             sub_dag_id
                         );
                         
+                        // Only clean pending_fair_proposals - ready_fair_proposals already drained on seal
                         self.pending_fair_proposals.remove(&sub_dag_id);
-                        self.ready_fair_proposals.retain(|(id, _)| *id != sub_dag_id);
                         
                         log::info!(
-                            "Cleaned up sub_dag_id={}: pending_proposals={}, ready_proposals={}",
+                            "Cleaned up sub_dag_id={}: pending_proposals={}",
                             sub_dag_id, 
-                            self.pending_fair_proposals.len(), 
-                            self.ready_fair_proposals.len()
+                            self.pending_fair_proposals.len()
                         );
                         continue;
                     }
@@ -361,22 +360,25 @@ impl LocalOrderMaker {
         local_order.insert(0, seq_bytes);
         self.sequence_number += 1;
 
+        // DRAIN immediately - only attach to ONE LocalOrder
         if !self.ready_fair_proposals.is_empty() {
             log::info!(
                 "seal: including {} fair proposal batches in this LocalOrder",
                 self.ready_fair_proposals.len()
             );
             
-            for (sub_dag_id, directed_edges) in self.ready_fair_proposals.iter() {
+            for (sub_dag_id, directed_edges) in self.ready_fair_proposals.drain(..) {
                 local_order.push(vec![0xFF; 32]);
                 local_order.push(sub_dag_id.to_le_bytes().to_vec());
+
+                log::info!("seal: appended {} edge votes for sub_dag_id={}", directed_edges.len(), sub_dag_id);
+
                 local_order.push((directed_edges.len() as u64).to_le_bytes().to_vec());
                 for edge in directed_edges {
                     local_order.push(edge.to_le_bytes().to_vec());
                 }
-                log::info!("seal: appended {} edge votes for sub_dag_id={}", directed_edges.len(), sub_dag_id);
             }
-            // NOT clearing here - cleanup signal from global_order handles this
+            // ready_fair_proposals is now empty after drain
         }
 
         let message = WorkerMessage::Batch(self.our_public_key, local_order.clone());
@@ -406,4 +408,5 @@ impl LocalOrderMaker {
             .await
             .expect("Failed to deliver batch");
     }
+
 }

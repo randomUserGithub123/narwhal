@@ -131,16 +131,37 @@ pub struct GlobalOrder {
     tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
     rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u32>, Vec<u64>)>,
 
-    subdag_index_to_digest: HashMap<u64, Vec<Vec<u8>>>,
-
     finalized_subdags: HashSet<u64>,
     pending_subdags_fair: HashSet<u64>,
+
+    pending_fair_updates: HashMap<u64, HashMap<PublicKey, Digest>>,
+
+    next_to_finalize: u64,
+    already_finalized: HashSet<Digest>,
 }
 
 impl GlobalOrder {
 
     fn region_data_key(sub_dag_id: u64) -> Vec<u8> {
         let mut key = vec![0xFF; 8];
+        key.extend_from_slice(&sub_dag_id.to_le_bytes());
+        key
+    }
+
+    fn index_to_digest_key(sub_dag_id: u64) -> Vec<u8> {
+        let mut key = vec![0xFE; 8];
+        key.extend_from_slice(&sub_dag_id.to_le_bytes());
+        key
+    }
+    
+    fn subdag_state_key(sub_dag_id: u64) -> Vec<u8> {
+        let mut key = vec![0xFD; 8];
+        key.extend_from_slice(&sub_dag_id.to_le_bytes());
+        key
+    }
+    
+    fn finalized_indices_key(sub_dag_id: u64) -> Vec<u8> {
+        let mut key = vec![0xFC; 8];
         key.extend_from_slice(&sub_dag_id.to_le_bytes());
         key
     }
@@ -180,9 +201,11 @@ impl GlobalOrder {
             pending_subdags: VecDeque::new(),
             rx_utig_results,
             tx_utig_results,
-            subdag_index_to_digest: HashMap::new(),
             finalized_subdags: HashSet::new(),
             pending_subdags_fair: HashSet::new(),
+            pending_fair_updates: HashMap::new(),
+            next_to_finalize: 0,
+            already_finalized: HashSet::new(),
         }
     }
 
@@ -274,8 +297,8 @@ impl GlobalOrder {
         let mut index_to_digest: Vec<Vec<u8>> = Vec::new();
         let mut next_idx: usize = 0;
 
-        // Track updated edges: sub_dag_id -> author -> Vec<edge>
-        let mut updated_edges_map: HashMap<u64, HashMap<PublicKey, Vec<u64>>> = HashMap::new();
+        // Track FairUpdate vote locations (don't extract edges yet)
+        let mut found_fair_updates: Vec<(u64, PublicKey, Digest)> = Vec::new();
 
         let mut authors: Vec<PublicKey> = author_to_lo_digests_subdag.keys().cloned().collect();
         authors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -322,8 +345,6 @@ impl GlobalOrder {
                     }
                 };
 
-                // Check if this LocalOrder is from the final round
-                let is_final_round = seq_num >= final_round_start && seq_num <= final_round_end;
 
                 let mut tx_idx = 0;
                 let mut indices: Vec<usize> = Vec::new();
@@ -339,94 +360,27 @@ impl GlobalOrder {
                     
                     // Check if this is a sentinel marker (32 bytes of 0xFF)
                     if tx_digest.len() == 32 && tx_digest.iter().all(|&b| b == 0xFF) {
-                        // Only extract fair proposals from final round LocalOrders
-                        if is_final_round {
-                            log::info!(
-                                "Found sentinel from author {:?} (seq={}) in final round LocalOrder {:?}",
-                                author, seq_num, lo_digest
-                            );
-                            
-                            // Extract fair proposal metadata
-                            if tx_idx + 2 >= local_order.len() {
-                                log::error!(
-                                    "Sentinel found but not enough data after it in LocalOrder {:?}",
-                                    lo_digest
-                                );
-                                break;
-                            }
-                            
-                            // Read sub_dag_id (8 bytes)
+                        
+                        
+                        // Extract sub_dag_id to know which sub-dag this vote is for
+                        if tx_idx + 1 < local_order.len() {
                             let sub_dag_id_bytes = &local_order[tx_idx + 1];
-                            if sub_dag_id_bytes.len() != 8 {
-                                log::error!(
-                                    "Invalid sub_dag_id length: expected 8, got {}",
-                                    sub_dag_id_bytes.len()
-                                );
-                                break;
-                            }
-                            let mut arr = [0u8; 8];
-                            arr.copy_from_slice(sub_dag_id_bytes);
-                            let sub_dag_id = u64::from_le_bytes(arr);
-                            
-                            // Read edge count (8 bytes)
-                            let edge_count_bytes = &local_order[tx_idx + 2];
-                            if edge_count_bytes.len() != 8 {
-                                log::error!(
-                                    "Invalid edge_count length: expected 8, got {}",
-                                    edge_count_bytes.len()
-                                );
-                                break;
-                            }
-                            let mut arr = [0u8; 8];
-                            arr.copy_from_slice(edge_count_bytes);
-                            let edge_count = u64::from_le_bytes(arr) as usize;
-                            
-                            log::info!(
-                                "Fair proposal from author {:?}: sub_dag_id={}, edge_count={}",
-                                author, sub_dag_id, edge_count
-                            );
-                            
-                            // Read edges (8 bytes each)
-                            let mut edges: Vec<u64> = Vec::with_capacity(edge_count);
-                            for i in 0..edge_count {
-                                let edge_idx = tx_idx + 3 + i;
-                                if edge_idx >= local_order.len() {
-                                    log::error!(
-                                        "Not enough edge data: expected {} edges, got {}",
-                                        edge_count, i
-                                    );
-                                    break;
-                                }
-                                
-                                let edge_bytes = &local_order[edge_idx];
-                                if edge_bytes.len() != 8 {
-                                    log::error!(
-                                        "Invalid edge length: expected 8, got {}",
-                                        edge_bytes.len()
-                                    );
-                                    continue;
-                                }
-                                
+                            if sub_dag_id_bytes.len() == 8 {
                                 let mut arr = [0u8; 8];
-                                arr.copy_from_slice(edge_bytes);
-                                let edge = u64::from_le_bytes(arr);
-                                edges.push(edge);
+                                arr.copy_from_slice(sub_dag_id_bytes);
+                                let vote_sub_dag_id = u64::from_le_bytes(arr);
+                                
+                                // Record vote location (lazy - don't extract edges yet)
+                                found_fair_updates.push((vote_sub_dag_id, author, lo_digest.clone()));
+                                
+                                log::info!(
+                                    "Found FairUpdate vote: sub_dag_id={}, author={:?}, lo_digest={:?}",
+                                    vote_sub_dag_id, author, lo_digest
+                                );
                             }
-                            
-                            // Store edges for this sub_dag_id and author
-                            updated_edges_map
-                                .entry(sub_dag_id)
-                                .or_insert_with(HashMap::new)
-                                .insert(author, edges);
-                        } else {
-                            log::debug!(
-                                "Skipping sentinel from author {:?} (seq={}) - not in final round",
-                                author, seq_num
-                            );
                         }
                         
-                        // Skip past the sentinel + metadata + edges regardless
-                        // Need to read edge_count even if not final round to skip correctly
+                        // Skip past sentinel + metadata + edges
                         if tx_idx + 2 < local_order.len() {
                             let edge_count_bytes = &local_order[tx_idx + 2];
                             if edge_count_bytes.len() == 8 {
@@ -437,7 +391,6 @@ impl GlobalOrder {
                                 continue;
                             }
                         }
-                        // If we can't parse edge_count, just skip sentinel + 2 fields
                         tx_idx += 3;
                         continue;
                     }
@@ -462,61 +415,27 @@ impl GlobalOrder {
         let k = next_idx;
         let t2 = start_time.elapsed().as_nanos() - t1;
         log::info!(
-            "t2 (store reads + indexing): {}\nunique txs (k): {}\nLocalOrders processed: {}\nupdated_edges found for {} subdags",
-            t2, k, indices_sets.len(), updated_edges_map.len()
+            "t2 (store reads + indexing): {}\nunique txs (k): {}\nLocalOrders processed: {}\nfound_fair_updates found for {} subdags",
+            t2, k, indices_sets.len(), found_fair_updates.len()
         );
         
-        // Process updated edges: check quorum and merge
+        for (vote_sub_dag_id, vote_author, vote_lo_digest) in found_fair_updates {
+            self.pending_fair_updates
+                .entry(vote_sub_dag_id)
+                .or_default()
+                .insert(vote_author, vote_lo_digest);
+        }
+
+        // Check if any pending sub_dags now have quorum
         let quorum_threshold = (self.n - self.f) as usize;
-        
-        for (sub_dag_id, author_edges_map) in &updated_edges_map {
-            let num_authors = author_edges_map.len();
-            
-            log::info!(
-                "sub_dag_id={}: received updated edges from {} authors (quorum threshold: {})",
-                sub_dag_id, num_authors, quorum_threshold
-            );
-            
-            if num_authors >= quorum_threshold {
-                
-                log::info!("MADE IT {}", sub_dag_id);
-                let _ = self.tx_fair_propose
-                    .send((*sub_dag_id, vec![], vec![], vec![]))
-                    .await;
+        let ready_subdags: Vec<u64> = self.pending_fair_updates
+            .iter()
+            .filter(|(_, authors)| authors.len() >= quorum_threshold)
+            .map(|(&id, _)| id)
+            .collect();
 
-                self.pending_subdags_fair.remove(sub_dag_id);
-
-                // Read region_b data from store NOW, before spawning
-                let combined_data = self.store.read(Self::region_data_key(*sub_dag_id))
-                    .await
-                    .expect("Store read failed")
-                    .expect("Data not found in store");
-                
-                let tx_utig_results = self.tx_utig_results.clone();
-                let n = self.n;
-                let f = self.f;
-                let gamma = self.gamma;
-                let sub_dag_id_val = *sub_dag_id;
-                let author_edges_map_clone = author_edges_map.clone();
-                
-                tokio_rayon::spawn(move || {
-                    apply_fair_update_and_finalize(
-                        combined_data,
-                        sub_dag_id_val,
-                        author_edges_map_clone,
-                        n,
-                        f,
-                        gamma,
-                        tx_utig_results,
-                    );
-                });
-
-            } else {
-                log::warn!(
-                    "sub_dag_id={}: insufficient authors for quorum ({} < {}), ignoring updated edges",
-                    sub_dag_id, num_authors, quorum_threshold
-                );
-            }
+        for ready_sub_dag_id in ready_subdags {
+            self.process_fair_update_quorum(ready_sub_dag_id).await;
         }
 
         let non_blank = self.non_blank_threshold;
@@ -524,10 +443,11 @@ impl GlobalOrder {
         let tx_utig_results = self.tx_utig_results.clone();
 
         let sub_dag_id = self.sub_dag_count;
-        self.subdag_index_to_digest.insert(sub_dag_id, index_to_digest);
         self.sub_dag_count += 1;
         
-        // TODO: Pass finalized_updated_edges to run_utig or use it to update existing UTIG results
+        let index_ser = bincode::serialize(&index_to_digest).expect("Failed to serialize index_to_digest");
+        self.store.write(Self::index_to_digest_key(sub_dag_id), index_ser).await;
+        self.store.write(Self::subdag_state_key(sub_dag_id), vec![0]).await;
         
         let _handler = tokio_rayon::spawn(move || {
             run_utig(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
@@ -546,6 +466,267 @@ impl GlobalOrder {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    async fn process_fair_update_quorum(&mut self, sub_dag_id: u64) {
+        let votes = match self.pending_fair_updates.remove(&sub_dag_id) {
+            Some(v) => v,
+            None => return,
+        };
+        
+        log::info!(
+            "process_fair_update_quorum: sub_dag_id={}, {} votes",
+            sub_dag_id, votes.len()
+        );
+        
+        // Send cleanup signal to LocalOrderMaker
+        let _ = self.tx_fair_propose
+            .send((sub_dag_id, vec![], vec![], vec![]))
+            .await;
+        
+        self.pending_subdags_fair.remove(&sub_dag_id);
+        
+        // Fetch edges from each LocalOrder
+        let mut author_edges_map: HashMap<PublicKey, Vec<u64>> = HashMap::new();
+        
+        for (author, lo_digest) in votes {
+            let edges = match self.extract_fair_update_edges(&lo_digest, sub_dag_id).await {
+                Some(e) => e,
+                None => {
+                    log::warn!(
+                        "Failed to extract edges for sub_dag_id={} from author={:?}",
+                        sub_dag_id, author
+                    );
+                    continue;
+                }
+            };
+            
+            if !edges.is_empty() {
+                author_edges_map.insert(author, edges);
+            }
+        }
+        
+        let quorum_threshold = (self.n - self.f) as usize;
+        if author_edges_map.len() < quorum_threshold {
+            log::warn!(
+                "sub_dag_id={}: only {} valid votes after extraction (need {})",
+                sub_dag_id, author_edges_map.len(), quorum_threshold
+            );
+            return;
+        }
+        
+        // Load region_b data and spawn FairUpdate
+        let combined_data = match self.store.read(Self::region_data_key(sub_dag_id)).await {
+            Ok(Some(data)) => data,
+            _ => {
+                log::error!("sub_dag_id={}: region_data not found", sub_dag_id);
+                return;
+            }
+        };
+        
+        let tx_utig_results = self.tx_utig_results.clone();
+        let n = self.n;
+        let f = self.f;
+        let gamma = self.gamma;
+        
+        log::info!(
+            "sub_dag_id={}: spawning FairUpdate with {} author votes",
+            sub_dag_id, author_edges_map.len()
+        );
+        
+        let _handler = tokio_rayon::spawn(move || {
+            apply_fair_update_and_finalize(
+                combined_data,
+                sub_dag_id,
+                author_edges_map,
+                n,
+                f,
+                gamma,
+                tx_utig_results,
+            );
+        });
+    }
+
+    /// Extract FairUpdate edges for a specific sub_dag_id from a LocalOrder
+    async fn extract_fair_update_edges(&mut self, lo_digest: &Digest, target_sub_dag_id: u64) -> Option<Vec<u64>> {
+        let serialized = self.store.read(lo_digest.to_vec()).await.ok()??;
+        
+        let local_order: Vec<Vec<u8>> = match bincode::deserialize(&serialized) {
+            Ok(WorkerMessage::Batch(_, batch)) => batch,
+            _ => return None,
+        };
+        
+        let mut tx_idx = 1; // Skip sequence number
+        while tx_idx < local_order.len() {
+            let tx_digest = &local_order[tx_idx];
+            
+            // Check for sentinel
+            if tx_digest.len() == 32 && tx_digest.iter().all(|&b| b == 0xFF) {
+                if tx_idx + 2 >= local_order.len() {
+                    break;
+                }
+                
+                // Read sub_dag_id
+                let sub_dag_id_bytes = &local_order[tx_idx + 1];
+                if sub_dag_id_bytes.len() != 8 {
+                    tx_idx += 3;
+                    continue;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(sub_dag_id_bytes);
+                let sub_dag_id = u64::from_le_bytes(arr);
+                
+                // Read edge count
+                let edge_count_bytes = &local_order[tx_idx + 2];
+                if edge_count_bytes.len() != 8 {
+                    tx_idx += 3;
+                    continue;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(edge_count_bytes);
+                let edge_count = u64::from_le_bytes(arr) as usize;
+                
+                // If this is the target sub_dag_id, extract edges
+                if sub_dag_id == target_sub_dag_id {
+                    let mut edges: Vec<u64> = Vec::with_capacity(edge_count);
+                    for i in 0..edge_count {
+                        let edge_idx = tx_idx + 3 + i;
+                        if edge_idx >= local_order.len() {
+                            break;
+                        }
+                        let edge_bytes = &local_order[edge_idx];
+                        if edge_bytes.len() == 8 {
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(edge_bytes);
+                            edges.push(u64::from_le_bytes(arr));
+                        }
+                    }
+                    return Some(edges);
+                }
+                
+                // Skip past this sentinel
+                tx_idx += 3 + edge_count;
+            } else {
+                tx_idx += 1;
+            }
+        }
+        
+        None
+    }
+
+    async fn try_finalize_sequential(&mut self) {
+        loop {
+            let sub_dag_id = self.next_to_finalize;
+            
+            // Check if this sub-dag exists and is Ready
+            let state_data = match self.store.read(Self::subdag_state_key(sub_dag_id)).await {
+                Ok(Some(data)) if !data.is_empty() => data,
+                _ => {
+                    log::debug!(
+                        "try_finalize_sequential: sub_dag_id={} not found, stopping",
+                        sub_dag_id
+                    );
+                    break;
+                }
+            };
+            
+            // State: 0=Processing, 1=WaitingForUpdates, 2=Ready, 3=Finalized
+            let state = state_data[0];
+            
+            if state != 2 {
+                log::debug!(
+                    "try_finalize_sequential: sub_dag_id={} not ready (state={}), stopping",
+                    sub_dag_id, state
+                );
+                break;
+            }
+            
+            log::info!(
+                "try_finalize_sequential: finalizing sub_dag_id={} (next_to_finalize={})",
+                sub_dag_id, self.next_to_finalize
+            );
+            
+            // Load index_to_digest from disk
+            let index_to_digest: Vec<Vec<u8>> = match self.store.read(Self::index_to_digest_key(sub_dag_id)).await {
+                Ok(Some(data)) => bincode::deserialize(&data).expect("deserialize failed"),
+                _ => {
+                    log::error!("sub_dag_id={}: index_to_digest not found!", sub_dag_id);
+                    break;
+                }
+            };
+            
+            // Load finalized indices from disk
+            let finalized_indices: Vec<usize> = match self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
+                Ok(Some(data)) => bincode::deserialize(&data).expect("deserialize failed"),
+                _ => {
+                    log::error!("sub_dag_id={}: finalized_indices not found!", sub_dag_id);
+                    break;
+                }
+            };
+            
+            // Map indices to digests, filtering already_finalized
+            let mut output_digests: Vec<Digest> = Vec::new();
+            let mut skipped_count = 0;
+            
+            for idx in &finalized_indices {
+                if *idx >= index_to_digest.len() {
+                    log::warn!(
+                        "sub_dag_id={}: index {} out of bounds (len={})",
+                        sub_dag_id, idx, index_to_digest.len()
+                    );
+                    continue;
+                }
+                
+                let digest_bytes = &index_to_digest[*idx];
+                if digest_bytes.len() != 32 {
+                    log::warn!(
+                        "sub_dag_id={}: invalid digest length {} at index {}",
+                        sub_dag_id, digest_bytes.len(), idx
+                    );
+                    continue;
+                }
+                
+                let arr: [u8; 32] = digest_bytes.clone().try_into().unwrap();
+                let digest = Digest(arr);
+                
+                if self.already_finalized.contains(&digest) {
+                    skipped_count += 1;
+                } else {
+                    self.already_finalized.insert(digest.clone());
+                    output_digests.push(digest);
+                }
+            }
+            
+            log::info!(
+                "sub_dag_id={}: FINALIZED! {} transactions ({} duplicates skipped)",
+                sub_dag_id,
+                output_digests.len(),
+                skipped_count
+            );
+            
+            // // TODO: Send output_digests to your output channel
+            // // For now, log each one
+            // for (i, digest) in output_digests.iter().enumerate() {
+            //     log::info!("  [{}] FINALIZED TX: {:?}", i, digest);
+            // }
+            
+            // Mark as Finalized (3)
+            self.store.write(Self::subdag_state_key(sub_dag_id), vec![3]).await;
+            self.finalized_subdags.insert(sub_dag_id);
+            
+            // Send cleanup signal to LocalOrderMaker
+            let _ = self.tx_fair_propose
+                .send((sub_dag_id, vec![], vec![], vec![]))
+                .await;
+            
+            // Move to next sub-dag
+            self.next_to_finalize += 1;
+            
+            log::info!(
+                "sub_dag_id={}: marked Finalized, next_to_finalize={}",
+                sub_dag_id, self.next_to_finalize
+            );
         }
     }
 
@@ -699,41 +880,71 @@ impl GlobalOrder {
                         sub_dag_id, finalized_now.len(), region_b_v.len(), region_b_e.len(), missing_edges.len()
                     );
 
-                    // TODO: Output finalized transactions
-                    log::info!("FINALIZED TX COUNT : {}\nsub_dag_id : {}", finalized_now.len(), sub_dag_id);
-
-                    // Check if this is a FairFinalize result (finalized_now full, rest empty)
                     if !finalized_now.is_empty() && region_b_v.is_empty() && region_b_e.is_empty() && missing_edges.is_empty() {
-                        log::info!("sub_dag_id={}: FairFinalize completed, {} transactions finalized", sub_dag_id, finalized_now.len());
-                        self.finalized_subdags.insert(sub_dag_id);
+                        log::info!(
+                            "sub_dag_id={}: FairUpdate+Finalize completed, {} indices",
+                            sub_dag_id, finalized_now.len()
+                        );
+                        
+                        let finalized_ser = bincode::serialize(&finalized_now).expect("serialize failed");
+                        self.store.write(Self::finalized_indices_key(sub_dag_id), finalized_ser).await;
+                        
+                        self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
+                        
                         self.pending_subdags_fair.remove(&sub_dag_id);
-
-                        continue;  // Skip the rest - no index_to_digest to remove
+                        
+                        self.try_finalize_sequential().await;
+                        continue;
                     }
 
                     // This is from run_utig - has region_b data
-                    let index_to_digest: Vec<Vec<u8>> = self.subdag_index_to_digest
-                        .remove(&sub_dag_id)
-                        .expect("missing index_to_digest for sub_dag_id");
+                    
+                    // Load index_to_digest from DISK (not RAM)
+                    let index_to_digest: Vec<Vec<u8>> = bincode::deserialize(
+                        &self.store.read(Self::index_to_digest_key(sub_dag_id))
+                            .await
+                            .expect("Store read failed")
+                            .expect("index_to_digest not found")
+                    ).expect("deserialize failed");
 
-                    // Store region_b data to disk
+                    // Store finalized solid prefix (can be finalized when turn comes)
+                    let solid_ser = bincode::serialize(&finalized_now).expect("serialize failed");
+                    self.store.write(Self::finalized_indices_key(sub_dag_id), solid_ser).await;
+
+                    // Store region_b data to disk (for FairUpdate later if needed)
                     let mut combined_data: Vec<u8> = Vec::new();
-                    let region_b_v_ser = bincode::serialize(&region_b_v).expect("Failed to serialize region_b_v");
+                    let region_b_v_ser = bincode::serialize(&region_b_v).expect("serialize");
                     combined_data.extend_from_slice(&(region_b_v_ser.len() as u64).to_le_bytes());
                     combined_data.extend_from_slice(&region_b_v_ser);
                     combined_data.extend_from_slice(&[0xFF; 8]);
-                    let region_b_e_ser = bincode::serialize(&region_b_e).expect("Failed to serialize region_b_e");
+                    let region_b_e_ser = bincode::serialize(&region_b_e).expect("serialize");
                     combined_data.extend_from_slice(&(region_b_e_ser.len() as u64).to_le_bytes());
                     combined_data.extend_from_slice(&region_b_e_ser);
                     combined_data.extend_from_slice(&[0xFF; 8]);
-                    let index_ser = bincode::serialize(&index_to_digest).expect("Failed to serialize index_to_digest");
+                    // Also store index_to_digest in combined_data for FairUpdate
+                    let index_ser = bincode::serialize(&index_to_digest).expect("serialize");
                     combined_data.extend_from_slice(&(index_ser.len() as u64).to_le_bytes());
                     combined_data.extend_from_slice(&index_ser);
                     self.store.write(Self::region_data_key(sub_dag_id), combined_data).await;
-                    
-                    log::info!("sub_dag_id={}: stored region_b data to disk", sub_dag_id);
 
-                    if !missing_edges.is_empty() {
+                    log::info!(
+                        "sub_dag_id={}: stored to disk, finalized_solid={}, region_b_v={}, missing_edges={}",
+                        sub_dag_id, finalized_now.len(), region_b_v.len(), missing_edges.len()
+                    );
+
+                    if missing_edges.is_empty() {
+                        // No missing edges - graph is fully specified, Ready to finalize
+                        self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
+                        
+                        log::info!("sub_dag_id={}: no missing edges, marked Ready", sub_dag_id);
+                        
+                        // Try to finalize sequentially
+                        self.try_finalize_sequential().await;
+                    } else {
+                        // Has missing edges - need FairUpdate votes
+                        self.store.write(Self::subdag_state_key(sub_dag_id), vec![1]).await;
+                        
+                        // Build missing_tx_digests for LocalOrderMaker
                         let mut missing_tx_digests: Vec<Digest> = Vec::with_capacity(missing_edge_vertices.len());
                         for &vid in &missing_edge_vertices {
                             let idx = vid as usize;
@@ -743,14 +954,19 @@ impl GlobalOrder {
                             let arr: [u8; 32] = index_to_digest[idx].clone().try_into().unwrap();
                             missing_tx_digests.push(Digest(arr));
                         }
+
+                        log::info!(
+                            "sub_dag_id={}: {} missing edges, sent to LocalOrderMaker for voting",
+                            sub_dag_id, missing_edges.len()
+                        );
+                        
                         self.pending_subdags_fair.insert(sub_dag_id);
                         let _ = self.tx_fair_propose
                             .send((sub_dag_id, missing_edge_vertices, missing_tx_digests, missing_edges))
                             .await;
                     }
-                    
-                    // TODO: Handle finalized_now from run_utig
                 }
+
             }
         }
     }

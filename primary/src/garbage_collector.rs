@@ -35,7 +35,7 @@ pub struct GarbageCollector {
     committed_headers_without_local_orders: HashSet<Digest>,
     of_worker_address: SocketAddr,
 
-    current_subdag: HashMap<Round, HashSet<PublicKey>>,
+    current_subdag: Vec<(Round, PublicKey)>,
 
 }
 
@@ -73,11 +73,32 @@ impl GarbageCollector {
                 rx_header_arrival,
                 committed_headers_without_local_orders: HashSet::new(),
                 of_worker_address,
-                current_subdag: HashMap::new(),
+                current_subdag: Vec::new(),
             }
             .run()
             .await;
         });
+    }
+
+    fn group_by_round_preserve_order(&mut self) -> Vec<(Round, Vec<PublicKey>)> {
+        
+        let entries: Vec<(Round, PublicKey)> = self.current_subdag.drain(..).collect();
+        let mut result: Vec<(Round, Vec<PublicKey>)> = Vec::new();
+        
+        for (round, author) in entries {
+            
+            if let Some((_r, authors)) = result.iter_mut().find(|(r, _)| *r == round) {
+                if !authors.contains(&author) {
+                    authors.push(author);
+                }
+            } else {
+                result.push((round, vec![author]));
+            }
+        }
+        
+        result.sort_by_key(|(r, _)| *r);
+        
+        result
     }
 
     async fn run(&mut self) {
@@ -99,23 +120,15 @@ impl GarbageCollector {
                         self.committed_headers_without_local_orders.insert(certificate.header.id.clone());
                     }
 
+                    self.current_subdag.push((round, author));
+
                     if is_leader {
 
-                        let mut entries: Vec<(Round, HashSet<PublicKey>)> = self.current_subdag.drain().collect();
-                        entries.sort_by_key(|(r, _)| *r);
-
-                        let sub_dag: Vec<(Round, Vec<PublicKey>)> = entries
-                            .into_iter()
-                            .map(|(r, authors_set)| {
-                                let mut v: Vec<PublicKey> = authors_set.into_iter().collect();
-                                v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                                (r, v)
-                            })
-                            .collect();
-
+                        let sub_dag = self.group_by_round_preserve_order();
+        
                         let message = PrimaryWorkerMessage::CommittedSubDag(sub_dag);
                         let serialized = bincode::serialize(&message)
-                            .expect("Failed to serialize our own CommittedSubDag message");
+                            .expect("Failed to serialize CommittedSubDag");
                         self.simple_network
                             .send(self.of_worker_address, Bytes::from(serialized))
                             .await;
@@ -127,9 +140,6 @@ impl GarbageCollector {
                             );
                         }
 
-                        self.current_subdag.entry(round).or_default().insert(author);
-                    } else {
-                        self.current_subdag.entry(round).or_default().insert(author);
                     }
 
                     let round = certificate.round();
