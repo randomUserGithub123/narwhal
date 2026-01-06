@@ -300,7 +300,7 @@ class OFBench:
             else:
                 # The params do not apply, so it does not matter
                 sb_users = 1000000
-                sb_prob = 0.9
+                sb_prob = 0.0 # Keep like this as otherwise default tx_size increases
                 sb_skew_factor = 0.1
             
 
