@@ -18,6 +18,7 @@ rayon = "1.11.0"
 nohash = "0.2.0"
 once_cell = "1.21.3"
 tokio-rayon = "2.1.0"
+lz4_flex = "0.12.0"
 
 crypto = { path = "../crypto" }
 store = { path = "../store" }

@@ -13,6 +13,7 @@ use crypto::{Digest, Hash, PublicKey};
 use nohash::{IntMap, IntSet};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use lz4_flex::decompress_size_prepended;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
@@ -100,6 +101,54 @@ impl UTIGMatrixPool {
 
 static UTIG_POOL: Lazy<Mutex<UTIGMatrixPool>> =
     Lazy::new(|| Mutex::new(UTIGMatrixPool::new()));
+
+fn unpack_and_decompress_edges(compressed: &[u8], expected_count: usize) -> Vec<u32> {
+    if compressed.is_empty() || expected_count == 0 {
+        return vec![];
+    }
+    
+    // LZ4 decompress
+    let deltas = match decompress_size_prepended(compressed) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("Failed to decompress edges: {}", e);
+            return vec![];
+        }
+    };
+    
+    // Varint + delta decode
+    let mut edges: Vec<u32> = Vec::with_capacity(expected_count);
+    let mut prev = 0u32;
+    let mut i = 0;
+    
+    while i < deltas.len() && edges.len() < expected_count {
+        // Read varint
+        let mut delta = 0u32;
+        let mut shift = 0;
+        loop {
+            if i >= deltas.len() {
+                break;
+            }
+            let b = deltas[i];
+            i += 1;
+            delta |= ((b & 0x7F) as u32) << shift;
+            if b < 0x80 {
+                break;
+            }
+            shift += 7;
+            if shift > 28 {
+                // Overflow protection
+                log::error!("Varint overflow during edge decoding");
+                return edges;
+            }
+        }
+        
+        prev = prev.wrapping_add(delta);
+        edges.push(prev);
+    }
+    
+    edges
+}
 
 #[cfg(test)]
 #[path = "tests/global_order_tests.rs"]
@@ -361,7 +410,6 @@ impl GlobalOrder {
                     // Check if this is a sentinel marker (32 bytes of 0xFF)
                     if tx_digest.len() == 32 && tx_digest.iter().all(|&b| b == 0xFF) {
                         
-                        
                         // Extract sub_dag_id to know which sub-dag this vote is for
                         if tx_idx + 1 < local_order.len() {
                             let sub_dag_id_bytes = &local_order[tx_idx + 1];
@@ -380,18 +428,9 @@ impl GlobalOrder {
                             }
                         }
                         
-                        // Skip past sentinel + metadata + edges
-                        if tx_idx + 2 < local_order.len() {
-                            let edge_count_bytes = &local_order[tx_idx + 2];
-                            if edge_count_bytes.len() == 8 {
-                                let mut arr = [0u8; 8];
-                                arr.copy_from_slice(edge_count_bytes);
-                                let edge_count = u64::from_le_bytes(arr) as usize;
-                                tx_idx += 3 + edge_count;
-                                continue;
-                            }
-                        }
-                        tx_idx += 3;
+                        // NEW FORMAT: sentinel + sub_dag_id + edge_count + compressed_blob = 4 entries
+                        // Skip past all 4 entries
+                        tx_idx += 4;
                         continue;
                     }
                     
@@ -563,14 +602,15 @@ impl GlobalOrder {
             
             // Check for sentinel
             if tx_digest.len() == 32 && tx_digest.iter().all(|&b| b == 0xFF) {
-                if tx_idx + 2 >= local_order.len() {
+                // Need at least: sentinel + sub_dag_id + edge_count + compressed_blob
+                if tx_idx + 3 >= local_order.len() {
                     break;
                 }
                 
                 // Read sub_dag_id
                 let sub_dag_id_bytes = &local_order[tx_idx + 1];
                 if sub_dag_id_bytes.len() != 8 {
-                    tx_idx += 3;
+                    tx_idx += 4;
                     continue;
                 }
                 let mut arr = [0u8; 8];
@@ -580,33 +620,36 @@ impl GlobalOrder {
                 // Read edge count
                 let edge_count_bytes = &local_order[tx_idx + 2];
                 if edge_count_bytes.len() != 8 {
-                    tx_idx += 3;
+                    tx_idx += 4;
                     continue;
                 }
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(edge_count_bytes);
                 let edge_count = u64::from_le_bytes(arr) as usize;
                 
-                // If this is the target sub_dag_id, extract edges
+                // If this is the target sub_dag_id, decompress and extract edges
                 if sub_dag_id == target_sub_dag_id {
-                    let mut edges: Vec<u32> = Vec::with_capacity(edge_count);
-                    for i in 0..edge_count {
-                        let edge_idx = tx_idx + 3 + i;
-                        if edge_idx >= local_order.len() {
-                            break;
-                        }
-                        let edge_bytes = &local_order[edge_idx];
-                        if edge_bytes.len() == 4 {
-                            let mut arr = [0u8; 4];
-                            arr.copy_from_slice(edge_bytes);
-                            edges.push(u32::from_le_bytes(arr));
-                        }
+                    let compressed_blob = &local_order[tx_idx + 3];
+                    
+                    log::info!(
+                        "extract_fair_update_edges: sub_dag_id={}, edge_count={}, compressed_size={}",
+                        sub_dag_id, edge_count, compressed_blob.len()
+                    );
+                    
+                    let edges = unpack_and_decompress_edges(compressed_blob, edge_count);
+                    
+                    if edges.len() != edge_count {
+                        log::warn!(
+                            "Edge count mismatch: expected {}, got {}",
+                            edge_count, edges.len()
+                        );
                     }
+                    
                     return Some(edges);
                 }
                 
-                // Skip past this sentinel
-                tx_idx += 3 + edge_count;
+                // Skip past this sentinel (4 entries total)
+                tx_idx += 4;
             } else {
                 tx_idx += 1;
             }

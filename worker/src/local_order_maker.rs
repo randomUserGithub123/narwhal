@@ -11,8 +11,33 @@ use std::net::SocketAddr;
 use std::collections::{VecDeque, HashSet, HashMap};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use lz4_flex::compress_prepend_size;
 
 pub type LocalOrder = VecDeque<Vec<u8>>;
+
+fn pack_and_compress_edges(directed_edges: &[u32]) -> Vec<u8> {
+    if directed_edges.is_empty() {
+        return vec![];
+    }
+    
+    let mut sorted: Vec<u32> = directed_edges.to_vec();
+    sorted.sort_unstable();
+    
+    let mut deltas: Vec<u8> = Vec::with_capacity(sorted.len() * 3);
+    let mut prev = 0u32;
+    for &e in &sorted {
+        let delta = e.wrapping_sub(prev);
+        prev = e;
+        let mut v = delta;
+        while v >= 0x80 {
+            deltas.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        deltas.push(v as u8);
+    }
+    
+    compress_prepend_size(&deltas)
+}
 
 /// Assemble clients tx_digests into LocalOrder.
 pub struct LocalOrderMaker {
@@ -360,7 +385,6 @@ impl LocalOrderMaker {
         local_order.insert(0, seq_bytes);
         self.sequence_number += 1;
 
-        // DRAIN immediately - only attach to ONE LocalOrder
         if !self.ready_fair_proposals.is_empty() {
             log::info!(
                 "seal: including {} fair proposal batches in this LocalOrder",
@@ -368,15 +392,24 @@ impl LocalOrderMaker {
             );
             
             for (sub_dag_id, directed_edges) in self.ready_fair_proposals.drain(..) {
+                // Sentinel marker (32 bytes of 0xFF)
                 local_order.push(vec![0xFF; 32]);
+                // Sub-dag ID (8 bytes)
                 local_order.push(sub_dag_id.to_le_bytes().to_vec());
-
-                log::info!("seal: appended {} edge votes for sub_dag_id={}", directed_edges.len(), sub_dag_id);
-
+                // Edge count (8 bytes) - needed for decoding
                 local_order.push((directed_edges.len() as u64).to_le_bytes().to_vec());
-                for edge in directed_edges {
-                    local_order.push(edge.to_le_bytes().to_vec());
-                }
+                // Compressed edge blob (single entry!)
+                let compressed = pack_and_compress_edges(&directed_edges);
+                
+                log::info!(
+                    "seal: appended {} edge votes for sub_dag_id={}, compressed {} -> {} bytes",
+                    directed_edges.len(),
+                    sub_dag_id,
+                    directed_edges.len() * 4,
+                    compressed.len()
+                );
+                
+                local_order.push(compressed);
             }
             // ready_fair_proposals is now empty after drain
         }
