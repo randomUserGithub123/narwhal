@@ -64,14 +64,12 @@ class DASBench:
             )
     
     def _preserve_machines(self, nodes):
-        # we need one machine per node (primary and workers are colocated) and 1 per 4 clients (which is nodes*workers)
         if self.collocate:
             self._amount_for_nodes = self.nodes[0]
-            self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * self.workers / 4)
+            self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * (self.workers - 1) / 4)
         else:
-            # one machine per primary, 1 machine per worker and 1 machine per 4 clients (same amount)
             self._amount_for_nodes = self.nodes[0] + self.nodes[0] * self.workers
-            self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * self.workers / 4)
+            self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * (self.workers - 1) / 4)
 
         time_string = str(datetime.timedelta(seconds=self.duration + 75 + 2 * nodes)) # extra time to set up things
         self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
