@@ -299,6 +299,25 @@ impl GlobalOrder {
 
     async fn process_subdag(&mut self, sub_dag: Vec<(Round, Vec<PublicKey>)>) {
         let start_time = Instant::now();
+
+        let rounds: Vec<Round> = sub_dag.iter().map(|(r, _)| *r).collect();
+        let min_round = rounds.iter().min().copied().unwrap_or(0);
+        let max_round = rounds.iter().max().copied().unwrap_or(0);
+        let total_author_entries: usize = sub_dag.iter().map(|(_, authors)| authors.len()).sum();
+        
+        log::warn!(
+            "SUBDAG STRUCTURE: sub_dag_id={}, rounds={}, span={}..{} ({} rounds), author_entries={}",
+            self.sub_dag_count,
+            sub_dag.len(),
+            min_round,
+            max_round,
+            max_round - min_round + 1,
+            total_author_entries
+        );
+        for (round, authors) in &sub_dag {
+            log::info!("  round {}: {} authors", round, authors.len());
+        }
+
         let mut author_to_lo_digests_subdag: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
 
         // Find the final (maximum) round
