@@ -53,6 +53,9 @@
     - load a particular software version (or module): `module load <name/version>`
     - remove a particular software version (or module): `module rm <name/version>`
 
+### Check number of nodes in cluster
+`sinfo -o "%P %D %N"`
+
 ## DAS Editing of Code & Compiling
 1. Code changes
     - Push to Gitlab repository
