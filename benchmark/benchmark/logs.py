@@ -62,10 +62,12 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips = zip(*results)
+        sizes, self.received_samples, workers_ips, finalization_events = zip(*results)
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
+
+        self.finalization_events = self._merge_results([x.items() for x in finalization_events])
 
         # self.received_samples is a tuple, for each worker it contains the batch in which it placed a specific sample transaction
         # transactions maybe duplicated and may not be in every worker
@@ -169,7 +171,13 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
-        return sizes, samples, ip
+        tmp = findall(r'\[(.*Z) .* sub_dag_id=(\d+): FINALIZED! (\d+) transactions', log)
+        finalization_events = {
+            int(sub_dag_id): (self._to_posix(t), int(count)) 
+            for t, sub_dag_id, count in tmp
+        }
+
+        return sizes, samples, ip, finalization_events
 
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
@@ -192,15 +200,18 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def _end_to_end_throughput(self):
-        if not self.commits:
+        if not self.finalization_events:
             return 0, 0, 0
-        start, end = min(self.start), max(self.commits.values())
+        
+        start = min(self.start)
+        end = max(ts for ts, _ in self.finalization_events.values())
         duration = end - start
-        # this is all bytes, but does not consider redundancy. we compute on average how many times is each sample transaction repeated and divide by that
-        bytes = sum(self.sizes.values()) / self.avg_redundancy
 
-        bps = bytes / duration
-        tps = bps / self.size[0]
+        total_finalized_txs = sum(count for _, count in self.finalization_events.values()) / self.avg_redundancy
+
+        tps = total_finalized_txs / duration
+        bps = tps * self.size[0]
+        
         return tps, bps, duration
 
     def _end_to_end_latency(self):
