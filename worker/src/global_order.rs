@@ -24,8 +24,8 @@ pub enum WorkerMessage {
 
 use crate::batch_maker::Batch;
 
-const MAX_TX: usize = 20_000;
-const MATRIX_POOL_SIZE: usize = 6; // M
+const MAX_TX: usize = 60_000;
+const MATRIX_POOL_SIZE: usize = 10; // M
 
 pub struct UTIGMatrix {
     pub weight: Vec<u8>,          // N×N
@@ -67,6 +67,10 @@ impl UTIGMatrixPool {
     pub fn new() -> Self {
         UTIGMatrixPool {
             pool: [
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
+                UTIGMatrix::new(),
                 UTIGMatrix::new(),
                 UTIGMatrix::new(),
                 UTIGMatrix::new(),
@@ -263,7 +267,7 @@ impl GlobalOrder {
             pending_fair_updates: HashMap::new(),
             next_to_finalize: 0,
             already_finalized: HashSet::new(),
-            use_auncel: true,
+            use_auncel: false,
             auncel_weight_k: 0.5,
             auncel_use_final_phase: false,
             tx_auncel_results,
