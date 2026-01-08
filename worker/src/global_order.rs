@@ -25,35 +25,97 @@ pub enum WorkerMessage {
 use crate::batch_maker::Batch;
 
 const MAX_TX: usize = 60_000;
+const MAX_ORDERS: usize = 500;  // Max LocalOrders per subdag
 const MATRIX_POOL_SIZE: usize = 10; // M
 
+// Nibble helper: bytes needed for `count` nibbles
+const fn nibble_bytes(count: usize) -> usize {
+    (count + 1) / 2
+}
+
+/// Get nibble at logical index
+#[inline(always)]
+fn get_nibble(data: &[u8], idx: usize) -> u8 {
+    let byte = data[idx >> 1];
+    if idx & 1 == 0 { byte & 0x0F } else { byte >> 4 }
+}
+
+/// Increment nibble at logical index, saturating at 15
+#[inline(always)]
+fn inc_nibble(data: &mut [u8], idx: usize) {
+    let byte_idx = idx >> 1;
+    if idx & 1 == 0 {
+        let lo = data[byte_idx] & 0x0F;
+        if lo < 15 {
+            data[byte_idx] = (data[byte_idx] & 0xF0) | (lo + 1);
+        }
+    } else {
+        let hi = data[byte_idx] >> 4;
+        if hi < 15 {
+            data[byte_idx] = (data[byte_idx] & 0x0F) | ((hi + 1) << 4);
+        }
+    }
+}
+
 pub struct UTIGMatrix {
-    pub weight: Vec<u8>,          // N×N
-    pub support: Vec<u8>,         // N
-    pub is_non_blank: Vec<bool>,   // N
-    pub is_solid: Vec<bool>,       // N
-    pub edges: Vec<Vec<u16>>,    // adjacency
+    // === UTIG fields ===
+    pub weight: Vec<u8>,           // nibble-packed: (MAX_TX * MAX_TX + 1) / 2
+    pub support: Vec<u8>,          // nibble-packed: (MAX_TX + 1) / 2 — also used as 'count' for AUNCEL
+    pub is_non_blank: Vec<bool>,
+    pub is_solid: Vec<bool>,
+    pub edges: Vec<Vec<u16>>,
+
+    // === AUNCEL fields ===
+    pub positions: Vec<u16>,       // MAX_TX × MAX_ORDERS (u16::MAX = None)
+    pub weight_sum: Vec<f64>,      // MAX_TX
 }
 
 impl UTIGMatrix {
     pub fn new() -> Self {
         UTIGMatrix {
-            weight: vec![0; MAX_TX * MAX_TX],
-            support: vec![0; MAX_TX],
+            // UTIG
+            weight: vec![0u8; nibble_bytes(MAX_TX * MAX_TX)],
+            support: vec![0u8; nibble_bytes(MAX_TX)],
             is_non_blank: vec![false; MAX_TX],
             is_solid: vec![false; MAX_TX],
             edges: (0..MAX_TX).map(|_| Vec::with_capacity(64)).collect(),
+
+            // AUNCEL
+            positions: vec![u16::MAX; MAX_TX * MAX_ORDERS],
+            weight_sum: vec![0.0; MAX_TX],
         }
     }
 
+    /// Reset for UTIG use
     #[inline]
-    pub fn reset(&mut self, k: usize) {
-        // fast clear: only reset the slice actually used
-        self.weight[..k * k].fill(0);
-        self.support[..k].fill(0);
+    pub fn reset_utig(&mut self, k: usize) {
+        self.weight[..nibble_bytes(k * k)].fill(0);
+        self.support[..nibble_bytes(k)].fill(0);
         self.is_non_blank[..k].fill(false);
         self.is_solid[..k].fill(false);
         for e in &mut self.edges[..k] { e.clear(); }
+    }
+
+    /// Reset for AUNCEL use
+    #[inline]
+    pub fn reset_auncel(&mut self, k: usize, num_orders: usize) {
+        // support is reused as 'count' (nibble-packed)
+        self.support[..nibble_bytes(k)].fill(0);
+        self.weight_sum[..k].fill(0.0);
+        self.positions[..k * num_orders].fill(u16::MAX);
+    }
+
+    // === AUNCEL position helpers ===
+
+    #[inline(always)]
+    pub fn get_position(&self, tx: usize, order_idx: usize, num_orders: usize) -> Option<usize> {
+        let val = self.positions[tx * num_orders + order_idx];
+        if val == u16::MAX { None } else { Some(val as usize) }
+    }
+
+    #[inline(always)]
+    pub fn set_position(&mut self, tx: usize, order_idx: usize, num_orders: usize, pos: usize) {
+        self.positions[tx * num_orders + order_idx] = pos as u16;
     }
 }
 
@@ -1394,9 +1456,9 @@ pub fn run_utig(
     // ============================================================
     for order in &indices_sets {
         for &tx in order {
-            // tx in [0..k)
-            let new_sup = support[tx].saturating_add(1);
-            support[tx] = new_sup;
+            
+            inc_nibble(support, tx);
+            let new_sup = get_nibble(support, tx);
 
             if new_sup >= non_blank_threshold {
                 is_non_blank[tx] = true;
@@ -1410,7 +1472,7 @@ pub fn run_utig(
     let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
     if active.is_empty() {
         log::info!(": no non-blank txs in this sub-dag, nothing to propose");
-        matrix.reset(k);
+        matrix.reset_utig(k);
         {
             let mut pool = UTIG_POOL
                 .lock()
@@ -1453,7 +1515,7 @@ pub fn run_utig(
                 }
 
                 let idx = w_idx(from, to, k);
-                weight[idx] = weight[idx].saturating_add(1);
+                inc_nibble(weight, idx);
             }
         }
     }
@@ -1462,8 +1524,9 @@ pub fn run_utig(
     for &u in &active {
         for &v in &active {
             if u >= v { continue; }
-            let kuv = weight[w_idx(u,v,k)];
-            let kvu = weight[w_idx(v,u,k)];
+            
+            let kuv = get_nibble(weight, w_idx(u, v, k));
+            let kvu = get_nibble(weight, w_idx(v, u, k));
 
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 continue;
@@ -1577,7 +1640,7 @@ pub fn run_utig(
     let scc_n = sccs.len();
     if scc_n == 0 {
         log::info!(": SCC decomposition empty, nothing to propose");
-        matrix.reset(k);
+        matrix.reset_utig(k);
         {
             let mut pool = UTIG_POOL
                 .lock()
@@ -1666,7 +1729,7 @@ pub fn run_utig(
     }
 
     if anchor_idx.is_none() {
-        matrix.reset(k);
+        matrix.reset_utig(k);
         {
             let mut pool = UTIG_POOL
                 .lock()
@@ -1769,8 +1832,8 @@ pub fn run_utig(
         let u = kept_shaded[i];
         for j in (i + 1)..kept_shaded.len() {
             let v = kept_shaded[j];
-            let kuv = weight[w_idx(u, v, k)];
-            let kvu = weight[w_idx(v, u, k)];
+            let kuv = get_nibble(weight, w_idx(u, v, k));
+            let kvu = get_nibble(weight, w_idx(v, u, k));
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 missing_edges.push(pair_key(u, v));
             }
@@ -1812,7 +1875,7 @@ pub fn run_utig(
 
     let _ = tx_utig_results.blocking_send((sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edge_vertices, missing_edges));
 
-    matrix.reset(k);
+    matrix.reset_utig(k);
 
     {
         let mut pool = UTIG_POOL
@@ -1830,15 +1893,13 @@ pub fn run_utig(
 
 }
 
-/// Auncel weight-based ordering algorithm (Two-Phase)
-/// This is an ALTERNATIVE to run_utig - can be used instead of Themis
 pub fn run_auncel_order(
     sub_dag_id: u64,
-    indices_sets: Vec<Vec<usize>>,  // LocalOrders as index lists
-    k: usize,                        // Total unique transactions
-    non_blank_threshold: usize,      // Minimum appearances to be included
-    weight_k: f64,                   // Weight fairness parameter (e.g., 0.5)
-    use_final_order_phase: bool,     // If false, skip Phase 2 (faster, ~98% fairness)
+    indices_sets: Vec<Vec<usize>>,
+    k: usize,
+    non_blank_threshold: usize,
+    weight_k: f64,
+    use_final_order_phase: bool,
     tx_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>)>,
 ) {
     let start_time = Instant::now();
@@ -1851,26 +1912,44 @@ pub fn run_auncel_order(
 
     let num_orders = indices_sets.len();
 
+    // Validate limits
+    if k > MAX_TX {
+        log::error!("run_auncel_order: k={} exceeds MAX_TX={}", k, MAX_TX);
+        let _ = tx_results.blocking_send((sub_dag_id, vec![]));
+        return;
+    }
+    if num_orders > MAX_ORDERS {
+        log::error!("run_auncel_order: num_orders={} exceeds MAX_ORDERS={}", num_orders, MAX_ORDERS);
+        let _ = tx_results.blocking_send((sub_dag_id, vec![]));
+        return;
+    }
+
+    // ===== Acquire matrix from pool =====
+    let (slot_idx, matrix_ptr) = {
+        let mut pool = UTIG_POOL.lock().expect("UTIG_POOL mutex poisoned");
+        let idx = pool.acquire_slot().expect("MatrixPool exhausted");
+        let matrix_ptr: *mut UTIGMatrix = &mut pool.pool[idx];
+        (idx, matrix_ptr)
+    };
+
+    let matrix: &mut UTIGMatrix = unsafe { &mut *matrix_ptr };
+
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 1: Weight Order Phase
     // ═══════════════════════════════════════════════════════════════════════
-    
-    // Build position map: position_map[tx][order_idx] = Some(position) or None
-    // This is used for both phases
-    let mut position_map: Vec<Vec<Option<usize>>> = vec![vec![None; num_orders]; k];
-    let mut weight_sum: Vec<f64> = vec![0.0; k];
-    let mut count: Vec<usize> = vec![0; k];
 
     for (order_idx, order) in indices_sets.iter().enumerate() {
         for (pos, &tx_idx) in order.iter().enumerate() {
-            // Record position for Phase 2 comparisons
-            position_map[tx_idx][order_idx] = Some(pos);
-            
+            // Record position
+            matrix.set_position(tx_idx, order_idx, num_orders, pos);
+
             // Compute weight: W = 1 - k^d where d is 1-indexed position
             let d = (pos + 1) as f64;
             let w = 1.0 - weight_k.powf(d);
-            weight_sum[tx_idx] += w;
-            count[tx_idx] += 1;
+            matrix.weight_sum[tx_idx] += w;
+
+            // Increment count (reusing nibble-packed support)
+            inc_nibble(&mut matrix.support, tx_idx);
         }
     }
 
@@ -1878,64 +1957,71 @@ pub fn run_auncel_order(
 
     // Filter to non-blank transactions
     let mut non_blank: Vec<usize> = (0..k)
-        .filter(|&i| count[i] >= non_blank_threshold)
+        .filter(|&i| get_nibble(&matrix.support, i) as usize >= non_blank_threshold)
         .collect();
 
     if non_blank.is_empty() {
         log::info!("run_auncel_order: sub_dag_id={}, no non-blank txs", sub_dag_id);
+
         let _ = tx_results.blocking_send((sub_dag_id, vec![]));
+
+        matrix.reset_auncel(k, num_orders);
+
+        {
+            let mut pool = UTIG_POOL.lock().expect("UTIG_POOL mutex poisoned");
+            pool.release_slot(slot_idx);
+        }
+
         return;
     }
 
     // Sort by weight sum ASCENDING (lower weight = appeared earlier = comes first)
-    // Tiebreak by tx index ASCENDING for determinism
     non_blank.sort_by(|&a, &b| {
-        weight_sum[a]
-            .partial_cmp(&weight_sum[b])
+        matrix.weight_sum[a]
+            .partial_cmp(&matrix.weight_sum[b])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.cmp(&b))
     });
 
     let t2 = start_time.elapsed().as_nanos();
     log::info!(
-        "run_auncel_order: sub_dag_id={}, Phase 1 done: {} non-blank txs (of {}), weight_compute={}ns, sort={}ns",
-        sub_dag_id, non_blank.len(), k, t1, t2 - t1
+        "run_auncel_order: sub_dag_id={}, Phase 1 done: {} non-blank txs (of {}), time={}ns",
+        sub_dag_id, non_blank.len(), k, t2
     );
 
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 2: Final Order Phase (Recursive) - Optional
     // ═══════════════════════════════════════════════════════════════════════
-    
+
     let final_order = if use_final_order_phase {
-        auncel_final_order_phase(&non_blank, &position_map, num_orders)
+        auncel_final_order_phase_pooled(&non_blank, matrix, num_orders)
     } else {
-        // Skip Phase 2 - use Phase 1 result directly (~98% fairness, ~13% faster)
         non_blank
     };
 
     let t3 = start_time.elapsed().as_nanos();
     log::info!(
-        "run_auncel_order: sub_dag_id={}, Phase 2 done: {} txs, phase2={}ns, total={}ns",
-        sub_dag_id, final_order.len(), t3 - t2, t3
+        "run_auncel_order: sub_dag_id={}, complete: {} txs, total={}ns",
+        sub_dag_id, final_order.len(), t3
     );
 
+
     let _ = tx_results.blocking_send((sub_dag_id, final_order));
+
+    matrix.reset_auncel(k, num_orders);
+    // ===== Release slot =====
+    {
+        let mut pool = UTIG_POOL.lock().expect("UTIG_POOL mutex poisoned");
+        pool.release_slot(slot_idx);
+    }
 }
 
-/// Recursive Final Order Phase (quicksort-style partitioning)
-/// 
-/// Algorithm from paper:
-/// 1. Select "Medium Tx" from middle of current list
-/// 2. Compare all other txs against Medium Tx using LocalOrder positions
-/// 3. Partition into Pre-Sequence (before Medium) and Post-Sequence (after Medium)
-/// 4. Recursively apply to both sequences
-/// 5. Concatenate: Pre + Medium + Post
-fn auncel_final_order_phase(
+/// Phase 2 using pooled matrix for position lookups
+fn auncel_final_order_phase_pooled(
     txs: &[usize],
-    position_map: &[Vec<Option<usize>>],
+    matrix: &UTIGMatrix,
     num_orders: usize,
 ) -> Vec<usize> {
-    // Base cases
     if txs.is_empty() {
         return vec![];
     }
@@ -1943,7 +2029,6 @@ fn auncel_final_order_phase(
         return txs.to_vec();
     }
 
-    // Select Medium Tx (middle element of the weight-sorted list)
     let mid_idx = txs.len() / 2;
     let medium_tx = txs[mid_idx];
 
@@ -1952,26 +2037,21 @@ fn auncel_final_order_phase(
 
     for (i, &tx) in txs.iter().enumerate() {
         if i == mid_idx {
-            continue; // Skip the medium tx itself
+            continue;
         }
 
-        // Compare tx vs medium_tx across all LocalOrders
-        let (before_count, after_count) = auncel_compare_pair(
+        let (before_count, after_count) = auncel_compare_pair_pooled(
             tx,
             medium_tx,
-            position_map,
+            matrix,
             num_orders,
         );
 
-        // Partition based on majority
         if before_count > after_count {
-            // tx comes before medium_tx in majority of LocalOrders
             pre_sequence.push(tx);
         } else if after_count > before_count {
-            // medium_tx comes before tx in majority of LocalOrders
             post_sequence.push(tx);
         } else {
-            // Tie: use tx index as deterministic tiebreaker
             if tx < medium_tx {
                 pre_sequence.push(tx);
             } else {
@@ -1980,38 +2060,37 @@ fn auncel_final_order_phase(
         }
     }
 
-    // Recursively process and concatenate
-    let mut result = auncel_final_order_phase(&pre_sequence, position_map, num_orders);
+    let mut result = auncel_final_order_phase_pooled(&pre_sequence, matrix, num_orders);
     result.push(medium_tx);
-    result.extend(auncel_final_order_phase(&post_sequence, position_map, num_orders));
+    result.extend(auncel_final_order_phase_pooled(&post_sequence, matrix, num_orders));
 
     result
 }
 
-/// Compare two transactions across all LocalOrders
-/// Returns (count where tx_a before tx_b, count where tx_b before tx_a)
 #[inline]
-fn auncel_compare_pair(
+fn auncel_compare_pair_pooled(
     tx_a: usize,
     tx_b: usize,
-    position_map: &[Vec<Option<usize>>],
+    matrix: &UTIGMatrix,
     num_orders: usize,
 ) -> (usize, usize) {
     let mut a_before_b = 0usize;
     let mut b_before_a = 0usize;
 
+    let base_a = tx_a * num_orders;
+    let base_b = tx_b * num_orders;
+
     for order_idx in 0..num_orders {
-        match (position_map[tx_a][order_idx], position_map[tx_b][order_idx]) {
-            (Some(pos_a), Some(pos_b)) => {
-                if pos_a < pos_b {
-                    a_before_b += 1;
-                } else if pos_b < pos_a {
-                    b_before_a += 1;
-                }
-                // pos_a == pos_b shouldn't happen (same position), but if it does, neither count increments
+        let pos_a = matrix.positions[base_a + order_idx];
+        let pos_b = matrix.positions[base_b + order_idx];
+
+        // u16::MAX means "not present"
+        if pos_a != u16::MAX && pos_b != u16::MAX {
+            if pos_a < pos_b {
+                a_before_b += 1;
+            } else if pos_b < pos_a {
+                b_before_a += 1;
             }
-            // If either tx is missing from this LocalOrder, we can't compare
-            _ => {}
         }
     }
 
