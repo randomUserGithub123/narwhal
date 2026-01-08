@@ -28,54 +28,25 @@ const MAX_TX: usize = 60_000;
 const MAX_ORDERS: usize = 500;  // Max LocalOrders per subdag
 const MATRIX_POOL_SIZE: usize = 10; // M
 
-// Nibble helper: bytes needed for `count` nibbles
-const fn nibble_bytes(count: usize) -> usize {
-    (count + 1) / 2
-}
-
-/// Get nibble at logical index
-#[inline(always)]
-fn get_nibble(data: &[u8], idx: usize) -> u8 {
-    let byte = data[idx >> 1];
-    if idx & 1 == 0 { byte & 0x0F } else { byte >> 4 }
-}
-
-/// Increment nibble at logical index, saturating at 15
-#[inline(always)]
-fn inc_nibble(data: &mut [u8], idx: usize) {
-    let byte_idx = idx >> 1;
-    if idx & 1 == 0 {
-        let lo = data[byte_idx] & 0x0F;
-        if lo < 15 {
-            data[byte_idx] = (data[byte_idx] & 0xF0) | (lo + 1);
-        }
-    } else {
-        let hi = data[byte_idx] >> 4;
-        if hi < 15 {
-            data[byte_idx] = (data[byte_idx] & 0x0F) | ((hi + 1) << 4);
-        }
-    }
-}
-
 pub struct UTIGMatrix {
     // === UTIG fields ===
-    pub weight: Vec<u8>,           // nibble-packed: (MAX_TX * MAX_TX + 1) / 2
-    pub support: Vec<u8>,          // nibble-packed: (MAX_TX + 1) / 2 — also used as 'count' for AUNCEL
+    pub weight: Vec<u8>,           // MAX_TX × MAX_TX (direct access)
+    pub support: Vec<u8>,          // MAX_TX (direct access)
     pub is_non_blank: Vec<bool>,
     pub is_solid: Vec<bool>,
     pub edges: Vec<Vec<u16>>,
 
     // === AUNCEL fields ===
-    pub positions: Vec<u16>,       // MAX_TX × MAX_ORDERS (u16::MAX = None)
-    pub weight_sum: Vec<f64>,      // MAX_TX
+    pub positions: Vec<u16>,
+    pub weight_sum: Vec<f64>,
 }
 
 impl UTIGMatrix {
     pub fn new() -> Self {
         UTIGMatrix {
-            // UTIG
-            weight: vec![0u8; nibble_bytes(MAX_TX * MAX_TX)],
-            support: vec![0u8; nibble_bytes(MAX_TX)],
+            // UTIG - direct u8 arrays
+            weight: vec![0u8; MAX_TX * MAX_TX],
+            support: vec![0u8; MAX_TX],
             is_non_blank: vec![false; MAX_TX],
             is_solid: vec![false; MAX_TX],
             edges: (0..MAX_TX).map(|_| Vec::with_capacity(64)).collect(),
@@ -89,8 +60,8 @@ impl UTIGMatrix {
     /// Reset for UTIG use
     #[inline]
     pub fn reset_utig(&mut self, k: usize) {
-        self.weight[..nibble_bytes(k * k)].fill(0);
-        self.support[..nibble_bytes(k)].fill(0);
+        self.weight[..k * k].fill(0);
+        self.support[..k].fill(0);
         self.is_non_blank[..k].fill(false);
         self.is_solid[..k].fill(false);
         for e in &mut self.edges[..k] { e.clear(); }
@@ -99,8 +70,7 @@ impl UTIGMatrix {
     /// Reset for AUNCEL use
     #[inline]
     pub fn reset_auncel(&mut self, k: usize, num_orders: usize) {
-        // support is reused as 'count' (nibble-packed)
-        self.support[..nibble_bytes(k)].fill(0);
+        self.support[..k].fill(0);
         self.weight_sum[..k].fill(0.0);
         self.positions[..k * num_orders].fill(u16::MAX);
     }
@@ -1457,8 +1427,8 @@ pub fn run_utig(
     for order in &indices_sets {
         for &tx in order {
             
-            inc_nibble(support, tx);
-            let new_sup = get_nibble(support, tx);
+            let new_sup = support[tx].saturating_add(1);
+            support[tx] = new_sup;
 
             if new_sup >= non_blank_threshold {
                 is_non_blank[tx] = true;
@@ -1515,7 +1485,7 @@ pub fn run_utig(
                 }
 
                 let idx = w_idx(from, to, k);
-                inc_nibble(weight, idx);
+                weight[idx] = weight[idx].saturating_add(1);
             }
         }
     }
@@ -1525,8 +1495,8 @@ pub fn run_utig(
         for &v in &active {
             if u >= v { continue; }
             
-            let kuv = get_nibble(weight, w_idx(u, v, k));
-            let kvu = get_nibble(weight, w_idx(v, u, k));
+            let kuv = weight[w_idx(u, v, k)];
+            let kvu = weight[w_idx(v, u, k)];
 
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 continue;
@@ -1832,8 +1802,10 @@ pub fn run_utig(
         let u = kept_shaded[i];
         for j in (i + 1)..kept_shaded.len() {
             let v = kept_shaded[j];
-            let kuv = get_nibble(weight, w_idx(u, v, k));
-            let kvu = get_nibble(weight, w_idx(v, u, k));
+            
+            let kuv = weight[w_idx(u, v, k)];
+            let kvu = weight[w_idx(v, u, k)];
+
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 missing_edges.push(pair_key(u, v));
             }
@@ -1948,8 +1920,7 @@ pub fn run_auncel_order(
             let w = 1.0 - weight_k.powf(d);
             matrix.weight_sum[tx_idx] += w;
 
-            // Increment count (reusing nibble-packed support)
-            inc_nibble(&mut matrix.support, tx_idx);
+            matrix.support[tx_idx] = matrix.support[tx_idx].saturating_add(1);
         }
     }
 
@@ -1957,7 +1928,7 @@ pub fn run_auncel_order(
 
     // Filter to non-blank transactions
     let mut non_blank: Vec<usize> = (0..k)
-        .filter(|&i| get_nibble(&matrix.support, i) as usize >= non_blank_threshold)
+        .filter(|&i| matrix.support[i] as usize >= non_blank_threshold)
         .collect();
 
     if non_blank.is_empty() {
