@@ -187,6 +187,13 @@ pub struct GlobalOrder {
 
     next_to_finalize: u64,
     already_finalized: HashSet<Digest>,
+
+    use_auncel: bool,
+    auncel_weight_k: f64,
+    auncel_use_final_phase: bool,
+
+    tx_auncel_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>)>,
+    rx_auncel_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>)>,
 }
 
 impl GlobalOrder {
@@ -230,6 +237,7 @@ impl GlobalOrder {
         let solid_threshold = (n - 2 * f) as u16;
 
         let (tx_utig_results, rx_utig_results) = tokio::sync::mpsc::channel(1024);
+        let (tx_auncel_results, rx_auncel_results) = tokio::sync::mpsc::channel(1024);
 
         GlobalOrder {
             store,
@@ -255,6 +263,11 @@ impl GlobalOrder {
             pending_fair_updates: HashMap::new(),
             next_to_finalize: 0,
             already_finalized: HashSet::new(),
+            use_auncel: true,
+            auncel_weight_k: 0.5,
+            auncel_use_final_phase: false,
+            tx_auncel_results,
+            rx_auncel_results,
         }
     }
 
@@ -496,10 +509,6 @@ impl GlobalOrder {
             self.process_fair_update_quorum(ready_sub_dag_id).await;
         }
 
-        let non_blank = self.non_blank_threshold;
-        let solid = self.solid_threshold;
-        let tx_utig_results = self.tx_utig_results.clone();
-
         let sub_dag_id = self.sub_dag_count;
         self.sub_dag_count += 1;
         
@@ -507,11 +516,45 @@ impl GlobalOrder {
         self.store.write(Self::index_to_digest_key(sub_dag_id), index_ser).await;
         self.store.write(Self::subdag_state_key(sub_dag_id), vec![0]).await;
         
-        let _handler = tokio_rayon::spawn(move || {
-            run_utig(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
-        });
+        if self.use_auncel {
+            
+            let auncel_weight_k = self.auncel_weight_k;
+            let auncel_use_final_phase = self.auncel_use_final_phase;
+            let non_blank_threshold = self.non_blank_threshold as usize;
+            let tx_auncel_results = self.tx_auncel_results.clone();
+            
+            let _handler = tokio_rayon::spawn(move || {
+                run_auncel_order(
+                    sub_dag_id,
+                    indices_sets,
+                    k,
+                    non_blank_threshold,
+                    auncel_weight_k,
+                    auncel_use_final_phase,
+                    tx_auncel_results,
+                );
+            });
+            
+            log::info!(
+                "process_subdag: spawned AUNCEL ordering (k={}, weight_k={}, final_phase={}) in {}ns",
+                k, auncel_weight_k, auncel_use_final_phase, start_time.elapsed().as_nanos()
+            );
+        } else {
+            
+            let non_blank = self.non_blank_threshold;
+            let solid = self.solid_threshold;
+            let tx_utig_results = self.tx_utig_results.clone();
+            
+            let _handler = tokio_rayon::spawn(move || {
+                run_utig(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
+            });
 
-        log::info!("spawning UTIG: {}", start_time.elapsed().as_nanos() - t2);
+            log::info!(
+                "process_subdag: spawned UTIG ordering in {}ns",
+                start_time.elapsed().as_nanos()
+            );
+        }
+
     }
 
     async fn try_process_pending_subdags(&mut self) {
@@ -1027,7 +1070,21 @@ impl GlobalOrder {
                             .send((sub_dag_id, missing_edge_vertices, missing_tx_digests, missing_edges))
                             .await;
                     }
-                }
+                },
+
+                Some((sub_dag_id, finalized_indices)) = self.rx_auncel_results.recv() => {
+                    log::info!(
+                        "rx_auncel_results: sub_dag_id={}, finalized={} txs (single-round)",
+                        sub_dag_id, finalized_indices.len()
+                    );
+
+                    let finalized_ser = bincode::serialize(&finalized_indices).expect("serialize failed");
+                    self.store.write(Self::finalized_indices_key(sub_dag_id), finalized_ser).await;
+                    
+                    self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
+                    
+                    self.try_finalize_sequential().await;
+                },
 
             }
         }
@@ -1767,4 +1824,192 @@ pub fn run_utig(
         " t8: {}", t8
     );
 
+}
+
+/// Auncel weight-based ordering algorithm (Two-Phase)
+/// This is an ALTERNATIVE to run_utig - can be used instead of Themis
+pub fn run_auncel_order(
+    sub_dag_id: u64,
+    indices_sets: Vec<Vec<usize>>,  // LocalOrders as index lists
+    k: usize,                        // Total unique transactions
+    non_blank_threshold: usize,      // Minimum appearances to be included
+    weight_k: f64,                   // Weight fairness parameter (e.g., 0.5)
+    use_final_order_phase: bool,     // If false, skip Phase 2 (faster, ~98% fairness)
+    tx_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>)>,
+) {
+    let start_time = Instant::now();
+
+    if k == 0 || indices_sets.is_empty() {
+        log::info!("run_auncel_order: sub_dag_id={}, empty input", sub_dag_id);
+        let _ = tx_results.blocking_send((sub_dag_id, vec![]));
+        return;
+    }
+
+    let num_orders = indices_sets.len();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 1: Weight Order Phase
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    // Build position map: position_map[tx][order_idx] = Some(position) or None
+    // This is used for both phases
+    let mut position_map: Vec<Vec<Option<usize>>> = vec![vec![None; num_orders]; k];
+    let mut weight_sum: Vec<f64> = vec![0.0; k];
+    let mut count: Vec<usize> = vec![0; k];
+
+    for (order_idx, order) in indices_sets.iter().enumerate() {
+        for (pos, &tx_idx) in order.iter().enumerate() {
+            // Record position for Phase 2 comparisons
+            position_map[tx_idx][order_idx] = Some(pos);
+            
+            // Compute weight: W = 1 - k^d where d is 1-indexed position
+            let d = (pos + 1) as f64;
+            let w = 1.0 - weight_k.powf(d);
+            weight_sum[tx_idx] += w;
+            count[tx_idx] += 1;
+        }
+    }
+
+    let t1 = start_time.elapsed().as_nanos();
+
+    // Filter to non-blank transactions
+    let mut non_blank: Vec<usize> = (0..k)
+        .filter(|&i| count[i] >= non_blank_threshold)
+        .collect();
+
+    if non_blank.is_empty() {
+        log::info!("run_auncel_order: sub_dag_id={}, no non-blank txs", sub_dag_id);
+        let _ = tx_results.blocking_send((sub_dag_id, vec![]));
+        return;
+    }
+
+    // Sort by weight sum ASCENDING (lower weight = appeared earlier = comes first)
+    // Tiebreak by tx index ASCENDING for determinism
+    non_blank.sort_by(|&a, &b| {
+        weight_sum[a]
+            .partial_cmp(&weight_sum[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    let t2 = start_time.elapsed().as_nanos();
+    log::info!(
+        "run_auncel_order: sub_dag_id={}, Phase 1 done: {} non-blank txs (of {}), weight_compute={}ns, sort={}ns",
+        sub_dag_id, non_blank.len(), k, t1, t2 - t1
+    );
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 2: Final Order Phase (Recursive) - Optional
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    let final_order = if use_final_order_phase {
+        auncel_final_order_phase(&non_blank, &position_map, num_orders)
+    } else {
+        // Skip Phase 2 - use Phase 1 result directly (~98% fairness, ~13% faster)
+        non_blank
+    };
+
+    let t3 = start_time.elapsed().as_nanos();
+    log::info!(
+        "run_auncel_order: sub_dag_id={}, Phase 2 done: {} txs, phase2={}ns, total={}ns",
+        sub_dag_id, final_order.len(), t3 - t2, t3
+    );
+
+    let _ = tx_results.blocking_send((sub_dag_id, final_order));
+}
+
+/// Recursive Final Order Phase (quicksort-style partitioning)
+/// 
+/// Algorithm from paper:
+/// 1. Select "Medium Tx" from middle of current list
+/// 2. Compare all other txs against Medium Tx using LocalOrder positions
+/// 3. Partition into Pre-Sequence (before Medium) and Post-Sequence (after Medium)
+/// 4. Recursively apply to both sequences
+/// 5. Concatenate: Pre + Medium + Post
+fn auncel_final_order_phase(
+    txs: &[usize],
+    position_map: &[Vec<Option<usize>>],
+    num_orders: usize,
+) -> Vec<usize> {
+    // Base cases
+    if txs.is_empty() {
+        return vec![];
+    }
+    if txs.len() == 1 {
+        return txs.to_vec();
+    }
+
+    // Select Medium Tx (middle element of the weight-sorted list)
+    let mid_idx = txs.len() / 2;
+    let medium_tx = txs[mid_idx];
+
+    let mut pre_sequence: Vec<usize> = Vec::new();
+    let mut post_sequence: Vec<usize> = Vec::new();
+
+    for (i, &tx) in txs.iter().enumerate() {
+        if i == mid_idx {
+            continue; // Skip the medium tx itself
+        }
+
+        // Compare tx vs medium_tx across all LocalOrders
+        let (before_count, after_count) = auncel_compare_pair(
+            tx,
+            medium_tx,
+            position_map,
+            num_orders,
+        );
+
+        // Partition based on majority
+        if before_count > after_count {
+            // tx comes before medium_tx in majority of LocalOrders
+            pre_sequence.push(tx);
+        } else if after_count > before_count {
+            // medium_tx comes before tx in majority of LocalOrders
+            post_sequence.push(tx);
+        } else {
+            // Tie: use tx index as deterministic tiebreaker
+            if tx < medium_tx {
+                pre_sequence.push(tx);
+            } else {
+                post_sequence.push(tx);
+            }
+        }
+    }
+
+    // Recursively process and concatenate
+    let mut result = auncel_final_order_phase(&pre_sequence, position_map, num_orders);
+    result.push(medium_tx);
+    result.extend(auncel_final_order_phase(&post_sequence, position_map, num_orders));
+
+    result
+}
+
+/// Compare two transactions across all LocalOrders
+/// Returns (count where tx_a before tx_b, count where tx_b before tx_a)
+#[inline]
+fn auncel_compare_pair(
+    tx_a: usize,
+    tx_b: usize,
+    position_map: &[Vec<Option<usize>>],
+    num_orders: usize,
+) -> (usize, usize) {
+    let mut a_before_b = 0usize;
+    let mut b_before_a = 0usize;
+
+    for order_idx in 0..num_orders {
+        match (position_map[tx_a][order_idx], position_map[tx_b][order_idx]) {
+            (Some(pos_a), Some(pos_b)) => {
+                if pos_a < pos_b {
+                    a_before_b += 1;
+                } else if pos_b < pos_a {
+                    b_before_a += 1;
+                }
+                // pos_a == pos_b shouldn't happen (same position), but if it does, neither count increments
+            }
+            // If either tx is missing from this LocalOrder, we can't compare
+            _ => {}
+        }
+    }
+
+    (a_before_b, b_before_a)
 }
