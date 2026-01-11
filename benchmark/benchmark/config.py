@@ -177,20 +177,24 @@ class DASCommittee(Committee):
         assert isinstance(faults, int) and faults >= 0
         # assert isinstance(attack_type, int) and attack_type <= 3
         node_num = len(names)
-        collocate = len(hostnames) == node_num * 2
+        collocate = len(hostnames) == node_num
         node_amount = workers + 1
         if collocate:
-            addresses = OrderedDict()
-            for i, x in enumerate(names):
-                primary_workers_host = socket.gethostbyname(hostnames[i * 2])
-                worker_0_host = socket.gethostbyname(hostnames[i * 2 + 1])
+            # addresses = OrderedDict()
+            # for i, x in enumerate(names):
+            #     primary_workers_host = socket.gethostbyname(hostnames[i * 2])
+            #     worker_0_host = socket.gethostbyname(hostnames[i * 2 + 1])
                 
-                hosts = [primary_workers_host]
-                hosts.append(worker_0_host)          # worker_0 (dedicated machine)
-                for _ in range(workers - 1):
-                    hosts.append(primary_workers_host)
+            #     hosts = [primary_workers_host]
+            #     hosts.append(worker_0_host)          # worker_0 (dedicated machine)
+            #     for _ in range(workers - 1):
+            #         hosts.append(primary_workers_host)
                 
-                addresses[x] = hosts
+            #     addresses[x] = hosts
+            addresses = OrderedDict(
+                (x, [socket.gethostbyname(hostnames[i])] * node_amount)
+                for i, x in enumerate(names)
+            )
         else:
             addresses = OrderedDict((x, list(map(socket.gethostbyname, hostnames[i*node_amount:(i+1)*node_amount]))) for i, x in enumerate(names))
 
