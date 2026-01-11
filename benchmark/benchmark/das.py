@@ -65,7 +65,7 @@ class DASBench:
     
     def _preserve_machines(self, nodes):
         if self.collocate:
-            self._amount_for_nodes = self.nodes[0]
+            self._amount_for_nodes = self.nodes[0] * 2
             self._num_machines = self._amount_for_nodes + ceil(self.nodes[0] * (self.workers - 1) / 4)
         else:
             self._amount_for_nodes = self.nodes[0] + self.nodes[0] * self.workers
