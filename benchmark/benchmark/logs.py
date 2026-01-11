@@ -276,7 +276,7 @@ class LogParser:
         end = max(ts for ts, _ in self.finalization_events.values())
         duration = end - start
 
-        total_finalized_txs = sum(count for _, count in self.finalization_events.values()) / self.avg_redundancy
+        total_finalized_txs = sum(count for _, count in self.finalization_events.values())
 
         tps = total_finalized_txs / duration
         bps = tps * self.size[0]
