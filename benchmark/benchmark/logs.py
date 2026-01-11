@@ -272,8 +272,11 @@ class LogParser:
         if not self.finalization_events:
             return 0, 0, 0
 
-        start = min(self.start)
-        end = max(ts for ts, _ in self.finalization_events.values())
+        start = min(self.proposals.values())
+        end = max(
+            max(self.commits.values()),
+            max(ts for ts, _ in self.finalization_events.values())
+        )
         duration = end - start
 
         total_finalized_txs = sum(count for _, count in self.finalization_events.values())
@@ -284,35 +287,19 @@ class LogParser:
         return tps, bps, duration
 
     def _end_to_end_latency(self):
-        """
-        Compute end-to-end latency based on FINALIZATION time.
-        
-        Chain: sample_tx_id → batch_digest → (round, short_author) → sub_dag_id → finalization_time
-        
-        Key insight: short_author is a PREFIX of full_author
-        - Committed logs: "B1(7jv81x0Age2f+E6q)" -> short_author
-        - Sub-dag logs: "7jv81x0Age2f+E6qtC2NV5PvHPK8H0EByZWkSXAU+8I=" -> full_author
-        - Match: full_author.startswith(short_author)
-        """
         latency = []
         
-        # Build index: (round, short_author) -> sub_dag_id
-        # We need to match short_author (prefix) with full_author
-        header_to_subdag = {}
-        
-        for sub_dag_id in sorted(self.subdag_to_headers.keys()):
-            for (round_num, full_author) in self.subdag_to_headers[sub_dag_id]:
-                # Create entry for prefix matching
-                # The short_author in Committed logs is a prefix of full_author
-                header_to_subdag[(round_num, full_author)] = sub_dag_id
-
-        # Helper function to find sub_dag_id by matching short_author prefix
         def find_subdag_for_header(round_num, short_author):
-            """Find sub_dag_id where a full_author starts with short_author"""
             for (r, full_author), sub_dag_id in header_to_subdag.items():
                 if r == round_num and full_author.startswith(short_author):
                     return sub_dag_id
             return None
+
+        # Build index
+        header_to_subdag = {}
+        for sub_dag_id in sorted(self.subdag_to_headers.keys()):
+            for (round_num, full_author) in self.subdag_to_headers[sub_dag_id]:
+                header_to_subdag[(round_num, full_author)] = sub_dag_id
 
         for sample_tx_id, send_time in self.all_sent_samples.items():
             batch_digests = self.all_received_samples.get(sample_tx_id)
@@ -322,24 +309,35 @@ class LogParser:
             min_latency = None
 
             for batch_digest in batch_digests:
-                # Step 1: batch_digest -> (round, short_author)
+                # Step 1: Get commit time for this batch
+                commit_time = self.commits.get(batch_digest)
+                if commit_time is None:
+                    continue
+                
+                # Step 2: Get header info
                 header = self.batch_to_header.get(batch_digest)
                 if header is None:
                     continue
                 
                 round_num, short_author = header
 
-                # Step 2: (round, short_author) -> sub_dag_id (using prefix match)
+                # Step 3: Find sub_dag
                 sub_dag_id = find_subdag_for_header(round_num, short_author)
                 if sub_dag_id is None:
                     continue
 
-                # Step 3: sub_dag_id -> finalization_time
+                # Step 4: Get finalization time
                 finalization_data = self.finalization_events.get(sub_dag_id)
                 if finalization_data is None:
                     continue
 
                 finalization_time, _ = finalization_data
+                
+                # SANITY CHECK: finalization MUST be >= commit
+                # If not, this is a bad match - skip it
+                if finalization_time < commit_time:
+                    continue
+                
                 lat = finalization_time - send_time
 
                 if lat > 0:
