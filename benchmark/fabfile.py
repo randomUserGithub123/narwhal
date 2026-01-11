@@ -57,10 +57,10 @@ def local(ctx, debug=True):
 @task
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for faults, workers_per_node, nodes, runs in [
-        # (1, 2, 5, 1),
+        (1, 2, 5, 1),
         # (2, 2, 9, 1),
         # (3, 2, 13, 1),
-        (4, 2, 17, 1),
+        #(4, 2, 17, 1),
     ]:
         """Run benchmarks on DAS5"""
         bench_params = {
@@ -69,18 +69,18 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             'workers': workers_per_node,
             'rate': 5_000,
             'tx_size': 128,
-            'duration': 120,
+            'duration': 60,
             "collocate": False,
         }
         node_params = {
-            "header_size": 352,  # bytes
+            "header_size": 512,  # bytes
             "max_header_delay": 150,  # ms
             "gc_depth": 50,  # rounds
             "sync_retry_delay": 5_000,  # ms
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 4_000,  # bytes
             "max_batch_delay": 100,  # ms
-            "lo_size": 100, # number of entries in LocalOrder queue
+            "lo_size": 200, # number of entries in LocalOrder queue
             "lo_max_delay": 100, # ms
             "gamma": 1.0, # batch-OF parameter
         }

@@ -30,7 +30,7 @@ const MATRIX_POOL_SIZE: usize = 10; // M
 
 pub struct UTIGMatrix {
     // === UTIG fields ===
-    pub weight: Vec<u8>,           // MAX_TX × MAX_TX (direct access)
+    pub weight: Vec<u8>,           // MAX_TX × MAX_TX / 2 (direct access)
     pub support: Vec<u8>,          // MAX_TX (direct access)
     pub is_non_blank: Vec<bool>,
     pub is_solid: Vec<bool>,
@@ -42,10 +42,11 @@ pub struct UTIGMatrix {
 }
 
 impl UTIGMatrix {
+
     pub fn new() -> Self {
         UTIGMatrix {
             // UTIG - direct u8 arrays
-            weight: vec![0u8; MAX_TX * MAX_TX],
+            weight: vec![0u8; (MAX_TX * MAX_TX + 1) / 2], // Nibble-packed:
             support: vec![0u8; MAX_TX],
             is_non_blank: vec![false; MAX_TX],
             is_solid: vec![false; MAX_TX],
@@ -60,11 +61,19 @@ impl UTIGMatrix {
     /// Reset for UTIG use
     #[inline]
     pub fn reset_utig(&mut self, k: usize) {
-        self.weight[..k * k].fill(0);
+        let packed_size = (k * k + 1) / 2;
+        self.weight[..packed_size].fill(0);
         self.support[..k].fill(0);
         self.is_non_blank[..k].fill(false);
         self.is_solid[..k].fill(false);
         for e in &mut self.edges[..k] { e.clear(); }
+    }
+
+    /// Reset for FairUpdate (only weight needed)
+    #[inline]
+    pub fn reset_fair_update(&mut self, k: usize) {
+        let packed_size = (k * k + 1) / 2;
+        self.weight[..packed_size].fill(0);
     }
 
     /// Reset for AUNCEL use
@@ -86,6 +95,43 @@ impl UTIGMatrix {
     #[inline(always)]
     pub fn set_position(&mut self, tx: usize, order_idx: usize, num_orders: usize, pos: usize) {
         self.positions[tx * num_orders + order_idx] = pos as u16;
+    }
+}
+
+#[inline(always)]
+fn get_weight(weight_packed: &[u8], idx: usize) -> u8 {
+    let byte_idx = idx >> 1;
+    let byte = weight_packed[byte_idx];
+    if idx & 1 == 0 {
+        byte & 0x0F
+    } else {
+        byte >> 4
+    }
+}
+
+#[inline(always)]
+fn set_weight(weight_packed: &mut [u8], idx: usize, value: u8) {
+    let byte_idx = idx >> 1;
+    if idx & 1 == 0 {
+        weight_packed[byte_idx] = (weight_packed[byte_idx] & 0xF0) | (value & 0x0F);
+    } else {
+        weight_packed[byte_idx] = (weight_packed[byte_idx] & 0x0F) | (value << 4);
+    }
+}
+
+#[inline(always)]
+fn inc_weight(weight_packed: &mut [u8], idx: usize) {
+    let byte_idx = idx >> 1;
+    if idx & 1 == 0 {
+        let low = weight_packed[byte_idx] & 0x0F;
+        if low < 15 {
+            weight_packed[byte_idx] += 1;
+        }
+    } else {
+        let high = weight_packed[byte_idx] >> 4;
+        if high < 15 {
+            weight_packed[byte_idx] += 0x10;
+        }
     }
 }
 
@@ -1485,7 +1531,7 @@ pub fn run_utig(
                 }
 
                 let idx = w_idx(from, to, k);
-                weight[idx] = weight[idx].saturating_add(1);
+                inc_weight(weight, idx);
             }
         }
     }
@@ -1495,8 +1541,8 @@ pub fn run_utig(
         for &v in &active {
             if u >= v { continue; }
             
-            let kuv = weight[w_idx(u, v, k)];
-            let kvu = weight[w_idx(v, u, k)];
+            let kuv = get_weight(weight, w_idx(u, v, k));  // NIBBLE get
+            let kvu = get_weight(weight, w_idx(v, u, k));  // NIBBLE get
 
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 continue;
@@ -1803,8 +1849,8 @@ pub fn run_utig(
         for j in (i + 1)..kept_shaded.len() {
             let v = kept_shaded[j];
             
-            let kuv = weight[w_idx(u, v, k)];
-            let kvu = weight[w_idx(v, u, k)];
+            let kuv = get_weight(weight, w_idx(u, v, k));  // NIBBLE get
+            let kvu = get_weight(weight, w_idx(v, u, k));  // NIBBLE get
 
             if kuv < non_blank_threshold && kvu < non_blank_threshold {
                 missing_edges.push(pair_key(u, v));
