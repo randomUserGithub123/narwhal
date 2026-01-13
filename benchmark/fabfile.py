@@ -140,6 +140,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         """Run benchmarks on DAS5"""
         bench_params = {
             'faults': faults,
+            "arbitragers": arbitragers,  # arbitragers: the number of frontrunning attackers f_a
+            "attack_type": attack_type,  # frontrunning strategies: 0: no attack; 1: fissure; 2: sluggish; 3: speculative; 10: baseline
             'nodes': nodes,
             'workers': workers_per_node,
             'rate': 10_000,
