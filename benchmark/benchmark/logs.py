@@ -33,8 +33,7 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_samples \
-            = zip(*results)
+        self.size, self.rate, self.start, misses, self.sent_samples = zip(*results)
         self.misses = sum(misses)
 
         self.all_sent_samples = {}
@@ -58,6 +57,7 @@ class LogParser:
             fissure_attacks,
             sluggish_attacks,
             speculative_attacks,
+            header_to_batches_list,
         ) = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
@@ -75,8 +75,10 @@ class LogParser:
             [x.items() for x in speculative_attacks]
         )
 
+        # Merge header_to_batches from all primaries
+        self.header_to_batches = self._merge_header_to_batches(header_to_batches_list)
+
         # batch_digest -> (round, short_author) from Committed logs
-        # short_author is like "8g4Oeq1VFCmKe4M3"
         self.batch_to_header = {}
         for d in batch_to_header:
             self.batch_to_header.update(d)
@@ -87,15 +89,30 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips, finalization_events, subdag_to_headers = zip(*results)
+        (
+            sizes,
+            self.received_samples,
+            workers_ips,
+            finalization_events,
+            subdag_to_headers,
+            batch_to_txs_list,
+            tx_exec_rank_list,
+        ) = zip(*results)
+        
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
+        # Merge batch_to_txs from all workers
+        self.batch_to_txs = self._merge_dict_of_lists(batch_to_txs_list)
+        
+        # Merge tx_exec_rank from all workers (only worker_id=0 has these)
+        # This also validates consistency across non-empty workers
+        self.tx_exec_rank = self._merge_tx_exec_rank(tx_exec_rank_list)
+
         self.finalization_events = self._merge_results([x.items() for x in finalization_events])
 
-        # sub_dag_id -> set of (round, full_author) from "Received sub-dag" logs
-        # full_author is like "8g4Oeq1VFCmKe4M36+1OjATqofUl9iksjrJ4IQmgr5g="
+        # sub_dag_id -> set of (round, full_author)
         self.subdag_to_headers = {}
         for d in subdag_to_headers:
             for sub_dag_id, headers_set in d.items():
@@ -125,36 +142,95 @@ class LogParser:
         merged = {}
         for x in input:
             for k, v in x:
-                if not k in merged or merged[k] > v:
+                if k not in merged or merged[k] > v:
                     merged[k] = v
         return merged
-    
-    # merged[block] = committing_height
+
     def _merge_blocks_to_heights(self, input):
         merged = {}
         for x in input:
             for block, height in x:
-                if not height in merged:
+                if block not in merged:
                     merged[block] = int(height)
         return merged
 
-    # merged[victim_header] = attacking_header
+    def _merge_header_to_batches(self, dicts):
+        """Merge header_to_batches from multiple primaries."""
+        merged = defaultdict(set)
+        for d in dicts:
+            for h, batches in d.items():
+                merged[h].update(batches)
+        return {h: list(bs) for h, bs in merged.items()}
+
     def _merge_monitor(self, input):
         merged = {}
         for x in input:
             for victim_header, attack_header in x:
-                if not victim_header in merged:
+                if victim_header not in merged:
                     merged[victim_header] = attack_header
         return merged
 
-    # merged[victim_header] = attacking_header
     def _merge_frontrun_attack(self, input):
         merged = {}
         for x in input:
             for victim_header, attack_header in x:
-                if not victim_header in merged:
+                if victim_header not in merged:
                     merged[victim_header] = attack_header
         return merged
+
+    def _merge_dict_of_lists(self, dicts):
+        """Merge dictionaries where values are lists."""
+        merged = defaultdict(set)
+        for d in dicts:
+            for k, vals in d.items():
+                merged[k].update(vals)
+        return {k: list(v) for k, v in merged.items()}
+
+    def _merge_tx_exec_rank(self, dicts):
+        """
+        Merge tx execution ranks from multiple workers.
+        Only worker_id=0 on each node runs GlobalOrder.
+        Validates that all non-empty workers agree on ordering (up to prefix).
+        """
+        # Filter out empty dicts (faulty nodes don't output anything)
+        non_empty = [d for d in dicts if len(d) > 0]
+        self._workers_with_exec_data = len(non_empty)
+        
+        # Validate: all non-empty workers must agree on relative order
+        self.exec_order_consistent = True
+        self.exec_order_violations = 0
+        
+        if len(non_empty) >= 2:
+            # Get ordered tx list from each worker (sorted by rank)
+            orderings = []
+            for d in non_empty:
+                ordered = sorted(d.keys(), key=lambda tx: d[tx])
+                orderings.append(ordered)
+            
+            # Check pairwise: for any two txs in common, relative order must match
+            reference = non_empty[0]
+            for i, other in enumerate(non_empty[1:], 1):
+                for tx_a in reference:
+                    if tx_a not in other:
+                        continue
+                    for tx_b in reference:
+                        if tx_b not in other or tx_a == tx_b:
+                            continue
+                        # Both txs in both workers - check relative order
+                        ref_order = reference[tx_a] < reference[tx_b]
+                        other_order = other[tx_a] < other[tx_b]
+                        if ref_order != other_order:
+                            self.exec_order_violations += 1
+                            self.exec_order_consistent = False
+            
+            if not self.exec_order_consistent:
+                Print.warn(f"EXECUTION ORDER INCONSISTENT: {self.exec_order_violations} ordering violations across workers!")
+        
+        # Merge: return the longest one (most complete data)
+        if non_empty:
+            longest = max(non_empty, key=len)
+            return dict(longest)
+        return {}
 
     def _parse_clients(self, log):
         if search(r"(?:panicked|Error)", log) is not None:
@@ -186,99 +262,89 @@ class LogParser:
         commits = self._merge_results([tmp])
 
         # Parse batch_digest -> (round, short_author) from Committed logs
-        # Format: "Committed B{round}({short_author}) -> {batch_digest}"
-        # Example: "Committed B1(7jv81x0Age2f+E6q) -> CKWkjWdfoadusvEfcNlgDG+FwG8hT3d2GWozD8tUrUw="
         batch_to_header = {}
         tmp_full = findall(r'Committed B(\d+)\(([^\)]+)\) -> ([^ \n]+)', log)
         for round_str, short_author, batch_digest in tmp_full:
             round_num = int(round_str)
             batch_to_header[batch_digest] = (round_num, short_author.strip())
 
-        # record the committing heights of certificates (blocks)
+        # Record committing heights of certificates (blocks)
         tmp = findall(r"\[(.*Z) .* FairDag Committed ([^ ]+) in height (\d+)", log)
         tmp = [(header, height) for t, header, height in tmp]
         blocks_to_heights = self._merge_blocks_to_heights([tmp])
 
-        # (for comparison) test the successful rate of front-running without attacking strategies
+        # Build header_to_batches by correlating "Committed B..." with "FairDag Committed..."
+        # The Rust code logs these in sequence for each batch in a header
+        header_to_batches = defaultdict(list)
+        lines = log.splitlines()
+
+        for i, line in enumerate(lines):
+            m = search(r'Committed B\d+\([^\)]+\) -> ([^ \n]+)', line)
+            if not m:
+                continue
+            batch_digest = m.group(1).strip()
+
+            # Look ahead 1-3 lines for the FairDag Committed line
+            for j in range(i + 1, min(i + 4, len(lines))):
+                m2 = search(r'FairDag Committed ([^ ]+) in height (\d+)', lines[j])
+                if m2:
+                    header_id = m2.group(1).strip()
+                    header_to_batches[header_id].append(batch_digest)
+                    break
+
+        # Parse attack data
         tmp = findall(
             r"\[(.*Z) .* FairDag Monitor attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
             log,
         )
-        tmp = [
-            (victim_header, attack_header)
-            for t, attack_header, victim_header, round in tmp
-        ]
+        tmp = [(victim_header, attack_header) for t, attack_header, victim_header, round in tmp]
         monitor_attacks = self._merge_monitor([tmp])
 
         tmp = findall(
             r"\[(.*Z) .* FairDag Created a fissure attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
             log,
         )
-        tmp = [
-            (victim_header, attack_header)
-            for t, attack_header, victim_header, round in tmp
-        ]
+        tmp = [(victim_header, attack_header) for t, attack_header, victim_header, round in tmp]
         fissure_attacks = self._merge_frontrun_attack([tmp])
 
         tmp = findall(
             r"\[(.*Z) .* FairDag Created a sluggish attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
             log,
         )
-        tmp = [
-            (victim_header, attack_header)
-            for t, attack_header, victim_header, round in tmp
-        ]
+        tmp = [(victim_header, attack_header) for t, attack_header, victim_header, round in tmp]
         sluggish_attacks = self._merge_frontrun_attack([tmp])
 
-        # test the effectiveness of speculative front-running attack
         tmp = findall(
             r"\[(.*Z) .* FairDag Created a speculative attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
             log,
         )
-        tmp = [
-            (victim_header, attack_header)
-            for t, attack_header, victim_header, round in tmp
-        ]
+        tmp = [(victim_header, attack_header) for t, attack_header, victim_header, round in tmp]
         speculative_attacks = self._merge_frontrun_attack([tmp])
-        # print("speculative_attacks is ", speculative_attacks)
 
         configs = {
-            'header_size': int(
-                search(r'Header size .* (\d+)', log).group(1)
-            ),
-            'max_header_delay': int(
-                search(r'Max header delay .* (\d+)', log).group(1)
-            ),
-            'gc_depth': int(
-                search(r'Garbage collection depth .* (\d+)', log).group(1)
-            ),
-            'sync_retry_delay': int(
-                search(r'Sync retry delay .* (\d+)', log).group(1)
-            ),
-            'sync_retry_nodes': int(
-                search(r'Sync retry nodes .* (\d+)', log).group(1)
-            ),
-            'batch_size': int(
-                search(r'Batch size .* (\d+)', log).group(1)
-            ),
-            'max_batch_delay': int(
-                search(r'Max batch delay .* (\d+)', log).group(1)
-            ),
+            'header_size': int(search(r'Header size .* (\d+)', log).group(1)),
+            'max_header_delay': int(search(r'Max header delay .* (\d+)', log).group(1)),
+            'gc_depth': int(search(r'Garbage collection depth .* (\d+)', log).group(1)),
+            'sync_retry_delay': int(search(r'Sync retry delay .* (\d+)', log).group(1)),
+            'sync_retry_nodes': int(search(r'Sync retry nodes .* (\d+)', log).group(1)),
+            'batch_size': int(search(r'Batch size .* (\d+)', log).group(1)),
+            'max_batch_delay': int(search(r'Max batch delay .* (\d+)', log).group(1)),
         }
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
         return (
-            proposals, 
-            commits, 
-            configs, 
-            ip, 
+            proposals,
+            commits,
+            configs,
+            ip,
             batch_to_header,
             blocks_to_heights,
             monitor_attacks,
             fissure_attacks,
             sluggish_attacks,
             speculative_attacks,
+            dict(header_to_batches),
         )
 
     def _parse_workers(self, log):
@@ -291,6 +357,13 @@ class LogParser:
         tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
         samples = {int(s): d for d, s in tmp}
 
+        # Parse batch -> tx_digests mapping (from batch_maker.rs)
+        # Log format: "Batch <batch_digest> contains tx <tx_digest>"
+        batch_to_txs = defaultdict(list)
+        tmp = findall(r'Batch ([^ ]+) contains tx ([^ \n]+)', log)
+        for batch, tx in tmp:
+            batch_to_txs[batch.strip()].append(tx.strip())
+
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
         tmp = findall(r'\[(.*Z) .* sub_dag_id=(\d+): FINALIZED! (\d+) transactions', log)
@@ -299,74 +372,65 @@ class LogParser:
             for t, sub_dag_id, count in tmp
         }
 
+        # Parse tx execution order (from global_order.rs)
+        # Log format: "Executed <tx_digest>"
+        # The rank is determined by the order of appearance in the log
+        tx_exec_rank = {}
+        rank = 0
+        for line in log.splitlines():
+            m = search(r'Executed ([^ \n]+)', line)
+            if m:
+                tx = m.group(1).strip()
+                # Keep earliest rank if tx appears multiple times (shouldn't happen)
+                if tx not in tx_exec_rank:
+                    tx_exec_rank[tx] = rank
+                rank += 1
+
         # Parse sub_dag_id -> (round, full_author) from "Received sub-dag" logs
-        # Format: "Received sub-dag : [(1, [author1, author2, ...]), (2, [...]), ...]"
-        # Example: "Received sub-dag : [(1, [7jv81x0Age2f+E6qtC2NV5PvHPK8H0EByZWkSXAU+8I=, ...]), ...]"
         subdag_to_headers = {}
-        
-        # Find all sub-dag logs and extract the sub_dag_id from the context
-        # We need to correlate "Received sub-dag" with the sub_dag_id from subsequent logs
-        # Strategy: Parse sub_dag_id from "SUBDAG STRUCTURE: sub_dag_id=X" which follows "Received sub-dag"
-        
-        # First, find all "Received sub-dag" entries
-        subdag_matches = findall(
-            r'Received sub-dag : \[(.*?)\](?=\s*\n)',
-            log,
-            flags=0
-        )
-        
-        # Find sub_dag_id assignments from "SUBDAG STRUCTURE" logs
-        structure_matches = findall(
-            r'SUBDAG STRUCTURE: sub_dag_id=(\d+)',
-            log
-        )
-        
-        # Parse the full sub-dag content with sub_dag_id
-        # Better approach: find lines with both "Received sub-dag" content and correlate with structure
         all_lines = log.split('\n')
         current_subdag_content = None
-        
+
         for i, line in enumerate(all_lines):
             if 'Received sub-dag : [' in line:
-                # Extract the content between [ and ]
                 start_idx = line.find('Received sub-dag : [') + len('Received sub-dag : [')
-                # Handle multi-line or find the closing bracket
                 content = line[start_idx:]
                 if content.endswith(']'):
                     content = content[:-1]
                 current_subdag_content = content
-                
+
             elif 'SUBDAG STRUCTURE: sub_dag_id=' in line and current_subdag_content:
-                # Extract sub_dag_id
                 match = search(r'sub_dag_id=(\d+)', line)
                 if match:
                     sub_dag_id = int(match.group(1))
                     headers_set = set()
-                    
-                    # Parse the content: (round, [author1, author2, ...]), ...
-                    # Use regex to find each (round, [authors]) pair
+
                     round_matches = findall(r'\((\d+), \[([^\]]*)\]\)', current_subdag_content)
-                    
                     for round_str, authors_str in round_matches:
                         round_num = int(round_str)
                         if authors_str.strip():
-                            # Split authors by comma, handling base64 which contains + and /
-                            # Authors are comma-space separated
                             authors = [a.strip() for a in authors_str.split(', ') if a.strip()]
                             for full_author in authors:
                                 headers_set.add((round_num, full_author))
-                    
+
                     subdag_to_headers[sub_dag_id] = headers_set
                     current_subdag_content = None
 
-        return sizes, samples, ip, finalization_events, subdag_to_headers
+        return (
+            sizes,
+            samples,
+            ip,
+            finalization_events,
+            subdag_to_headers,
+            dict(batch_to_txs),
+            tx_exec_rank,
+        )
 
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
         return datetime.timestamp(x)
-    
+
     def _attack_monitor_results(self):
-        # attack_num = len(self.monitor_attacks)
         attack_num = 0
         succ_num = 0
         for victim_header, attacking_header in self.monitor_attacks.items():
@@ -374,18 +438,12 @@ class LogParser:
                 victim_header in self.blocks_to_heights
                 and attacking_header in self.blocks_to_heights
             ):
-                # only consider both the victim and attacking blocks are committed
                 attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
+                if self.blocks_to_heights[victim_header] > self.blocks_to_heights[attacking_header]:
                     succ_num += 1
         return succ_num, attack_num
 
     def _fissure_attack_results(self):
-        # attack_num = len(self.fissure_attacks)
         attack_num = 0
         succ_num = 0
         for victim_header, attacking_header in self.fissure_attacks.items():
@@ -394,16 +452,11 @@ class LogParser:
                 and attacking_header in self.blocks_to_heights
             ):
                 attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
+                if self.blocks_to_heights[victim_header] > self.blocks_to_heights[attacking_header]:
                     succ_num += 1
         return succ_num, attack_num
 
     def _sluggish_attack_results(self):
-        # attack_num = len(self.sluggish_attacks)
         attack_num = 0
         succ_num = 0
         for victim_header, attacking_header in self.sluggish_attacks.items():
@@ -412,16 +465,11 @@ class LogParser:
                 and attacking_header in self.blocks_to_heights
             ):
                 attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
+                if self.blocks_to_heights[victim_header] > self.blocks_to_heights[attacking_header]:
                     succ_num += 1
         return succ_num, attack_num
 
     def _speculative_attack_results(self):
-        # attack_num = len(self.speculative_attacks)
         attack_num = 0
         succ_num = 0
         for victim_header, attacking_header in self.speculative_attacks.items():
@@ -430,13 +478,70 @@ class LogParser:
                 and attacking_header in self.blocks_to_heights
             ):
                 attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
+                if self.blocks_to_heights[victim_header] > self.blocks_to_heights[attacking_header]:
                     succ_num += 1
         return succ_num, attack_num
+
+    def _is_frontrun_successful(self, victim_txs, attacker_txs):
+        """
+        Check if frontrunning was successful.
+        Success = any attacker tx executed before any victim tx.
+        """
+        for a in attacker_txs:
+            ra = self.tx_exec_rank.get(a)
+            if ra is None:
+                continue  # Attacker tx not found in execution log
+            for v in victim_txs:
+                rv = self.tx_exec_rank.get(v)
+                if rv is None:
+                    # Victim tx never executed => attacker wins
+                    return True
+                if ra < rv:
+                    # Attacker executed before victim => success
+                    return True
+        return False
+
+    def _transaction_frontrun_results(self):
+        """
+        Calculate transaction-level front-running success rate.
+        
+        For each attack pair (victim_header, attacker_header):
+        1. Get all batches in each header
+        2. Get all tx_digests in those batches
+        3. Check if any attacker tx executed before any victim tx
+        """
+        # Use whichever attack type is present
+        attacks = (
+            self.monitor_attacks
+            or self.fissure_attacks
+            or self.sluggish_attacks
+            or self.speculative_attacks
+            or {}
+        )
+
+        succ = 0
+        total = 0
+
+        for victim_h, attacker_h in attacks.items():
+            # Get batches for each header
+            vb = self.header_to_batches.get(victim_h)
+            ab = self.header_to_batches.get(attacker_h)
+            
+            if not vb or not ab:
+                continue  # Can't analyze if we don't have batch mapping
+
+            # Get all tx_digests in those batches
+            victim_txs = [tx for b in vb for tx in self.batch_to_txs.get(b, [])]
+            attacker_txs = [tx for b in ab for tx in self.batch_to_txs.get(b, [])]
+
+            if not victim_txs or not attacker_txs:
+                continue  # Can't analyze without tx mappings
+
+            total += 1
+            if self._is_frontrun_successful(victim_txs, attacker_txs):
+                succ += 1
+
+        return succ, total
 
     def _consensus_throughput(self):
         if not self.commits:
@@ -473,7 +578,7 @@ class LogParser:
 
     def _end_to_end_latency(self):
         latency = []
-        
+
         def find_subdag_for_header(round_num, short_author):
             for (r, full_author), sub_dag_id in header_to_subdag.items():
                 if r == round_num and full_author.startswith(short_author):
@@ -494,37 +599,29 @@ class LogParser:
             min_latency = None
 
             for batch_digest in batch_digests:
-                # Step 1: Get commit time for this batch
                 commit_time = self.commits.get(batch_digest)
                 if commit_time is None:
                     continue
-                
-                # Step 2: Get header info
+
                 header = self.batch_to_header.get(batch_digest)
                 if header is None:
                     continue
-                
-                round_num, short_author = header
 
-                # Step 3: Find sub_dag
+                round_num, short_author = header
                 sub_dag_id = find_subdag_for_header(round_num, short_author)
                 if sub_dag_id is None:
                     continue
 
-                # Step 4: Get finalization time
                 finalization_data = self.finalization_events.get(sub_dag_id)
                 if finalization_data is None:
                     continue
 
                 finalization_time, _ = finalization_data
-                
-                # SANITY CHECK: finalization MUST be >= commit
-                # If not, this is a bad match - skip it
+
                 if finalization_time < commit_time:
                     continue
-                
-                lat = finalization_time - send_time
 
+                lat = finalization_time - send_time
                 if lat > 0:
                     min_latency = min(min_latency, lat) if min_latency else lat
 
@@ -534,9 +631,6 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def _end_to_end_latency_commit_based(self):
-        """
-        Original commit-based latency calculation (kept for comparison).
-        """
         latency = []
         for tx_id, batches_ids in self.all_received_samples.items():
             min_time = None
@@ -572,20 +666,41 @@ class LogParser:
         end_to_end_latency = self._end_to_end_latency() * 1_000
         end_to_end_latency_commit = self._end_to_end_latency_commit_based() * 1_000
 
-        # attacking caculation
-        attack_print = f""
+        # Attack calculation (header-level)
+        attack_print = ""
         monitor_succ_num, monitor_total = self._attack_monitor_results()
         fissure_succ_num, fissure_total = self._fissure_attack_results()
         sluggish_succ_num, sluggish_total = self._sluggish_attack_results()
         speculative_succ_num, speculative_total = self._speculative_attack_results()
-        if monitor_total != 0:  # no front-running attack
+        
+        if monitor_total != 0:
             attack_print = f"Baseline front-running rate: {round(monitor_succ_num/monitor_total*100, 2):,}% ({monitor_succ_num:,}/{monitor_total:,})"
-        elif fissure_total != 0:  # fissure front-running attack
+        elif fissure_total != 0:
             attack_print = f"Fissure front-running rate: {round(fissure_succ_num/fissure_total*100, 2):,}% ({fissure_succ_num:,}/{fissure_total:,})"
-        elif sluggish_total != 0:  # sluggish front-running attack
+        elif sluggish_total != 0:
             attack_print = f"Sluggish front-running rate: {round(sluggish_succ_num/sluggish_total*100, 2):,}% ({sluggish_succ_num:,}/{sluggish_total:,})"
-        elif speculative_total != 0:  # speculative front-running attack
+        elif speculative_total != 0:
             attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
+
+        # Transaction-level front-running calculation
+        tx_succ, tx_total = self._transaction_frontrun_results()
+        tx_rate = round(tx_succ / tx_total * 100, 2) if tx_total else 0
+
+        # Debug stats to help diagnose 0/0 issues
+        debug_stats = (
+            f" Debug: header_to_batches={len(self.header_to_batches)} headers, "
+            f"batch_to_txs={len(self.batch_to_txs)} batches, "
+            f"tx_exec_rank={len(self.tx_exec_rank)} txs"
+        )
+        
+        # Execution order consistency report
+        exec_order_status = "✓ CONSISTENT" if self.exec_order_consistent else f"✗ {self.exec_order_violations} VIOLATIONS"
+        
+        exec_order_report = (
+            f" Execution order validation:\n"
+            f"   Workers with data: {self._workers_with_exec_data}\n"
+            f"   Order consistency: {exec_order_status}"
+        )
 
         return (
             '\n'
@@ -619,9 +734,13 @@ class LogParser:
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms\n'
             f' End-to-end latency (commit-based): {round(end_to_end_latency_commit):,} ms\n'
-            "\n"
-            " + ATTACK:\n"
-            f" {attack_print} \n"
+            '\n'
+            ' + ATTACK:\n'
+            f' {attack_print}\n'
+            f' Transaction front-running rate: {tx_rate}% ({tx_succ}/{tx_total})\n'
+            '\n'
+            f'{exec_order_report}\n'
+            f'{debug_stats}\n'
             '-----------------------------------------\n'
         )
 

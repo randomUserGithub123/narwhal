@@ -42,7 +42,8 @@ pub struct BatchMaker {
     /// Our OF_Worker address
     of_worker_address: SocketAddr,
 
-    our_public_key: PublicKey
+    our_public_key: PublicKey,
+    current_tx_digests: Vec<Digest>,
     
 }
 
@@ -67,7 +68,8 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 of_worker_address,
-                our_public_key
+                our_public_key,
+                current_tx_digests: Vec::new(),
             }
             .run()
             .await;
@@ -92,6 +94,7 @@ impl BatchMaker {
                             .try_into()
                             .expect("Sha512 output must be at least 32 bytes"),
                     );
+                    self.current_tx_digests.push(tx_digest.clone());
                     let message = WorkerMessage::TxDigest(tx_digest);
                     let serialized = bincode::serialize(&message)
                         .expect("Failed to serialize our own tx digest");
@@ -146,6 +149,7 @@ impl BatchMaker {
                 .unwrap(),
         );
 
+        let batch_tx_digests = &self.current_tx_digests;
         #[cfg(feature = "benchmark")]
         {
 
@@ -158,9 +162,14 @@ impl BatchMaker {
                 );
             }
 
+            for tx_digest in batch_tx_digests {
+                info!("Batch {:?} contains tx {:?}", digest, tx_digest);
+            }
+
             // NOTE: This log entry is used to compute performance.
             info!("Batch {:?} contains {} B", digest, size);
         }
+        self.current_tx_digests.clear();
 
         // Broadcast the batch through the network.
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();

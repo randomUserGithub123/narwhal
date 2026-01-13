@@ -892,11 +892,9 @@ impl GlobalOrder {
                 skipped_count
             );
             
-            // // TODO: Send output_digests to your output channel
-            // // For now, log each one
-            // for (i, digest) in output_digests.iter().enumerate() {
-            //     log::info!("  [{}] FINALIZED TX: {:?}", i, digest);
-            // }
+            for digest in output_digests.iter() {
+                log::info!("Executed {:?}", digest);
+            }
             
             // Mark as Finalized (3)
             self.store.write(Self::subdag_state_key(sub_dag_id), vec![3]).await;
