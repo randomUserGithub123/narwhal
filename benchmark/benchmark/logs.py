@@ -15,12 +15,14 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, faults=0):
+    def __init__(self, clients, primaries, workers, attack_type=10, arbitragers=1, faults=0):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
         assert all(x for x in inputs)
 
+        self.attack_type = attack_type
+        self.arbitragers = arbitragers
         self.faults = faults
         self.committee_size = len(primaries)
         self.workers = len(workers) // len(primaries)
@@ -45,9 +47,33 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, self.configs, primary_ips, batch_to_header = zip(*results)
+        (
+            proposals,
+            commits,
+            self.configs,
+            primary_ips,
+            batch_to_header,
+            blocks_to_heights,
+            monitor_attacks,
+            fissure_attacks,
+            sluggish_attacks,
+            speculative_attacks,
+        ) = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
+        self.blocks_to_heights = self._merge_blocks_to_heights(
+            [x.items() for x in blocks_to_heights]
+        )
+        self.monitor_attacks = self._merge_monitor([x.items() for x in monitor_attacks])
+        self.fissure_attacks = self._merge_frontrun_attack(
+            [x.items() for x in fissure_attacks]
+        )
+        self.sluggish_attacks = self._merge_frontrun_attack(
+            [x.items() for x in sluggish_attacks]
+        )
+        self.speculative_attacks = self._merge_frontrun_attack(
+            [x.items() for x in speculative_attacks]
+        )
 
         # batch_digest -> (round, short_author) from Committed logs
         # short_author is like "8g4Oeq1VFCmKe4M3"
@@ -102,6 +128,33 @@ class LogParser:
                 if not k in merged or merged[k] > v:
                     merged[k] = v
         return merged
+    
+    # merged[block] = committing_height
+    def _merge_blocks_to_heights(self, input):
+        merged = {}
+        for x in input:
+            for block, height in x:
+                if not height in merged:
+                    merged[block] = int(height)
+        return merged
+
+    # merged[victim_header] = attacking_header
+    def _merge_monitor(self, input):
+        merged = {}
+        for x in input:
+            for victim_header, attack_header in x:
+                if not victim_header in merged:
+                    merged[victim_header] = attack_header
+        return merged
+
+    # merged[victim_header] = attacking_header
+    def _merge_frontrun_attack(self, input):
+        merged = {}
+        for x in input:
+            for victim_header, attack_header in x:
+                if not victim_header in merged:
+                    merged[victim_header] = attack_header
+        return merged
 
     def _parse_clients(self, log):
         if search(r"(?:panicked|Error)", log) is not None:
@@ -141,6 +194,54 @@ class LogParser:
             round_num = int(round_str)
             batch_to_header[batch_digest] = (round_num, short_author.strip())
 
+        # record the committing heights of certificates (blocks)
+        tmp = findall(r"\[(.*Z) .* FairDag Committed ([^ ]+) in height (\d+)", log)
+        tmp = [(header, height) for t, header, height in tmp]
+        blocks_to_heights = self._merge_blocks_to_heights([tmp])
+
+        # (for comparison) test the successful rate of front-running without attacking strategies
+        tmp = findall(
+            r"\[(.*Z) .* FairDag Monitor attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
+            log,
+        )
+        tmp = [
+            (victim_header, attack_header)
+            for t, attack_header, victim_header, round in tmp
+        ]
+        monitor_attacks = self._merge_monitor([tmp])
+
+        tmp = findall(
+            r"\[(.*Z) .* FairDag Created a fissure attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
+            log,
+        )
+        tmp = [
+            (victim_header, attack_header)
+            for t, attack_header, victim_header, round in tmp
+        ]
+        fissure_attacks = self._merge_frontrun_attack([tmp])
+
+        tmp = findall(
+            r"\[(.*Z) .* FairDag Created a sluggish attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
+            log,
+        )
+        tmp = [
+            (victim_header, attack_header)
+            for t, attack_header, victim_header, round in tmp
+        ]
+        sluggish_attacks = self._merge_frontrun_attack([tmp])
+
+        # test the effectiveness of speculative front-running attack
+        tmp = findall(
+            r"\[(.*Z) .* FairDag Created a speculative attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
+            log,
+        )
+        tmp = [
+            (victim_header, attack_header)
+            for t, attack_header, victim_header, round in tmp
+        ]
+        speculative_attacks = self._merge_frontrun_attack([tmp])
+        # print("speculative_attacks is ", speculative_attacks)
+
         configs = {
             'header_size': int(
                 search(r'Header size .* (\d+)', log).group(1)
@@ -167,7 +268,18 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
-        return proposals, commits, configs, ip, batch_to_header
+        return (
+            proposals, 
+            commits, 
+            configs, 
+            ip, 
+            batch_to_header,
+            blocks_to_heights,
+            monitor_attacks,
+            fissure_attacks,
+            sluggish_attacks,
+            speculative_attacks,
+        )
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -252,6 +364,79 @@ class LogParser:
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
         return datetime.timestamp(x)
+    
+    def _attack_monitor_results(self):
+        # attack_num = len(self.monitor_attacks)
+        attack_num = 0
+        succ_num = 0
+        for victim_header, attacking_header in self.monitor_attacks.items():
+            if (
+                victim_header in self.blocks_to_heights
+                and attacking_header in self.blocks_to_heights
+            ):
+                # only consider both the victim and attacking blocks are committed
+                attack_num += 1
+                if (
+                    self.blocks_to_heights[victim_header]
+                    > self.blocks_to_heights[attacking_header]
+                ):
+                    # attacking successfully
+                    succ_num += 1
+        return succ_num, attack_num
+
+    def _fissure_attack_results(self):
+        # attack_num = len(self.fissure_attacks)
+        attack_num = 0
+        succ_num = 0
+        for victim_header, attacking_header in self.fissure_attacks.items():
+            if (
+                victim_header in self.blocks_to_heights
+                and attacking_header in self.blocks_to_heights
+            ):
+                attack_num += 1
+                if (
+                    self.blocks_to_heights[victim_header]
+                    > self.blocks_to_heights[attacking_header]
+                ):
+                    # attacking successfully
+                    succ_num += 1
+        return succ_num, attack_num
+
+    def _sluggish_attack_results(self):
+        # attack_num = len(self.sluggish_attacks)
+        attack_num = 0
+        succ_num = 0
+        for victim_header, attacking_header in self.sluggish_attacks.items():
+            if (
+                victim_header in self.blocks_to_heights
+                and attacking_header in self.blocks_to_heights
+            ):
+                attack_num += 1
+                if (
+                    self.blocks_to_heights[victim_header]
+                    > self.blocks_to_heights[attacking_header]
+                ):
+                    # attacking successfully
+                    succ_num += 1
+        return succ_num, attack_num
+
+    def _speculative_attack_results(self):
+        # attack_num = len(self.speculative_attacks)
+        attack_num = 0
+        succ_num = 0
+        for victim_header, attacking_header in self.speculative_attacks.items():
+            if (
+                victim_header in self.blocks_to_heights
+                and attacking_header in self.blocks_to_heights
+            ):
+                attack_num += 1
+                if (
+                    self.blocks_to_heights[victim_header]
+                    > self.blocks_to_heights[attacking_header]
+                ):
+                    # attacking successfully
+                    succ_num += 1
+        return succ_num, attack_num
 
     def _consensus_throughput(self):
         if not self.commits:
@@ -387,6 +572,21 @@ class LogParser:
         end_to_end_latency = self._end_to_end_latency() * 1_000
         end_to_end_latency_commit = self._end_to_end_latency_commit_based() * 1_000
 
+        # attacking caculation
+        attack_print = f""
+        monitor_succ_num, monitor_total = self._attack_monitor_results()
+        fissure_succ_num, fissure_total = self._fissure_attack_results()
+        sluggish_succ_num, sluggish_total = self._sluggish_attack_results()
+        speculative_succ_num, speculative_total = self._speculative_attack_results()
+        if monitor_total != 0:  # no front-running attack
+            attack_print = f"Baseline front-running rate: {round(monitor_succ_num/monitor_total*100, 2):,}% ({monitor_succ_num:,}/{monitor_total:,})"
+        elif fissure_total != 0:  # fissure front-running attack
+            attack_print = f"Fissure front-running rate: {round(fissure_succ_num/fissure_total*100, 2):,}% ({fissure_succ_num:,}/{fissure_total:,})"
+        elif sluggish_total != 0:  # sluggish front-running attack
+            attack_print = f"Sluggish front-running rate: {round(sluggish_succ_num/sluggish_total*100, 2):,}% ({sluggish_succ_num:,}/{sluggish_total:,})"
+        elif speculative_total != 0:  # speculative front-running attack
+            attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
+
         return (
             '\n'
             '-----------------------------------------\n'
@@ -419,6 +619,9 @@ class LogParser:
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms\n'
             f' End-to-end latency (commit-based): {round(end_to_end_latency_commit):,} ms\n'
+            "\n"
+            " + ATTACK:\n"
+            f" {attack_print} \n"
             '-----------------------------------------\n'
         )
 
@@ -428,7 +631,7 @@ class LogParser:
             f.write(self.result())
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, attack_type=10, arbitragers=1, faults=0):
         assert isinstance(directory, str)
 
         clients = []

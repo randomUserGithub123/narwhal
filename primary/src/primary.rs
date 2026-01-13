@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::certificate_waiter::CertificateWaiter;
+use crate::attacks::{Attacker, SPECULATIVE_MAX_TRIES};
 use crate::core::Core;
 use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
@@ -85,6 +86,10 @@ impl Primary {
         // Re-injection
         let (tx_committed_own_headers, rx_committed_own_headers) = channel(CHANNEL_CAPACITY);
 
+        // for speculative front-running attack
+        let (tx_monitor_header, rx_monitor_header) = channel(CHANNEL_CAPACITY);
+        let (tx_clean_certificate, rx_clean_certificate) = channel(CHANNEL_CAPACITY);
+
         let (tx_header_arrival, rx_header_arrival) = channel(CHANNEL_CAPACITY);
 
         // Write the parameters to the logs.
@@ -93,6 +98,9 @@ impl Primary {
         // Parse the public and secret key of this authority.
         let name = keypair.name;
         let secret = keypair.secret;
+
+        // Attacking parameters
+        let attacker = Attacker::new(committee.clone(), committee.attack_type(&name), SPECULATIVE_MAX_TRIES);
 
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
         // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
@@ -162,13 +170,15 @@ impl Primary {
             /* rx_header_waiter */ rx_headers_loopback,
             /* rx_certificate_waiter */ rx_certificates_loopback,
             /* rx_proposer */ rx_headers,
+            tx_monitor_header,
             tx_consensus,
             /* tx_proposer */ tx_parents,
-            tx_header_arrival
+            tx_header_arrival,
+            attacker.clone()
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(name, &committee, consensus_round.clone(), rx_consensus, tx_committed_own_headers, rx_header_arrival);
+        GarbageCollector::spawn(name, &committee, consensus_round.clone(), rx_consensus, tx_committed_own_headers, rx_header_arrival, tx_clean_certificate);
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
@@ -207,7 +217,10 @@ impl Primary {
             /* rx_core */ rx_parents,
             /* rx_workers */ rx_our_digests,
             /* tx_core */ tx_headers,
-            rx_committed_own_headers
+            rx_committed_own_headers,
+            /* rx_clean_certificate */ rx_clean_certificate,
+            rx_monitor_header,
+            /* attack_type*/ attacker.clone(),
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.

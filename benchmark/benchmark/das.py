@@ -96,6 +96,8 @@ class DASBench:
         try:
             Print.info("Setting up testbed...")
             nodes, rate = self.nodes[0], self.rate[0]
+            arbitragers = self.arbitragers
+            attack_type = self.attack_type
 
             # Cleanup all files.
             cmd = f"{CommandMaker.clean_logs()} ; {CommandMaker.cleanup(self.username)}"
@@ -140,6 +142,8 @@ class DASBench:
                 self.BASE_PORT,
                 self.workers,
                 self.faults,
+                arbitragers,
+                attack_type,
                 nodes_hostnames
             )
             committee.print(PathMaker.committee_file())
@@ -209,9 +213,8 @@ class DASBench:
                 self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
             # Run the primaries.
-            faulty_node_ids = sample(
-                list(range(0, nodes)),
-                self.faults
+            faulty_node_ids = committee.get_byzantine_nodes(
+                f=self.faults
             )
             for i, address in enumerate(committee.primary_addresses()):
                 cmd = CommandMaker.run_primary(
@@ -257,6 +260,8 @@ class DASBench:
             Print.info("Parsing logs...")
             log_values =  LogParser.process(
                 PathMaker.logs_path(),
+                attack_type=attack_type,
+                arbitragers=arbitragers,
                 faults=self.faults,
             )
 

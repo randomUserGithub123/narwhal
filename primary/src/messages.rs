@@ -73,6 +73,11 @@ impl Header {
             .verify(&self.id, &self.author)
             .map_err(DagError::from)
     }
+
+    pub fn update(&mut self, header: Header) {
+        *self = header;
+    }
+
 }
 
 impl Hash for Header {
@@ -233,6 +238,20 @@ impl Certificate {
     pub fn origin(&self) -> PublicKey {
         self.header.author
     }
+
+    pub fn header_id(&self) -> Digest {
+        self.header.id.clone()
+    }
+
+    pub fn update(&mut self, certificate: Certificate) {
+        self.header = certificate.header;
+        self.votes.clone_from_slice(&certificate.votes);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Certificate::default()
+    }
+
 }
 
 impl Hash for Certificate {

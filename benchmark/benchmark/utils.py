@@ -69,18 +69,18 @@ class PathMaker:
     
     @staticmethod
     def local_result_file(
-        faults, workers, nodes
+        attack_type, arbitragers, faults, workers, nodes
     ):
         return join(
             PathMaker.results_path(),
-            f"local-{faults}-{workers}-{nodes}.txt",
+            f"local-{attack_type}-{arbitragers}-{faults}-{workers}-{nodes}.txt",
         )
 
     @staticmethod
-    def result_file(faults, nodes, workers, collocate, rate, tx_size):
+    def result_file(attack_type, arbitragers, faults, workers, nodes):
         return join(
             PathMaker.results_path(),
-            f'bench-{faults}-{nodes}-{workers}-{collocate}-{rate}-{tx_size}.txt'
+            f"remote-{attack_type}-{arbitragers}-{faults}-{workers}-{nodes}.txt",
         )
 
     @staticmethod

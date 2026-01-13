@@ -55,6 +55,7 @@ pub trait Export: Serialize {
     }
 }
 
+pub type AttackType = u32;
 pub type Stake = u32;
 pub type WorkerId = u32;
 
@@ -144,6 +145,8 @@ pub struct WorkerAddresses {
 
 #[derive(Clone, Deserialize)]
 pub struct Authority {
+    /// The attacking type: 0 = no attack; 1 = fissure front-running; 2 = speculative front-running； 3 = sluggish front-running
+    pub attack_type: AttackType,
     /// The voting power of this authority.
     pub stake: Stake,
     /// The network addresses of the primary.
@@ -160,6 +163,12 @@ pub struct Committee {
 impl Import for Committee {}
 
 impl Committee {
+
+    /// Return the attacking type.
+    pub fn attack_type(&self, name: &PublicKey) -> AttackType {
+        self.authorities.get(&name).map_or_else(|| 0, |x| x.attack_type)
+    }
+
     /// Returns the number of authorities.
     pub fn size(&self) -> usize {
         self.authorities.len()

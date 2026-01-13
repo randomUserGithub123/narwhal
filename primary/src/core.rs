@@ -1,5 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{CertificatesAggregator, VotesAggregator};
+use crate::attacks::{
+    Attacker, ATTACKING_INTERVAL, FISSURE_ATTACK, FISSURE_NOT_ACTIVE_ATTACK, MONITOR_NOTHING,
+    SPECULATIVE_ATTACK, SPECULATIVE_NOT_DELEGATE_ATTACK, SLUGGISH_ATTACK, SLUGGISH_NOT_ACTIVE_ATTACK,
+};
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote};
 use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, Round};
@@ -49,6 +53,8 @@ pub struct Core {
     tx_consensus: Sender<Certificate>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     tx_proposer: Sender<(Vec<Digest>, Round)>,
+    /// Send the monitored victim certificate to proposer
+    tx_monitor_header: Sender<Header>,
 
     /// The last garbage collected round.
     gc_round: Round,
@@ -68,7 +74,10 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 
     tx_header_arrival: Sender<(Round, PublicKey, Digest, Vec<Digest>)>,
-    simple_network: SimpleSender
+    simple_network: SimpleSender,
+
+    /// The parameters of attacker
+    attacker: Attacker,
 
 }
 
@@ -86,9 +95,11 @@ impl Core {
         rx_header_waiter: Receiver<Header>,
         rx_certificate_waiter: Receiver<Certificate>,
         rx_proposer: Receiver<Header>,
+        tx_monitor_header: Sender<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
         tx_header_arrival: Sender<(Round, PublicKey, Digest, Vec<Digest>)>,
+        attacker: Attacker,
     ) {
         tokio::spawn(async move {
             Self {
@@ -105,6 +116,7 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
+                tx_monitor_header,
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
@@ -115,6 +127,7 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 tx_header_arrival,
                 simple_network: SimpleSender::new(),
+                attacker: attacker,
             }
             .run()
             .await;
@@ -214,6 +227,57 @@ impl Core {
         let bytes = bincode::serialize(header).expect("Failed to serialize header");
         self.store.write(header.id.to_vec(), bytes).await;
 
+        // jianting: recognize victim block (header), activate front-running attack
+        if self.attacker.attack_type() == FISSURE_ATTACK
+            || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK
+        {
+            if self.attacker.victims().contains(&header.author)
+                && self.attacker.is_target_victim(header.author)
+                && header.round % ATTACKING_INTERVAL == 0
+            // && self.current_header.round + 1 <= header.round
+            {
+                self.tx_monitor_header
+                    .send(header.clone())
+                    .await
+                    .expect("Failed to send victim header to proposer");
+            }
+        } else if self.attacker.attack_type() == SLUGGISH_ATTACK
+            || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK
+        {
+            // TODO
+            if self.attacker.victims().contains(&header.author)
+                && self.attacker.is_target_victim(header.author)
+                && header.round % ATTACKING_INTERVAL == 0
+            {
+                self.tx_monitor_header
+                    .send(header.clone())
+                    .await
+                    .expect("Failed to send victim header to proposer");
+            }
+        } else if self.attacker.attack_type() == SPECULATIVE_ATTACK
+            || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK
+        {
+            if self.attacker.victims().contains(&header.author)
+                && self.attacker.is_target_victim(header.author)
+                && header.round % ATTACKING_INTERVAL == 0
+            {
+                self.tx_monitor_header
+                    .send(header.clone())
+                    .await
+                    .expect("Failed to send victim header to proposer");
+            }
+        } else if self.attacker.attack_type() == MONITOR_NOTHING {
+            if self.attacker.victims().contains(&header.author)
+                && self.attacker.is_target_victim(header.author)
+                && header.round % ATTACKING_INTERVAL == 0
+            {
+                self.tx_monitor_header
+                    .send(header.clone())
+                    .await
+                    .expect("Failed to send victim header to proposer");
+            }
+        }
+
         // Check if we can vote for this header.
         if self
             .last_voted
@@ -312,17 +376,77 @@ impl Core {
         self.store.write(certificate.digest().to_vec(), bytes).await;
 
         // Check if we have enough certificates to enter a new dag round and propose a header.
-        if let Some(parents) = self
-            .certificates_aggregators
-            .entry(certificate.round())
-            .or_insert_with(|| Box::new(CertificatesAggregator::new()))
-            .append(certificate.clone(), &self.committee)?
+        if self.attacker.attack_type() == FISSURE_ATTACK
+            || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK
         {
-            // Send it to the `Proposer`.
-            self.tx_proposer
-                .send((parents, certificate.round()))
-                .await
-                .expect("Failed to send certificate");
+            // Fissure front-running attack: don't link the victim block
+            if let Some(target_victim) = self.attacker.target_victim() {
+                if let Some(parents) = self
+                    .certificates_aggregators
+                    .entry(certificate.round())
+                    .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+                    .fissure_attack_append(certificate.clone(), &self.committee, target_victim)?
+                {
+                    // Send it to the `Proposer`.
+                    self.tx_proposer
+                        .send((parents, certificate.round()))
+                        .await
+                        .expect("Failed to send certificate");
+                }
+            } else {
+                error!("Can not find the victim node");
+                panic!("Attack failure: no fissure attacker.");
+            }
+        } else if self.attacker.attack_type() == SLUGGISH_ATTACK
+            || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK
+        {
+            // Sluggish front-running attack: slow down the creation of new blocks
+            // TODO
+            if let Some(parents) = self
+                .certificates_aggregators
+                .entry(certificate.round())
+                .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+                .append(certificate.clone(), &self.committee)?
+            {
+                // Send it to the `Proposer`.
+                self.tx_proposer
+                    .send((parents, certificate.round()))
+                    .await
+                    .expect("Failed to send certificate");
+            }
+        } else if self.attacker.attack_type() == SPECULATIVE_ATTACK
+            || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK
+        {
+            // if let Some(speculative_delegate) = self.attacker.delegate_speculative() {
+                if let Some(parents) = self
+                    .certificates_aggregators
+                    .entry(certificate.round())
+                    .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+                    .speculative_attack_append(certificate.clone(), &self.committee)?
+                {
+                    // Send it to the `Proposer`.
+                    self.tx_proposer
+                        .send((parents, certificate.round()))
+                        .await
+                        .expect("Failed to send certificate");
+                }
+            // } else {
+            //     error!("Can not find speculative delegate");
+            //     panic!("Attack failure: no speculative attacker.");
+            // }
+        } else {
+            if let Some(parents) = self
+                .certificates_aggregators
+                .entry(certificate.round())
+                .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+                .append(certificate.clone(), &self.committee)?
+            {
+                // Send it to the `Proposer`.
+                self.tx_proposer
+                    .send((parents, certificate.round()))
+                    .await
+                    .expect("Failed to send certificate");
+            }
         }
 
         // Send it to the consensus layer.

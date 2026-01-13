@@ -52,6 +52,8 @@ class LocalBench:
         try:
             Print.info("Setting up testbed...")
             nodes, rate = self.nodes[0], self.rate[0]
+            arbitragers = self.arbitragers
+            attack_type = self.attack_type
 
             # Cleanup all files.
             cmd = f"{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}"
@@ -75,7 +77,14 @@ class LocalBench:
                 keys += [Key.from_file(filename)]
 
             names = [x.name for x in keys]
-            committee = LocalCommittee(names, self.BASE_PORT, self.workers)
+            committee = LocalCommittee(
+                names, 
+                self.BASE_PORT, 
+                self.workers,
+                self.faults,
+                arbitragers=arbitragers,
+                attack_type=attack_type
+            )
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())
@@ -137,9 +146,8 @@ class LocalBench:
                 self._background_run(cmd, log_file)
 
             # Run the primaries.
-            faulty_node_ids = sample(
-                list(range(0, nodes)),
-                self.faults
+            faulty_node_ids = committee.get_byzantine_nodes(
+                f=self.faults
             )
             for i, address in enumerate(committee.primary_addresses()):
                 cmd = CommandMaker.run_primary(
@@ -179,7 +187,12 @@ class LocalBench:
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")
-            return LogParser.process(PathMaker.logs_path(), faults=self.faults)
+            return LogParser.process(
+                PathMaker.logs_path(), 
+                attack_type=attack_type,
+                arbitragers=arbitragers,
+                faults=self.faults,
+            )
 
         except (subprocess.SubprocessError, ParseError) as e:
             self._kill_nodes()
