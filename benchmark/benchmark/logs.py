@@ -481,33 +481,35 @@ class LogParser:
 
     def _is_frontrun_successful(self, victim_txs, attacker_txs):
         """
-        Check if frontrunning was successful.
-        Success = any attacker tx executed before any victim tx.
+        Count how many (attacker_tx, victim_tx) pairs were frontrun.
+        Returns (success_count, total_count)
         """
+        succ = 0
+        total = 0
         for a in attacker_txs:
             ra = self.tx_exec_rank.get(a)
             if ra is None:
-                continue  # Attacker tx not found in execution log
+                continue
             for v in victim_txs:
                 rv = self.tx_exec_rank.get(v)
                 if rv is None:
                     # Victim tx never executed => attacker wins
-                    return True
-                if ra < rv:
+                    succ += 1
+                    total += 1
+                elif ra < rv:
                     # Attacker executed before victim => success
-                    return True
-        return False
+                    succ += 1
+                    total += 1
+                else:
+                    total += 1
+        return succ, total
 
     def _transaction_frontrun_results(self):
         """
         Calculate transaction-level front-running success rate.
         
-        For each attack pair (victim_header, attacker_header):
-        1. Get all batches in each header
-        2. Get all tx_digests in those batches
-        3. Check if any attacker tx executed before any victim tx
+        Counts individual (attacker_tx, victim_tx) pairs where attacker executed first.
         """
-        # Use whichever attack type is present
         attacks = (
             self.monitor_attacks
             or self.fissure_attacks
@@ -516,29 +518,27 @@ class LogParser:
             or {}
         )
 
-        succ = 0
-        total = 0
+        total_succ = 0
+        total_pairs = 0
 
         for victim_h, attacker_h in attacks.items():
-            # Get batches for each header
             vb = self.header_to_batches.get(victim_h)
             ab = self.header_to_batches.get(attacker_h)
             
             if not vb or not ab:
-                continue  # Can't analyze if we don't have batch mapping
+                continue
 
-            # Get all tx_digests in those batches
             victim_txs = [tx for b in vb for tx in self.batch_to_txs.get(b, [])]
             attacker_txs = [tx for b in ab for tx in self.batch_to_txs.get(b, [])]
 
             if not victim_txs or not attacker_txs:
-                continue  # Can't analyze without tx mappings
+                continue
 
-            total += 1
-            if self._is_frontrun_successful(victim_txs, attacker_txs):
-                succ += 1
+            succ, pairs = self._is_frontrun_successful(victim_txs, attacker_txs)
+            total_succ += succ
+            total_pairs += pairs
 
-        return succ, total
+        return total_succ, total_pairs
 
     def _consensus_throughput(self):
         if not self.commits:
