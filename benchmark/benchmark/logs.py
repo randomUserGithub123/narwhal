@@ -196,41 +196,38 @@ class LogParser:
         non_empty = [d for d in dicts if len(d) > 0]
         self._workers_with_exec_data = len(non_empty)
         
-        # Validate: all non-empty workers must agree on relative order
         self.exec_order_consistent = True
         self.exec_order_violations = 0
         
-        if len(non_empty) >= 2:
-            # Get ordered tx list from each worker (sorted by rank)
-            orderings = []
-            for d in non_empty:
-                ordered = sorted(d.keys(), key=lambda tx: d[tx])
-                orderings.append(ordered)
-            
-            # Check pairwise: for any two txs in common, relative order must match
-            reference = non_empty[0]
-            for i, other in enumerate(non_empty[1:], 1):
-                for tx_a in reference:
-                    if tx_a not in other:
-                        continue
-                    for tx_b in reference:
-                        if tx_b not in other or tx_a == tx_b:
-                            continue
-                        # Both txs in both workers - check relative order
-                        ref_order = reference[tx_a] < reference[tx_b]
-                        other_order = other[tx_a] < other[tx_b]
-                        if ref_order != other_order:
-                            self.exec_order_violations += 1
-                            self.exec_order_consistent = False
-            
-            if not self.exec_order_consistent:
-                Print.warn(f"EXECUTION ORDER INCONSISTENT: {self.exec_order_violations} ordering violations across workers!")
+        if len(non_empty) < 2:
+            if non_empty:
+                return dict(non_empty[0])
+            return {}
         
-        # Merge: return the longest one (most complete data)
-        if non_empty:
-            longest = max(non_empty, key=len)
-            return dict(longest)
-        return {}
+        # Sort by length (shortest first)
+        sorted_by_len = sorted(non_empty, key=len)
+        
+        # Get ordered tx lists
+        orderings = []
+        for d in sorted_by_len:
+            ordered = sorted(d.keys(), key=lambda tx: d[tx])
+            orderings.append(ordered)
+        
+        # Check: each ordering must be prefix of the next
+        for i in range(len(orderings) - 1):
+            shorter = orderings[i]
+            longer = orderings[i + 1]
+            
+            # shorter must equal longer[:len(shorter)]
+            if shorter != longer[:len(shorter)]:
+                self.exec_order_consistent = False
+                self.exec_order_violations += 1
+        
+        if not self.exec_order_consistent:
+            Print.warn(f"EXECUTION ORDER INCONSISTENT: {self.exec_order_violations} workers have non-prefix orderings!")
+        
+        # Return longest
+        return dict(sorted_by_len[-1])
 
     def _parse_clients(self, log):
         if search(r"(?:panicked|Error)", log) is not None:
