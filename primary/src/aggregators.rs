@@ -6,6 +6,9 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
 use std::collections::HashSet;
 
+#[cfg(feature = "benchmark")]
+use log::info;
+
 /// Aggregates votes for a particular header into a certificate.
 pub struct VotesAggregator {
     weight: Stake,
@@ -82,4 +85,53 @@ impl CertificatesAggregator {
         }
         Ok(None)
     }
+
+    pub fn fissure_attack_append(
+        &mut self,
+        certificate: Certificate,
+        committee: &Committee,
+        victim: PublicKey,
+    ) -> DagResult<Option<Vec<Digest>>> {
+        let origin = certificate.origin();
+        if origin == victim {
+            #[cfg(feature = "benchmark")]
+            info!("This is the victim block, victim is {}", origin);
+            return Ok(None)
+        }
+        // Ensure it is the first time this authority votes.
+        if !self.used.insert(origin) {
+            return Ok(None);
+        }
+
+        self.certificates.push(certificate.digest());
+        self.weight += committee.stake(&origin);
+        if self.weight >= committee.quorum_threshold() {
+            self.weight = 0; // Ensures quorum is only reached once.
+            return Ok(Some(self.certificates.drain(..).collect()));
+        }
+        Ok(None)
+    }
+
+    // maybe can do more things here
+    pub fn speculative_attack_append(
+        &mut self,
+        certificate: Certificate,
+        committee: &Committee,
+    ) -> DagResult<Option<Vec<Digest>>> {
+        let origin = certificate.origin();
+
+        // Ensure it is the first time this authority votes.
+        if !self.used.insert(origin) {
+            return Ok(None);
+        }
+
+        self.certificates.push(certificate.digest());
+        self.weight += committee.stake(&origin);
+        if self.weight >= committee.quorum_threshold() {
+            self.weight = 0; // Ensures quorum is only reached once.
+            return Ok(Some(self.certificates.drain(..).collect()));
+        }
+        Ok(None)
+    }
+
 }

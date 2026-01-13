@@ -115,6 +115,8 @@ class DASBench:
         try:
             Print.info("Setting up testbed...")
             nodes, rate = self.nodes[0], self.rate[0]
+            arbitragers = self.arbitragers
+            attack_type = self.attack_type
 
             # Cleanup all files.
             cmd = f"{CommandMaker.clean_logs()} ; {CommandMaker.cleanup(self.username)}"
@@ -159,6 +161,8 @@ class DASBench:
                 self.BASE_PORT,
                 self.workers,
                 self.faults,
+                arbitragers,
+                attack_type,
                 nodes_hostnames
             )
             committee.print(PathMaker.committee_file())
@@ -168,7 +172,7 @@ class DASBench:
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(self.faults)
-            rate_share = ceil(rate / (committee.workers() * committee.size()))
+            rate_share = ceil(rate / committee.workers())
             
             ### Default Narwhal Approach : 
             # counter = 0
@@ -256,6 +260,8 @@ class DASBench:
             Print.info("Parsing logs...")
             log_values =  LogParser.process(
                 PathMaker.logs_path(),
+                attack_type=attack_type,
+                arbitragers=arbitragers,
                 faults=self.faults,
             )
 

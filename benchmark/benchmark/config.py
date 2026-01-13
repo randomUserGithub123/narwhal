@@ -103,6 +103,16 @@ class Committee:
         for authority in list(self.json['authorities'].values())[:good_nodes]:
             addresses += [authority['primary']['primary_to_primary']]
         return addresses
+    
+    def attacker_primary_addresses(self, attack_type, faults=0):
+        """Returns an ordered list of primaries' addresses."""
+        assert faults < self.size()
+        addresses = []
+        good_nodes = self.size() - faults
+        for authority in list(self.json["authorities"].values())[:good_nodes]:
+            if authority["attack_type"] == attack_type:
+                addresses += [authority["primary"]["primary_to_primary"]]
+        return addresses
 
     def workers_addresses(self, faults=0):
         ''' Returns an ordered list of list of workers' addresses. '''
@@ -114,6 +124,20 @@ class Committee:
             for id, worker in authority['workers'].items():
                 authority_addresses += [(id, worker['transactions'])]
             addresses.append(authority_addresses)
+        return addresses
+    
+    def attacker_workers_addresses(self, attack_type, faults=0):
+        """Returns an ordered list of list of workers' addresses."""
+        assert faults < self.size()
+        addresses = []
+        good_nodes = self.size() - faults
+        for authority in list(self.json["authorities"].values())[:good_nodes]:
+            # 1: fissure; 3: sluggish; 5: pick-max; 10: monitoring
+            if authority["attack_type"] == attack_type:
+                authority_addresses = []
+                for id, worker in authority["workers"].items():
+                    authority_addresses += [(id, worker["transactions"])]
+                addresses.append(authority_addresses)
         return addresses
 
     def ips(self, name=None):
@@ -162,16 +186,40 @@ class Committee:
 
 
 class LocalCommittee(Committee):
-    def __init__(self, names, port, workers):
+    def __init__(self, names, port, workers, faults, arbitragers, attack_type):
         assert isinstance(names, list)
         assert all(isinstance(x, str) for x in names)
         assert isinstance(port, int)
         assert isinstance(workers, int) and workers > 0
-        addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
-        super().__init__(addresses, port)
+        assert isinstance(faults, int) and faults >= 0
+        assert isinstance(arbitragers, int) and arbitragers >= 0
+        node_num = len(names)
+        assert faults + arbitragers < node_num
+        attack_types = []
+        if attack_type == 0:
+            attack_types = [0] * node_num
+        elif attack_type == 1: # fissure attack
+            attack_types = [0] * (node_num - faults - arbitragers) + [1] + [2] * (
+                faults + arbitragers - 1
+            )
+        elif attack_type == 2: # sluggish attack
+            attack_types = [0] * (node_num - faults - arbitragers) + [3] + [4] * (
+                faults + arbitragers - 1
+            )
+        elif attack_type == 3: # minimun digest attack
+            attack_types = [0] * (node_num - faults - arbitragers) + [5] + [6] * (
+                faults + arbitragers - 1
+            )
+        elif attack_type == 10: # just monitor
+            attack_types = [0] * (node_num - faults - arbitragers) + [10] + [0] * (
+                faults + arbitragers - 1
+            )
+
+        addresses = OrderedDict((x, ['127.0.0.1'] * (1 + workers)) for x in names)
+        super().__init__(addresses, port, attack_types)
 
 class DASCommittee(Committee):
-    def __init__(self, names, port, workers, faults, hostnames):
+    def __init__(self, names, port, workers, faults, arbitragers, attack_type, hostnames):
         assert isinstance(names, list)
         assert all(isinstance(x, str) for x in names)
         assert isinstance(port, int)
@@ -180,13 +228,46 @@ class DASCommittee(Committee):
         # assert isinstance(attack_type, int) and attack_type <= 3
         node_num = len(names)
         collocate = len(hostnames) == node_num
+
+        assert faults + arbitragers < node_num
+        attack_types = []
+        if attack_type == 0:
+            attack_types = [0] * node_num
+        elif attack_type == 1:  # fissure attack
+            # 1 builds the fissure, N-f-a victims, remaining f+a-1 are "passive" attackers (identical to active, but not logging)
+            attack_types = (
+                [0] * (node_num - faults - arbitragers)
+                + [1]
+                + [2] * (faults + arbitragers - 1)
+            )
+        elif attack_type == 2:  # sluggish attack
+            # 1 builds the sluggish, N-f-a victims, remaining f+a-1 are "passive" attackers (identical to active, but not logging)
+            attack_types = (
+                [0] * (node_num - faults - arbitragers)
+                + [3]
+                + [4] * (faults + arbitragers - 1)
+            )
+        elif attack_type == 3:  # minimun digest attack
+            # 1 tries multiple blocks, N-f-a victims, remaining f+a-1 are "passive" attackers (identical to active, but not logging)
+            attack_types = (
+                [0] * (node_num - faults - arbitragers)
+                + [5]
+                + [6] * (faults + arbitragers - 1)
+            )
+        elif attack_type == 10:  # just monitor
+            attack_types = (
+                [0] * (node_num - faults - arbitragers)
+                + [10]
+                + [0] * (faults + arbitragers - 1)
+            )
+
         node_amount = workers + 1
         if collocate:
             addresses = OrderedDict((x, [socket.gethostbyname(hostnames[i])] * node_amount) for i, x in enumerate(names))
         else:
             addresses = OrderedDict((x, list(map(socket.gethostbyname, hostnames[i*node_amount:(i+1)*node_amount]))) for i, x in enumerate(names))
 
-        super().__init__(addresses, port)
+        super().__init__(addresses, port, attack_types)
 
 class NodeParameters:
     def __init__(self, json):
@@ -217,6 +298,9 @@ class BenchParameters:
     def __init__(self, json):
         try:
             self.faults = int(json['faults'])
+
+            self.arbitragers = int(json["arbitragers"])
+            self.attack_type = int(json["attack_type"])
 
             nodes = json['nodes']
             nodes = nodes if isinstance(nodes, list) else [nodes]

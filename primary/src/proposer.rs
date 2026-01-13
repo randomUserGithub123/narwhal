@@ -1,11 +1,16 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::attacks::{
+    Attacker, ATTACKING_INTERVAL, FISSURE_ATTACK, FISSURE_NOT_ACTIVE_ATTACK, HONEST_NODE,
+    MONITOR_NOTHING, SPECULATIVE_ATTACK, SPECULATIVE_NOT_DELEGATE_ATTACK, SLUGGISH_ATTACK,
+    SLUGGISH_DELAY_MULTI_FACTOR, SLUGGISH_NOT_ACTIVE_ATTACK,
+};
 use crate::messages::{Certificate, Header};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, info};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque, BTreeSet};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -48,6 +53,19 @@ pub struct Proposer {
     rx_committed_own_headers: Receiver<Round>,
     /// The round of the maximum own header we committed
     max_committed_header: Round,
+
+    /// Receives ordered certificate from garbage collector to decide if stop creating propagation priority blocks
+    rx_clean_certificate: Receiver<Certificate>,
+    /// Receives a victim certificate from core, start attacking this victim certificate
+    rx_monitor_header: Receiver<Header>,
+    /// The parameters of attacker
+    attacker: Attacker,
+
+    /// Trace the current victim header (block)
+    /// 1) victim_header.author == self.name: no victim header currently
+    /// 2) victim_header.author != self.name: we are front-running
+    victim_header: Header,
+    is_attacking: bool,
 }
 
 impl Proposer {
@@ -62,6 +80,9 @@ impl Proposer {
         rx_workers: Receiver<(Digest, WorkerId)>,
         tx_core: Sender<Header>,
         rx_committed_own_headers: Receiver<Round>,
+        rx_clean_certificate: Receiver<Certificate>,
+        rx_monitor_header: Receiver<Header>,
+        attacker: Attacker,
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
@@ -69,6 +90,8 @@ impl Proposer {
             .collect();
 
         tokio::spawn(async move {
+            let mut ini_victim_header = Header::default();
+            ini_victim_header.author = name;
             Self {
                 name,
                 signature_service,
@@ -84,6 +107,11 @@ impl Proposer {
                 proposed_headers: BTreeMap::new(),
                 rx_committed_own_headers,
                 max_committed_header: 0,
+                rx_clean_certificate,
+                rx_monitor_header,
+                attacker: attacker,
+                victim_header: ini_victim_header,
+                is_attacking: false,
             }
             .run()
             .await;
@@ -106,9 +134,52 @@ impl Proposer {
         debug!("Created {:?}", header);
 
         #[cfg(feature = "benchmark")]
-        for digest in header.payload.keys() {
-            // NOTE: This log entry is used to compute performance.
-            info!("Created {} -> {:?}", header, digest);
+        {
+            for digest in header.payload.keys() {
+                // NOTE: This log entry is used to compute performance.
+                info!("Created {} -> {:?}", header, digest);
+            }
+            if header.round % ATTACKING_INTERVAL == 0 && self.attacker.attack_type() == HONEST_NODE
+            {
+                // Info: Create a victim header
+                info!(
+                    "FairDag Created a victim header {} in round {}",
+                    header.id, header.round
+                );
+            }
+            // Print the attacking information for calculation
+            // Note that we only consider a block as a front-running block if and only if: The block is created after the victim block
+            // For Fissure and Speculative attacks, we only consider the victim and attacking blocks are in the same round
+
+            // For comparison between adopting attack strategies and not adopting attack strategies
+            if header.round % ATTACKING_INTERVAL == 0
+                && self.attacker.attack_type() == MONITOR_NOTHING
+                && self.victim_header.round == header.round
+            {
+                info!(
+                    "FairDag Monitor attacking header {}, victim header {}, in round {}",
+                    header.id, self.victim_header.id, header.round
+                );
+            }
+
+            if header.round % ATTACKING_INTERVAL == 0
+                && self.attacker.attack_type() == FISSURE_ATTACK
+                && self.victim_header.round == header.round
+            {
+                info!(
+                    "FairDag Created a fissure attacking header {}, victim header {}, in round {}",
+                    header.id, self.victim_header.id, header.round
+                );
+            }
+
+            if self.attacker.attack_type() == SLUGGISH_ATTACK
+                && self.victim_header.round >= header.round
+            {
+                info!(
+                    "FairDag Created a sluggish attacking header {}, victim header {}, in round {}",
+                    header.id, self.victim_header.id, header.round
+                );
+            }
         }
 
         self.proposed_headers
@@ -119,6 +190,145 @@ impl Proposer {
             .send(header)
             .await
             .expect("Failed to send header");
+    }
+
+    // pick-minumum attack: create a header with the minimum id (i.e., the header's digest)
+    // return the number of left payload's digests
+    async fn make_minimum_header(&mut self) -> usize {
+        // ensure there is at least one digest (otherwise, we have no choices)
+        // and only consider the attacking round
+        let mut left_payload = 0;
+        if !self.digests.is_empty()
+            && self.round % ATTACKING_INTERVAL == 0
+            && self.victim_header.round == self.round
+        {
+            let temp_last_parents: BTreeSet<Digest> = self.last_parents.drain(..).collect();
+            let temp_payload_digests: Vec<_> = self.digests.iter().cloned().collect();
+            let mut min_index = 0;
+
+            let first_header_id = self.attacker.get_header_id(
+                self.name,
+                self.round,
+                min_index,
+                &temp_payload_digests,
+                &temp_last_parents,
+            );
+            let mut min_digest =
+                self.attacker
+                    .get_certificate_digest(self.name, self.round, &first_header_id);
+
+            #[cfg(feature = "benchmark")]
+            {
+                info!("Current digest amount is {}", temp_payload_digests.len());
+            }
+            // now try to pick a minimum digest
+            for element_num in 1..self
+                .attacker
+                .speculative_try_times()
+                .min(temp_payload_digests.len())
+            {
+                // calculate a new digest
+                let try_header_id = self.attacker.get_header_id(
+                    self.name,
+                    self.round,
+                    element_num,
+                    &temp_payload_digests,
+                    &temp_last_parents,
+                );
+                let temp_digest =
+                    self.attacker
+                        .get_certificate_digest(self.name, self.round, &try_header_id);
+                if temp_digest > min_digest {
+                    // reverted tree traversal
+                    // therefore, pick the maximum
+                    min_digest = temp_digest;
+                    min_index = element_num;
+                }
+            }
+            // calculate the left payload
+            left_payload = self.digests.len() - min_index - 1;
+            // left_payload = 0;
+            
+            let header_digests: VecDeque<_> = self.digests.drain(0..(min_index + 1)).collect();
+            
+            // Make a new header.
+            let header = Header::new(
+                self.name,
+                self.round,
+                header_digests.iter().cloned().collect(),
+                temp_last_parents,
+                &mut self.signature_service,
+            )
+            .await;
+            debug!("Created {:?}", header);
+
+            #[cfg(feature = "benchmark")]
+            {
+                for digest in header.payload.keys() {
+                    // NOTE: This log entry is used to compute performance.
+                    info!("Created {} -> {:?}", header, digest);
+                }
+                if self.attacker.attack_type() == SPECULATIVE_ATTACK {
+                    // Info: Create a speculative attacking header
+                    info!(
+                        "FairDag Created a speculative attacking header {}, victim header {}, in round {}",
+                        header.id, self.victim_header.id, header.round
+                    );
+                }
+            }
+
+            self.proposed_headers
+                .insert(self.round, (header.clone(), header_digests));
+
+            // Send the new header to the `Core` that will broadcast and process it.
+            self.tx_core
+                .send(header)
+                .await
+                .expect("Failed to send header");
+        } else {
+            let header_digests: VecDeque<_> = self.digests.drain(..).collect();
+            
+            // Make a new header.
+            let header = Header::new(
+                self.name,
+                self.round,
+                header_digests.iter().cloned().collect(),
+                self.last_parents.drain(..).collect(),
+                &mut self.signature_service,
+            )
+            .await;
+            debug!("Created {:?}", header);
+
+            #[cfg(feature = "benchmark")]
+            {
+                for digest in header.payload.keys() {
+                    // NOTE: This log entry is used to compute performance.
+                    info!("Created {} -> {:?}", header, digest);
+                }
+
+                if header.round % ATTACKING_INTERVAL == 0
+                    // && self.attacker.attack_type() == SPECULATIVE_ATTACK
+                    && self.victim_header.round == header.round
+                // this is the target victim block
+                {
+                    // Info: Create a speculative attacking header
+                    info!(
+                        "FairDag Created a speculative attacking header {}, victim header {}, in round {}",
+                        header.id, self.victim_header.id, header.round
+                    );
+                }
+            }
+
+            self.proposed_headers
+                .insert(self.round, (header.clone(), header_digests));
+
+            // Send the new header to the `Core` that will broadcast and process it.
+            self.tx_core
+                .send(header)
+                .await
+                .expect("Failed to send header");
+        }
+        left_payload
     }
 
     // Main loop listening to incoming messages.
@@ -137,14 +347,75 @@ impl Proposer {
             let enough_parents = !self.last_parents.is_empty();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
-            if (timer_expired || enough_digests) && enough_parents {
-                // Make a new header.
-                self.make_header().await;
-                self.payload_size = 0;
+            if self.attacker.attack_type() == HONEST_NODE
+                || self.attacker.attack_type() == MONITOR_NOTHING
+            {
+                if (timer_expired || enough_digests) && enough_parents {
+                    // Make a new header.
+                    self.make_header().await;
+                    self.payload_size = 0;
 
-                // Reschedule the timer.
-                let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
-                timer.as_mut().reset(deadline);
+                    // Reschedule the timer.
+                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    timer.as_mut().reset(deadline);
+                }
+            } else if self.attacker.attack_type() == FISSURE_ATTACK
+                || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK
+            {
+                // Current: in core.rs, do not add victim block into header.parents
+                if (timer_expired || enough_digests) && enough_parents {
+                    // Make a new header.
+                    self.make_header().await;
+                    self.payload_size = 0;
+
+                    // Reschedule the timer.
+                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    timer.as_mut().reset(deadline);
+                }
+            } else if self.attacker.attack_type() == SLUGGISH_ATTACK
+                || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK
+            {
+                // Current: in core.rs, do not add victim block into header.parents
+                if (timer_expired || enough_digests) && enough_parents {
+                    // if (timer_expired) && enough_parents {
+                    // Make a new header.
+                    self.make_header().await;
+                    self.payload_size = 0;
+
+                    if self.is_attacking {
+                        // if is attacking, create new blocks in a normal speed
+                        let deadline =
+                            Instant::now() + Duration::from_millis(self.max_header_delay);
+                        timer.as_mut().reset(deadline);
+                    } else {
+                        // otherwise, slow down the creation of new blocks
+                        // current setting: double max_header_delay
+                        let deadline = Instant::now()
+                            + Duration::from_millis(
+                                SLUGGISH_DELAY_MULTI_FACTOR * self.max_header_delay,
+                            );
+                        timer.as_mut().reset(deadline);
+                    }
+                }
+            } else if self.attacker.attack_type() == SPECULATIVE_ATTACK
+                || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK
+            {
+                // currently, we only consider one node in pick-minimum attack
+                if (timer_expired || enough_digests) && enough_parents && self.is_attacking {
+                    self.payload_size = self.make_minimum_header().await;
+
+                    // Reschedule the timer.
+                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    timer.as_mut().reset(deadline);
+                } else if (timer_expired || enough_digests) && enough_parents {
+                    // Make a new header.
+                    self.make_header().await;
+                    self.payload_size = 0;
+
+                    // Reschedule the timer.
+                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    timer.as_mut().reset(deadline);
+                }
             }
 
             tokio::select! {
@@ -217,6 +488,53 @@ impl Proposer {
 
                     }
                 },
+                Some(header) = self.rx_monitor_header.recv() => {
+                    // Find a victim header, start front-running it by constructing propagation priority blocks
+                    if self.attacker.attack_type() == FISSURE_ATTACK || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK {
+                        if !self.is_attacking && self.round <= header.round {
+                            self.victim_header.update(header);
+                            self.is_attacking = true;
+                        }
+                    } else if self.attacker.attack_type() == SLUGGISH_ATTACK || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK {
+                        if !self.is_attacking && self.round <= header.round {
+                            self.victim_header.update(header);
+                            self.is_attacking = true;
+                        }
+                    } else if (self.attacker.attack_type() == SPECULATIVE_ATTACK || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK)
+                        && !self.is_attacking && self.round <= header.round
+                    {
+                        self.victim_header.update(header);
+                        self.is_attacking = true;
+                    } else if self.attacker.attack_type() == MONITOR_NOTHING {
+                        if !self.is_attacking && self.round <= header.round {
+                            self.victim_header.update(header);
+                            self.is_attacking = true;
+                        }
+                    }
+                }
+                Some(certificate) = self.rx_clean_certificate.recv() => {
+                    if self.attacker.attack_type() == FISSURE_ATTACK || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK {
+                        if certificate.header.round >= self.victim_header.round {
+                            // the victim certificate has been committed or missed, move to attack another certificate
+                            self.is_attacking = false;
+                        }
+                    } else if self.attacker.attack_type() == SLUGGISH_ATTACK || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK {
+                        if certificate.header.round >= self.victim_header.round {
+                            // the victim certificate has been committed or missed, move to attack another certificate
+                            self.is_attacking = false;
+                        }
+                    } else if self.attacker.attack_type() == SPECULATIVE_ATTACK || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK {
+                        if certificate.header.round >= self.victim_header.round {
+                            // the victim certificate has been committed or missed, move to attack another certificate
+                            self.is_attacking = false;
+                        }
+                    } else if self.attacker.attack_type() == MONITOR_NOTHING {
+                        if certificate.header.round >= self.victim_header.round {
+                            // the victim certificate has been committed or missed, move to attack another certificate
+                            self.is_attacking = false;
+                        }
+                    }
+                }
                 () = &mut timer => {
                     // Nothing to do.
                 }

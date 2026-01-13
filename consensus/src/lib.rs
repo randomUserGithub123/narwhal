@@ -78,6 +78,10 @@ pub struct Consensus {
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
+
+    /// Block height: when converting dag into a chain, label each block with a height
+    /// block_height is used for detect front-running attacks
+    block_height: u64,
 }
 
 impl Consensus {
@@ -96,6 +100,7 @@ impl Consensus {
                 tx_primary,
                 tx_output,
                 genesis: Certificate::genesis(&committee),
+                block_height: 0,
             }
             .run()
             .await;
@@ -179,13 +184,18 @@ impl Consensus {
 
             // Output the sequence in the right order.
             for certificate in sequence {
-                #[cfg(not(feature = "benchmark"))]
-                info!("Committed {}", certificate.header);
+                self.block_height += 1;
+                #[cfg(not(feature = "benchmark"))] 
+                {
+                    info!("Committed {}", certificate.header);
+                    info!("FairDag Committed {} in height {}", certificate.header.id, self.block_height);
+                }
 
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
                     // NOTE: This log entry is used to compute performance.
                     info!("Committed {} -> {:?}", certificate.header, digest);
+                    info!("FairDag Committed {} in height {}", certificate.header.id, self.block_height);
                 }
 
                 self.tx_primary

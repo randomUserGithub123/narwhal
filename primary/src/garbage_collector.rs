@@ -18,6 +18,8 @@ pub struct GarbageCollector {
     consensus_round: Arc<AtomicU64>,
     /// Receives the ordered certificates from consensus.
     rx_consensus: Receiver<Certificate>,
+    /// Send the ordered certificates to proposer to decide if stop creating propagation priority blocks
+    tx_clean_certificate: Sender<Certificate>,
     /// The network addresses of our workers.
     addresses: Vec<SocketAddr>,
     /// A network sender to notify our workers of cleanup events.
@@ -35,6 +37,7 @@ impl GarbageCollector {
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<Certificate>,
         tx_committed_own_headers: Sender<Round>,
+        tx_clean_certificate: Sender<Certificate>,
     ) {
         let addresses = committee
             .our_workers(&name)
@@ -47,6 +50,7 @@ impl GarbageCollector {
             Self {
                 consensus_round,
                 rx_consensus,
+                tx_clean_certificate,
                 addresses,
                 network: SimpleSender::new(),
                 tx_committed_own_headers,
@@ -67,6 +71,12 @@ impl GarbageCollector {
 
                 // Trigger cleanup on the primary.
                 self.consensus_round.store(round, Ordering::Relaxed);
+
+                // Sends ordered certificate to proposer
+                self.tx_clean_certificate
+                    .send(certificate.clone())
+                    .await
+                    .expect("Failed to send certificate to proposer");
 
                 // Trigger cleanup on the workers..
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))

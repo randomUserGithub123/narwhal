@@ -51,6 +51,8 @@ class LocalBench:
         try:
             Print.info("Setting up testbed...")
             nodes, rate = self.nodes[0], self.rate[0]
+            arbitragers = self.arbitragers
+            attack_type = self.attack_type
 
             # Cleanup all files.
             cmd = f"{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}"
@@ -74,14 +76,21 @@ class LocalBench:
                 keys += [Key.from_file(filename)]
 
             names = [x.name for x in keys]
-            committee = LocalCommittee(names, self.BASE_PORT, self.workers)
+            committee = LocalCommittee(
+                names, 
+                self.BASE_PORT, 
+                self.workers,
+                self.faults,
+                arbitragers,
+                attack_type,
+            )
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(self.faults)
-            rate_share = ceil(rate / (committee.workers() * committee.size()))
+            rate_share = ceil(rate / committee.workers())
 
             ### Default Narwhal Approach : 
             # for i, addresses in enumerate(workers_addresses):
@@ -158,7 +167,12 @@ class LocalBench:
 
             # Parse logs and return the parser.
             Print.info("Parsing logs...")
-            return LogParser.process(PathMaker.logs_path(), faults=self.faults)
+            return LogParser.process(
+                PathMaker.logs_path(), 
+                attack_type=attack_type,
+                arbitragers=arbitragers,
+                faults=self.faults,
+            )
 
         except (subprocess.SubprocessError, ParseError) as e:
             self._kill_nodes()
