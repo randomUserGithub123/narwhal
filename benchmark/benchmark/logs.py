@@ -527,7 +527,7 @@ class LogParser:
             if self._is_frontrun_successful(victim_txs, attacker_txs):
                 successes += 1
 
-        rate = (successes / total) if total > 0 else 0.0
+        rate = round(successes / total * 100, 2) if total > 0 else 0.0
         return rate, successes, total
 
     def _consensus_throughput(self):
