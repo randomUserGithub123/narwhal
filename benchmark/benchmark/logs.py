@@ -480,12 +480,7 @@ class LogParser:
         return succ_num, attack_num
 
     def _is_frontrun_successful(self, victim_txs, attacker_txs):
-        """
-        Count how many (attacker_tx, victim_tx) pairs were frontrun.
-        Returns (success_count, total_count)
-        """
-        succ = 0
-        total = 0
+        """Was ANY attacker tx executed before ANY victim tx?"""
         for a in attacker_txs:
             ra = self.tx_exec_rank.get(a)
             if ra is None:
@@ -493,16 +488,10 @@ class LogParser:
             for v in victim_txs:
                 rv = self.tx_exec_rank.get(v)
                 if rv is None:
-                    # Victim tx never executed => attacker wins
-                    succ += 1
-                    total += 1
-                elif ra < rv:
-                    # Attacker executed before victim => success
-                    succ += 1
-                    total += 1
-                else:
-                    total += 1
-        return succ, total
+                    return True  # Victim never executed
+                if ra < rv:
+                    return True  # Attacker before victim
+        return False
 
     def _transaction_frontrun_results(self):
         """
@@ -518,8 +507,8 @@ class LogParser:
             or {}
         )
 
-        total_succ = 0
-        total_pairs = 0
+        successes = 0
+        total = 0
 
         for victim_h, attacker_h in attacks.items():
             vb = self.header_to_batches.get(victim_h)
@@ -534,11 +523,12 @@ class LogParser:
             if not victim_txs or not attacker_txs:
                 continue
 
-            succ, pairs = self._is_frontrun_successful(victim_txs, attacker_txs)
-            total_succ += succ
-            total_pairs += pairs
+            total += 1
+            if self._is_frontrun_successful(victim_txs, attacker_txs):
+                successes += 1
 
-        return total_succ, total_pairs
+        rate = (successes / total) if total > 0 else 0.0
+        return rate, successes, total
 
     def _consensus_throughput(self):
         if not self.commits:
@@ -680,8 +670,7 @@ class LogParser:
             attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
 
         # Transaction-level front-running calculation
-        tx_succ, tx_total = self._transaction_frontrun_results()
-        tx_rate = round(tx_succ / tx_total * 100, 2) if tx_total else 0
+        tx_rate, tx_succ, tx_total = self._transaction_frontrun_results()
 
         # Debug stats to help diagnose 0/0 issues
         debug_stats = (

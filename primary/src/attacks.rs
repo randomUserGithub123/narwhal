@@ -77,6 +77,7 @@ impl Attacker {
         round: u64,
         ele_index: usize,
         payload: &Vec<(Digest, WorkerId)>,
+        local_orderings: &BTreeMap<Digest, WorkerId>,
         parents: &BTreeSet<Digest>,
     ) -> Digest {
         let btree_map: BTreeMap<Digest, WorkerId> =
@@ -88,10 +89,14 @@ impl Attacker {
             hasher.update(x);
             hasher.update(y.to_le_bytes());
         }
+        for (x, y) in local_orderings {
+            hasher.update(x);
+            hasher.update(y.to_le_bytes());
+        }
         for x in parents {
             hasher.update(x);
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 
     // Pick-minimum attack: calculate a the digest of a certificate
@@ -106,6 +111,6 @@ impl Attacker {
         hasher.update(&header_id);
         hasher.update(round.to_le_bytes());
         hasher.update(&author);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }

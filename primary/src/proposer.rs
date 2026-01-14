@@ -216,6 +216,10 @@ impl Proposer {
             && self.round % ATTACKING_INTERVAL == 0
             && self.victim_header.round == self.round
         {
+
+            let header_local_order_digests: VecDeque<_> = self.local_order_digests.drain(..).collect();
+            let header_local_order_map: BTreeMap<Digest, WorkerId> = header_local_order_digests.iter().cloned().collect();
+
             let temp_last_parents: BTreeSet<Digest> = self.last_parents.drain(..).collect();
             let temp_payload_digests: Vec<_> = self.batch_digests.iter().cloned().collect();
             let mut min_index = 0;
@@ -225,6 +229,7 @@ impl Proposer {
                 self.round,
                 min_index,
                 &temp_payload_digests,
+                &header_local_order_map,
                 &temp_last_parents,
             );
             let mut min_digest =
@@ -247,6 +252,7 @@ impl Proposer {
                     self.round,
                     element_num,
                     &temp_payload_digests,
+                    &header_local_order_map,
                     &temp_last_parents,
                 );
                 let temp_digest =
@@ -261,7 +267,6 @@ impl Proposer {
             }
             
             let header_batch_digests: VecDeque<_> = self.batch_digests.drain(0..(min_index + 1)).collect();
-            let header_local_order_digests: VecDeque<_> = self.local_order_digests.drain(..).collect();
             
             // Calculate the byte size of remaining batch digests
             for (digest, _) in &self.batch_digests {
@@ -450,6 +455,19 @@ impl Proposer {
             }
 
             tokio::select! {
+                Some(header) = self.rx_monitor_header.recv() => {
+                    // Find a victim header, start front-running it by constructing propagation priority blocks
+                    if self.attacker.attack_type() != HONEST_NODE && !self.is_attacking && self.round <= header.round {
+                        self.victim_header.update(header);
+                        self.is_attacking = true;
+                    }
+                }
+                Some(certificate) = self.rx_clean_certificate.recv() => {
+                    if self.attacker.attack_type() != HONEST_NODE && certificate.header.round >= self.victim_header.round {
+                        // the victim certificate has been committed or missed, move to attack another certificate
+                        self.is_attacking = false;
+                    }
+                },
                 Some((parents, round)) = self.rx_core.recv() => {
                     if round < self.round {
                         continue;
@@ -530,53 +548,6 @@ impl Proposer {
 
                     }
                 },
-                Some(header) = self.rx_monitor_header.recv() => {
-                    // Find a victim header, start front-running it by constructing propagation priority blocks
-                    if self.attacker.attack_type() == FISSURE_ATTACK || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK {
-                        if !self.is_attacking && self.round <= header.round {
-                            self.victim_header.update(header);
-                            self.is_attacking = true;
-                        }
-                    } else if self.attacker.attack_type() == SLUGGISH_ATTACK || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK {
-                        if !self.is_attacking && self.round <= header.round {
-                            self.victim_header.update(header);
-                            self.is_attacking = true;
-                        }
-                    } else if (self.attacker.attack_type() == SPECULATIVE_ATTACK || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK)
-                        && !self.is_attacking && self.round <= header.round
-                    {
-                        self.victim_header.update(header);
-                        self.is_attacking = true;
-                    } else if self.attacker.attack_type() == MONITOR_NOTHING {
-                        if !self.is_attacking && self.round <= header.round {
-                            self.victim_header.update(header);
-                            self.is_attacking = true;
-                        }
-                    }
-                }
-                Some(certificate) = self.rx_clean_certificate.recv() => {
-                    if self.attacker.attack_type() == FISSURE_ATTACK || self.attacker.attack_type() == FISSURE_NOT_ACTIVE_ATTACK {
-                        if certificate.header.round >= self.victim_header.round {
-                            // the victim certificate has been committed or missed, move to attack another certificate
-                            self.is_attacking = false;
-                        }
-                    } else if self.attacker.attack_type() == SLUGGISH_ATTACK || self.attacker.attack_type() == SLUGGISH_NOT_ACTIVE_ATTACK {
-                        if certificate.header.round >= self.victim_header.round {
-                            // the victim certificate has been committed or missed, move to attack another certificate
-                            self.is_attacking = false;
-                        }
-                    } else if self.attacker.attack_type() == SPECULATIVE_ATTACK || self.attacker.attack_type() == SPECULATIVE_NOT_DELEGATE_ATTACK {
-                        if certificate.header.round >= self.victim_header.round {
-                            // the victim certificate has been committed or missed, move to attack another certificate
-                            self.is_attacking = false;
-                        }
-                    } else if self.attacker.attack_type() == MONITOR_NOTHING {
-                        if certificate.header.round >= self.victim_header.round {
-                            // the victim certificate has been committed or missed, move to attack another certificate
-                            self.is_attacking = false;
-                        }
-                    }
-                }
                 () = &mut timer => {
                     // Nothing to do.
                 }
