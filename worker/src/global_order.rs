@@ -893,7 +893,7 @@ impl GlobalOrder {
             );
             
             for digest in output_digests.iter() {
-                log::info!("Executed {:?}", digest);
+                log::info!("sub_dag_id={}: Executed {:?}", sub_dag_id, digest);
             }
             
             // Mark as Finalized (3)

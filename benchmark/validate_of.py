@@ -2,24 +2,21 @@
 """
 Batch-Order-Fairness Validator for DAG BFT Systems (Themis Protocol)
 
-This script validates that a distributed system's execution order respects
-the batch-order-fairness property as defined in Themis:
+Validates that execution order respects the batch-order-fairness property:
 - If γ fraction of nodes receive tx before tx', then tx should be ordered no later than tx'
-- Transactions in a Condorcet cycle can be ordered arbitrarily
+- Transactions in Condorcet cycles can be ordered arbitrarily
 
-Based on Themis protocol implementation from adv_reorder.py
+Strategy:
+1. Parse logs to extract per-node receive orders and per-subdag executions
+2. Validate each sub_dag independently (in parallel) - O(subdag_size²) instead of O(total²)
+3. Check for suspicious missing transactions
+4. Verify execution convergence across nodes
 
 Usage:
-    python validate_batch_order_fairness.py --logs-dir <path> [--gamma 0.51] [--f 0] [--verbose]
-    
-Log file format expected:
-    - Node logs: worker-X-0.log where X is node index (0 to N-1)
-    - Receive order: "Receival of tx_digest <DIGEST> at position <N>"
-    - Execution: "Executed <DIGEST>"
+    python validate_order_fairness.py --logs-dir /path/to/logs --gamma 1.0 --f 4
 """
 
 import re
-import os
 import sys
 import argparse
 import networkx as nx
@@ -28,743 +25,508 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
 from pathlib import Path
 from re import findall, search
+from multiprocessing import Pool, cpu_count
+import time
+
+
+# =============================================================================
+# REGEX PATTERNS (matching Rust log::info! format)
+# =============================================================================
+
+# Rust: log::info!("Receival of tx_digest {:?} at position {}", tx_digest, counter);
+# Output: "Receival of tx_digest XYZ123= at position 42"
+RECEIVE_PATTERN = re.compile(r'Receival of tx_digest\s+([^\s]+)\s+at position\s+(\d+)')
+
+# Rust: log::info!("sub_dag_id={}: Executed {:?}", sub_dag_id, digest);
+# Output: "sub_dag_id=1: Executed XYZ123="
+EXEC_PATTERN = re.compile(r'sub_dag_id=(\d+):\s*Executed\s+([^\s]+)')
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class SubDagResult:
+    """Validation result for a single sub_dag."""
+    sub_dag_id: int
+    num_txs: int
+    is_valid: bool
+    violations: List[Tuple[str, str, str]]
+    num_sccs: int
+    largest_scc: int
 
 
 @dataclass
 class ValidationResult:
-    """Results of batch-order-fairness validation."""
+    """Full validation result."""
     is_valid: bool
-    total_tx_pairs: int
-    constrained_pairs: int  # Pairs with a definite order (not in same SCC)
-    cycle_pairs: int        # Pairs in Condorcet cycles (arbitrary order allowed)
-    violations: List[Tuple[str, str, str]]  # (tx1, tx2, reason)
-    num_sccs: int
-    largest_scc_size: int
-    execution_converged: bool  # Did all nodes converge to same execution order?
+    total_sub_dags: int
+    valid_sub_dags: int
+    invalid_sub_dags: int
+    total_txs: int
+    violations: List[Tuple[int, str, str, str]]  # (sub_dag_id, tx1, tx2, reason)
+    execution_converged: bool
     execution_mismatch_details: Optional[str] = None
-    # Suspicious transactions: received by many nodes before cutoff but not executed
-    suspicious_missing_txs: List[Tuple[str, int, float, str]] = field(default_factory=list)
-    # Format: (tx_digest, nodes_that_received, avg_position_ratio, reason)
+    suspicious_missing: List[Tuple[str, int, str]] = field(default_factory=list)
     
     def __str__(self):
         status = "✓ VALID" if self.is_valid else "✗ INVALID"
-        converge_status = "✓ YES" if self.execution_converged else "✗ NO"
-        suspicious_status = "✗ YES" if self.suspicious_missing_txs else "✓ NONE"
+        conv = "✓ YES" if self.execution_converged else "✗ NO"
+        susp = "✗ YES" if self.suspicious_missing else "✓ NONE"
+        
         s = f"""
 ╔══════════════════════════════════════════════════════════════╗
-║          Batch-Order-Fairness Validation Result              ║
-║                    (Themis Protocol)                         ║
+║       Batch-Order-Fairness Validation Result (Themis)        ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Status: {status:50} ║
-║  Execution Converged: {converge_status:37} ║
-║  Suspicious Missing Txs: {suspicious_status:34} ║
+║  Execution Converged: {conv:37} ║
+║  Suspicious Missing: {susp:38} ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Total transaction pairs analyzed: {self.total_tx_pairs:<24} ║
-║  Pairs with ordering constraints:  {self.constrained_pairs:<24} ║
-║  Pairs in Condorcet cycles:        {self.cycle_pairs:<24} ║
-║  Number of SCCs:                   {self.num_sccs:<24} ║
-║  Largest SCC size:                 {self.largest_scc_size:<24} ║
-║  Violations found:                 {len(self.violations):<24} ║
+║  Total sub_dags:     {self.total_sub_dags:<38} ║
+║  Valid sub_dags:     {self.valid_sub_dags:<38} ║
+║  Invalid sub_dags:   {self.invalid_sub_dags:<38} ║
+║  Total transactions: {self.total_txs:<38} ║
+║  Total violations:   {len(self.violations):<38} ║
 ╚══════════════════════════════════════════════════════════════╝
 """
         if not self.execution_converged and self.execution_mismatch_details:
-            s += f"\nExecution Convergence Issue:\n{self.execution_mismatch_details}\n"
+            s += f"\nExecution Convergence Issues:\n{self.execution_mismatch_details}\n"
         
-        if self.suspicious_missing_txs:
-            s += f"\n⚠️  SUSPICIOUS MISSING TRANSACTIONS ({len(self.suspicious_missing_txs)}):\n"
-            s += "    These txs were received by many/all nodes BEFORE the last executed tx,\n"
-            s += "    but are NOT in the execution list. Possible censorship or bug!\n\n"
-            for i, (tx, num_nodes, avg_pos_ratio, reason) in enumerate(self.suspicious_missing_txs[:10], 1):
-                tx_short = tx[:24] + "..." if len(tx) > 24 else tx
-                s += f"  {i}. {tx_short}\n"
-                s += f"     Received by: {num_nodes} nodes, Avg position: {avg_pos_ratio:.1%} through receive order\n"
-                s += f"     {reason}\n"
-            if len(self.suspicious_missing_txs) > 10:
-                s += f"  ... and {len(self.suspicious_missing_txs) - 10} more suspicious txs\n"
+        if self.suspicious_missing:
+            s += f"\n⚠️  SUSPICIOUS MISSING TRANSACTIONS ({len(self.suspicious_missing)}):\n"
+            s += "    Received by many nodes BEFORE last executed, but never executed!\n\n"
+            for i, (tx, nodes, reason) in enumerate(self.suspicious_missing[:10], 1):
+                tx_short = tx[:32] + "..." if len(tx) > 32 else tx
+                s += f"  {i}. {tx_short}\n     {reason}\n"
+            if len(self.suspicious_missing) > 10:
+                s += f"  ... and {len(self.suspicious_missing) - 10} more\n"
         
         if self.violations:
-            s += "\nBatch-Order-Fairness Violations:\n"
-            for i, (tx1, tx2, reason) in enumerate(self.violations[:20], 1):
-                tx1_short = tx1[:16] + "..." if len(tx1) > 16 else tx1
-                tx2_short = tx2[:16] + "..." if len(tx2) > 16 else tx2
-                s += f"  {i}. {tx1_short} should come before {tx2_short}\n"
-                s += f"     Reason: {reason}\n"
+            s += f"\nOrder-Fairness Violations:\n"
+            for i, (sd, tx1, tx2, reason) in enumerate(self.violations[:20], 1):
+                t1 = tx1[:16] + "..." if len(tx1) > 16 else tx1
+                t2 = tx2[:16] + "..." if len(tx2) > 16 else tx2
+                s += f"  {i}. [sub_dag {sd}] {t1} should precede {t2}\n"
             if len(self.violations) > 20:
-                s += f"  ... and {len(self.violations) - 20} more violations\n"
+                s += f"  ... and {len(self.violations) - 20} more\n"
+        
         return s
 
 
-class BatchOrderFairnessValidator:
+# =============================================================================
+# LOG PARSING (inspired by logs.py - fast findall approach)
+# =============================================================================
+
+def parse_worker_log(log_path: Path) -> dict:
     """
-    Validates batch-order-fairness property for DAG BFT consensus.
+    Parse a single worker log file.
     
-    Implements the Themis protocol validation:
-    - Threshold: n * (1 - γ) + f + 1
-    - When both directions meet threshold, higher count wins
-    - SCCs (Condorcet cycles) allow arbitrary ordering
+    Returns:
+        {
+            'node_id': str,
+            'receive_orders': {tx_digest: position},
+            'subdag_executions': {sub_dag_id: [tx_digests in order]}
+        }
+    """
+    # Extract node ID from filename: worker-X-0.log -> X
+    match = search(r'worker-(\d+)-', log_path.name)
+    node_id = match.group(1) if match else log_path.stem
     
-    Based on themis_protocol() from adv_reorder.py
+    with open(log_path, 'r') as f:
+        content = f.read()
+    
+    # Parse receive orders using findall (single regex pass - fast!)
+    receive_orders = {}
+    for tx, pos in findall(RECEIVE_PATTERN, content):
+        tx = tx.strip()
+        if tx not in receive_orders:  # Keep first occurrence
+            receive_orders[tx] = int(pos)
+    
+    # Parse sub_dag executions using findall
+    subdag_execs = defaultdict(list)
+    seen = defaultdict(set)
+    
+    for sd_id, tx in findall(EXEC_PATTERN, content):
+        sd_id = int(sd_id)
+        tx = tx.strip()
+        if tx not in seen[sd_id]:  # Keep order, no duplicates
+            subdag_execs[sd_id].append(tx)
+            seen[sd_id].add(tx)
+    
+    return {
+        'node_id': node_id,
+        'receive_orders': receive_orders,
+        'subdag_executions': dict(subdag_execs),
+    }
+
+
+# =============================================================================
+# SUB_DAG VALIDATOR
+# =============================================================================
+
+def validate_subdag(args) -> SubDagResult:
+    """
+    Validate a single sub_dag's order-fairness (worker function for Pool).
+    
+    Builds Themis order graph and checks execution respects it.
+    """
+    sub_dag_id, txs, node_orders, gamma, f, n = args
+    
+    if not txs:
+        return SubDagResult(sub_dag_id, 0, True, [], 0, 0)
+    
+    threshold = n * (1 - gamma) + gamma * f + 1
+    
+    # Count orderings between tx pairs
+    def count_orderings(tx1: str, tx2: str) -> Tuple[int, int]:
+        c12, c21 = 0, 0
+        for orders in node_orders.values():
+            p1, p2 = orders.get(tx1), orders.get(tx2)
+            if p1 is not None and p2 is not None:
+                if p1 < p2:
+                    c12 += 1
+                elif p2 < p1:
+                    c21 += 1
+        return c12, c21
+    
+    # Build Themis order graph
+    G = nx.DiGraph()
+    G.add_nodes_from(txs)
+    
+    for i, tx1 in enumerate(txs):
+        for tx2 in txs[i+1:]:
+            c12, c21 = count_orderings(tx1, tx2)
+            
+            # Themis protocol edge logic
+            if c12 >= threshold and c21 >= threshold:
+                # Both meet threshold - higher count wins
+                if c12 >= c21:
+                    G.add_edge(tx1, tx2)
+                else:
+                    G.add_edge(tx2, tx1)
+            elif c12 >= threshold:
+                G.add_edge(tx1, tx2)
+            elif c21 >= threshold:
+                G.add_edge(tx2, tx1)
+    
+    # Find SCCs (Condorcet cycles - any order within SCC is valid)
+    sccs = list(nx.strongly_connected_components(G))
+    largest_scc = max(len(s) for s in sccs) if sccs else 0
+    
+    tx_to_scc = {}
+    for idx, scc in enumerate(sccs):
+        for tx in scc:
+            tx_to_scc[tx] = idx
+    
+    # Build condensation graph (DAG of SCCs)
+    H = nx.condensation(G, sccs)
+    
+    # Check execution order (txs list IS the execution order for this sub_dag)
+    exec_pos = {tx: i for i, tx in enumerate(txs)}
+    
+    violations = []
+    for i, tx1 in enumerate(txs):
+        for tx2 in txs[i+1:]:
+            scc1, scc2 = tx_to_scc.get(tx1), tx_to_scc.get(tx2)
+            
+            if scc1 is None or scc2 is None or scc1 == scc2:
+                continue  # Same SCC = any order OK
+            
+            # Check constraint in condensation graph
+            if nx.has_path(H, scc1, scc2):
+                if exec_pos[tx1] > exec_pos[tx2]:
+                    c12, c21 = count_orderings(tx1, tx2)
+                    violations.append((tx1, tx2, f"{c12}/{n} nodes saw tx1 first"))
+            elif nx.has_path(H, scc2, scc1):
+                if exec_pos[tx2] > exec_pos[tx1]:
+                    c12, c21 = count_orderings(tx1, tx2)
+                    violations.append((tx2, tx1, f"{c21}/{n} nodes saw tx2 first"))
+    
+    return SubDagResult(
+        sub_dag_id=sub_dag_id,
+        num_txs=len(txs),
+        is_valid=len(violations) == 0,
+        violations=violations,
+        num_sccs=len(sccs),
+        largest_scc=largest_scc
+    )
+
+
+# =============================================================================
+# MAIN VALIDATOR
+# =============================================================================
+
+class OrderFairnessValidator:
+    """
+    Validates batch-order-fairness by chunking into sub_dags.
+    
+    Complexity: O(num_subdags × avg_subdag_size²) instead of O(total_txs²)
     """
     
-    # Regex patterns for log parsing (matching your format)
-    RECEIVE_PATTERN = re.compile(
-        r"Receival of tx_digest\s+([^ \n]+)\s+at position\s+(\d+)"
-    )
-    
-    # Execution pattern matching your parser: r'Executed ([^ \n]+)'
-    EXECUTED_PATTERN = re.compile(r"Executed\s+([^ \n]+)")
-    
-    # Finalization pattern
-    FINALIZED_PATTERN = re.compile(
-        r"sub_dag_id=(\d+):\s*FINALIZED!\s*(\d+)\s*transactions"
-    )
-    
-    def __init__(self, gamma: float = 0.51, f: int = 0, verbose: bool = False,
-                 executed_only: bool = True):
-        """
-        Initialize the validator.
-        
-        Args:
-            gamma: Order-fairness parameter (0.5 < γ ≤ 1)
-            f: Byzantine fault tolerance bound
-            verbose: Print detailed progress information
-            executed_only: If True, only consider transactions that were actually
-                          executed (important when benchmark ends with SIGKILL,
-                          leaving some received txs unfinalized)
-        """
+    def __init__(self, gamma: float = 1.0, f: int = 0):
         if not (0.5 < gamma <= 1.0):
-            raise ValueError("gamma must be in range (0.5, 1.0]")
+            raise ValueError("gamma must be in (0.5, 1.0]")
         
         self.gamma = gamma
         self.f = f
-        self.verbose = verbose
-        self.executed_only = executed_only
         
-        # Node receive orders: node_id -> {tx_digest -> position}
-        self.node_orders: Dict[str, Dict[str, int]] = defaultdict(dict)
+        # Per-node data
+        self.node_orders: Dict[str, Dict[str, int]] = {}
+        self.node_subdag_execs: Dict[str, Dict[int, List[str]]] = {}
         
-        # Execution order per node: node_id -> [tx_digests in order]
-        self.node_execution_orders: Dict[str, List[str]] = defaultdict(list)
-        
-        # Canonical execution order (from first node or consensus)
-        self.execution_order: List[str] = []
-        
-        # All unique transaction digests (from receive orders)
+        # Aggregated data
         self.all_txs: Set[str] = set()
+        self.subdag_txs: Dict[int, List[str]] = {}  # Canonical execution per sub_dag
+        self.full_exec_order: List[str] = []
         
-        # Transactions to actually validate (may be filtered to executed only)
-        self.txs_to_validate: Set[str] = set()
-        
-        # Number of nodes
         self.n: int = 0
-        
-        # Execution convergence status
         self.execution_converged: bool = True
-        self.execution_mismatch_details: Optional[str] = None
-        
-    def _log(self, msg: str):
-        """Print message if verbose mode is enabled."""
-        if self.verbose:
-            print(f"[INFO] {msg}")
+        self.convergence_details: Optional[str] = None
     
-    def parse_logs_dir(self, logs_dir: str):
-        """
-        Parse all worker logs from directory.
-        
-        Expects files named: worker-X-0.log where X is node index
-        
-        Args:
-            logs_dir: Directory containing worker log files
-        """
+    def parse_logs(self, logs_dir: str):
+        """Parse all worker logs in parallel."""
         logs_path = Path(logs_dir)
-        
-        # Find worker log files: worker-X-0.log
         log_files = sorted(logs_path.glob("worker-*-0.log"))
         
         if not log_files:
-            raise FileNotFoundError(
-                f"No worker log files found in {logs_dir}. "
-                f"Expected format: worker-X-0.log"
-            )
+            raise FileNotFoundError(f"No worker-*-0.log files found in {logs_dir}")
         
-        self._log(f"Found {len(log_files)} worker log files")
+        print(f"[PROGRESS] Found {len(log_files)} worker log files", flush=True)
+        print(f"[PROGRESS] Parsing in parallel ({cpu_count()} CPUs)...", flush=True)
         
-        for log_file in log_files:
-            # Extract node ID from filename (e.g., "worker-0-0.log" -> "0")
-            match = re.search(r'worker-(\d+)-', log_file.name)
-            if match:
-                node_id = match.group(1)
-            else:
-                node_id = log_file.stem
+        start = time.time()
+        with Pool() as p:
+            results = p.map(parse_worker_log, log_files)
+        print(f"[PROGRESS] Parsing completed in {time.time() - start:.1f}s", flush=True)
+        
+        # Merge results
+        for r in results:
+            nid = r['node_id']
+            self.node_orders[nid] = r['receive_orders']
+            self.node_subdag_execs[nid] = r['subdag_executions']
+            self.all_txs.update(r['receive_orders'].keys())
             
-            self._parse_single_worker_log(node_id, log_file)
+            n_recv = len(r['receive_orders'])
+            n_sd = len(r['subdag_executions'])
+            n_exec = sum(len(v) for v in r['subdag_executions'].values())
+            print(f"[PROGRESS]   Node {nid}: {n_recv} received, {n_sd} sub_dags, {n_exec} executed", flush=True)
         
         self.n = len(self.node_orders)
-        self._log(f"Parsed {self.n} nodes, {len(self.all_txs)} unique transactions")
+        print(f"[PROGRESS] Total: {self.n} nodes, {len(self.all_txs)} unique txs", flush=True)
         
-        # Check execution convergence and set canonical execution order
-        self._check_execution_convergence()
-        
-    def _parse_single_worker_log(self, node_id: str, log_path: Path):
-        """
-        Parse a single worker's log file for receive orders and execution.
-        
-        Based on your parsing code pattern.
-        """
-        self._log(f"Parsing {log_path} as node {node_id}")
-        
-        with open(log_path, 'r') as f:
-            log_content = f.read()
-        
-        # Parse receive orders
-        for match in self.RECEIVE_PATTERN.finditer(log_content):
-            tx_digest = match.group(1).strip()
-            position = int(match.group(2))
-            
-            if tx_digest not in self.node_orders[node_id]:
-                self.node_orders[node_id][tx_digest] = position
-                self.all_txs.add(tx_digest)
-        
-        # Parse execution order (rank by order of appearance)
-        # Matching your parser: keeps earliest rank if tx appears multiple times
-        exec_order = []
-        seen_txs = set()
-        for line in log_content.splitlines():
-            match = self.EXECUTED_PATTERN.search(line)
-            if match:
-                tx = match.group(1).strip()
-                if tx not in seen_txs:
-                    exec_order.append(tx)
-                    seen_txs.add(tx)
-        
-        self.node_execution_orders[node_id] = exec_order
-        
-        self._log(f"  Node {node_id}: {len(self.node_orders[node_id])} receive orders, "
-                  f"{len(exec_order)} executed txs")
+        self._check_convergence()
+        self._build_canonical_order()
     
-    def _check_execution_convergence(self):
-        """
-        Check that all nodes converged to the same execution order.
-        Also sets txs_to_validate based on executed_only flag.
-        """
-        if not self.node_execution_orders:
+    def _check_convergence(self):
+        """Verify all nodes converged to same execution order per sub_dag."""
+        print(f"[PROGRESS] Checking execution convergence...", flush=True)
+        
+        all_subdags = set()
+        for execs in self.node_subdag_execs.values():
+            all_subdags.update(execs.keys())
+        
+        if not all_subdags:
             self.execution_converged = False
-            self.execution_mismatch_details = "No execution orders found in any log"
+            self.convergence_details = "No sub_dag executions found in any log"
             return
         
-        # Get reference execution order (from first node with data)
-        reference_node = None
-        reference_order = None
-        
-        for node_id, exec_order in sorted(self.node_execution_orders.items()):
-            if exec_order:
-                reference_node = node_id
-                reference_order = exec_order
-                break
-        
-        if reference_order is None:
-            self.execution_converged = False
-            self.execution_mismatch_details = "All nodes have empty execution orders"
-            return
-        
-        self.execution_order = reference_order
-        
-        # Compare all nodes to reference
         mismatches = []
-        for node_id, exec_order in sorted(self.node_execution_orders.items()):
-            if not exec_order:
+        for sd_id in sorted(all_subdags):
+            # Find reference (first non-empty)
+            ref_order, ref_node = None, None
+            for nid, execs in sorted(self.node_subdag_execs.items()):
+                if sd_id in execs and execs[sd_id]:
+                    ref_order, ref_node = execs[sd_id], nid
+                    break
+            
+            if ref_order is None:
                 continue
-                
-            if exec_order != reference_order:
-                # Find first difference
-                min_len = min(len(exec_order), len(reference_order))
-                for i in range(min_len):
-                    if exec_order[i] != reference_order[i]:
-                        mismatches.append(
-                            f"Node {node_id} differs from node {reference_node} at position {i}: "
-                            f"{exec_order[i][:20]}... vs {reference_order[i][:20]}..."
-                        )
+            
+            # Compare others
+            for nid, execs in sorted(self.node_subdag_execs.items()):
+                if sd_id in execs and execs[sd_id] and execs[sd_id] != ref_order:
+                    mismatches.append(f"sub_dag {sd_id}: node {nid} differs from node {ref_node}")
+                    if len(mismatches) >= 10:
                         break
-                else:
-                    mismatches.append(
-                        f"Node {node_id} has different length: {len(exec_order)} vs {len(reference_order)}"
-                    )
+            if len(mismatches) >= 10:
+                break
         
         if mismatches:
             self.execution_converged = False
-            self.execution_mismatch_details = "\n".join(mismatches[:5])
-            if len(mismatches) > 5:
-                self.execution_mismatch_details += f"\n... and {len(mismatches) - 5} more mismatches"
+            self.convergence_details = "\n".join(mismatches[:10])
+            if len(mismatches) > 10:
+                self.convergence_details += f"\n... and {len(mismatches) - 10} more"
+            print(f"[PROGRESS] ✗ NOT converged: {len(mismatches)} mismatches", flush=True)
         else:
             self.execution_converged = True
-            self._log(f"All {len(self.node_execution_orders)} nodes converged to same execution order")
-        
-        # Set transactions to validate based on executed_only flag
-        if self.executed_only:
-            self.txs_to_validate = set(self.execution_order)
-            not_executed = len(self.all_txs) - len(self.txs_to_validate)
-            self._log(f"executed_only=True: validating {len(self.txs_to_validate)} executed txs "
-                      f"(ignoring {not_executed} received-but-not-executed txs)")
-        else:
-            self.txs_to_validate = self.all_txs.copy()
-            self._log(f"executed_only=False: validating all {len(self.txs_to_validate)} received txs")
+            print(f"[PROGRESS] ✓ All nodes converged", flush=True)
     
-    def _compute_threshold(self) -> float:
-        """
-        Compute the Themis threshold for edge creation.
+    def _build_canonical_order(self):
+        """Build canonical tx list per sub_dag from first node with data."""
+        print(f"[PROGRESS] Building canonical execution order...", flush=True)
         
-        From adv_reorder.py themis_protocol():
-            threshold = n * (1-gamma) + f + 1
-        """
-        threshold = self.n * (1 - self.gamma) + self.gamma * self.f + 1
-        self._log(f"Themis threshold for n={self.n}, γ={self.gamma}, f={self.f}: {threshold}")
-        return threshold
+        all_subdags = set()
+        for execs in self.node_subdag_execs.values():
+            all_subdags.update(execs.keys())
+        
+        for sd_id in sorted(all_subdags):
+            for nid, execs in sorted(self.node_subdag_execs.items()):
+                if sd_id in execs and execs[sd_id]:
+                    self.subdag_txs[sd_id] = execs[sd_id]
+                    break
+        
+        # Full order = sub_dag 1 txs ++ sub_dag 2 txs ++ ...
+        self.full_exec_order = []
+        for sd_id in sorted(self.subdag_txs.keys()):
+            self.full_exec_order.extend(self.subdag_txs[sd_id])
+        
+        sizes = [len(txs) for txs in self.subdag_txs.values()]
+        print(f"[PROGRESS] {len(self.subdag_txs)} sub_dags, {len(self.full_exec_order)} total executed", flush=True)
+        if sizes:
+            print(f"[PROGRESS] Sub_dag sizes: min={min(sizes)}, max={max(sizes)}, avg={sum(sizes)/len(sizes):.0f}", flush=True)
     
-    def detect_suspicious_missing_txs(self) -> List[Tuple[str, int, float, str]]:
-        """
-        Detect transactions that were received by many nodes BEFORE the last
-        executed transaction, but are NOT in the execution list.
+    def _detect_suspicious(self) -> List[Tuple[str, int, str]]:
+        """Find txs received early by many nodes but never executed."""
+        print(f"[PROGRESS] Detecting suspicious missing transactions...", flush=True)
         
-        This could indicate:
-        - Censorship attack
-        - Liveness bug
-        - Protocol violation
-        
-        Returns:
-            List of (tx_digest, num_nodes_received, avg_position_ratio, reason)
-        """
-        if not self.execution_order:
-            return []
-        
-        executed_set = set(self.execution_order)
-        non_executed = self.all_txs - executed_set
+        executed = set(self.full_exec_order)
+        non_executed = self.all_txs - executed
         
         if not non_executed:
-            self._log("No non-executed transactions to check for suspicious missing")
+            print(f"[PROGRESS] All received txs were executed", flush=True)
             return []
         
-        self._log(f"Checking {len(non_executed)} non-executed txs for suspicious missing...")
+        print(f"[PROGRESS] Checking {len(non_executed)} non-executed txs...", flush=True)
         
-        # For each node, find the position of the LAST executed transaction
-        # This is our "cutoff" - anything received before this should have been executed
-        node_cutoffs: Dict[str, int] = {}
-        node_max_positions: Dict[str, int] = {}
-        
-        for node_id, orders in self.node_orders.items():
-            max_pos = max(orders.values()) if orders else 0
-            node_max_positions[node_id] = max_pos
-            
-            # Find position of last executed tx at this node
-            last_exec_pos = -1
-            for tx in self.execution_order:
-                if tx in orders:
-                    last_exec_pos = max(last_exec_pos, orders[tx])
-            
-            if last_exec_pos >= 0:
-                node_cutoffs[node_id] = last_exec_pos
+        # Find cutoff per node (position of last executed tx)
+        cutoffs = {}
+        for nid, orders in self.node_orders.items():
+            last_pos = max((orders.get(tx, -1) for tx in self.full_exec_order), default=-1)
+            if last_pos >= 0:
+                cutoffs[nid] = last_pos
         
         suspicious = []
+        min_nodes = self.n - self.f
         
         for tx in non_executed:
-            nodes_received = []
-            positions_before_cutoff = []
-            position_ratios = []
-            
-            for node_id, orders in self.node_orders.items():
+            n_recv, n_before = 0, 0
+            for nid, orders in self.node_orders.items():
                 if tx in orders:
-                    pos = orders[tx]
-                    nodes_received.append(node_id)
-                    
-                    # Check if this tx was received BEFORE the last executed tx
-                    if node_id in node_cutoffs:
-                        cutoff = node_cutoffs[node_id]
-                        if pos < cutoff:
-                            positions_before_cutoff.append(node_id)
-                        
-                        # Calculate position ratio (how early in the receive order)
-                        max_pos = node_max_positions.get(node_id, cutoff)
-                        if max_pos > 0:
-                            position_ratios.append(pos / max_pos)
+                    n_recv += 1
+                    if nid in cutoffs and orders[tx] < cutoffs[nid]:
+                        n_before += 1
             
-            num_received = len(nodes_received)
-            num_before_cutoff = len(positions_before_cutoff)
-            
-            # Suspicious if:
-            # 1. Received by at least (n - f) nodes (or all nodes)
-            # 2. AND received BEFORE the cutoff at most of those nodes
-            min_nodes_for_suspicion = self.n - self.f
-            
-            if num_received >= min_nodes_for_suspicion and num_before_cutoff >= min_nodes_for_suspicion:
-                avg_pos_ratio = sum(position_ratios) / len(position_ratios) if position_ratios else 1.0
-                
-                reason = (f"Received by {num_received}/{self.n} nodes, "
-                         f"{num_before_cutoff} received it BEFORE last executed tx")
-                
-                suspicious.append((tx, num_received, avg_pos_ratio, reason))
-                
-                self._log(f"  SUSPICIOUS: {tx[:32]}... - {reason}")
+            if n_recv >= min_nodes and n_before >= min_nodes:
+                suspicious.append((tx, n_recv, f"Received by {n_recv}/{self.n}, {n_before} before cutoff"))
         
-        # Sort by average position ratio (earlier = more suspicious)
-        suspicious.sort(key=lambda x: x[2])
-        
-        if suspicious:
-            self._log(f"Found {len(suspicious)} suspicious missing transactions!")
-        else:
-            self._log("No suspicious missing transactions found")
-        
+        print(f"[PROGRESS] Found {len(suspicious)} suspicious missing", flush=True)
         return suspicious
     
-    def _count_orderings(self, tx1: str, tx2: str) -> Tuple[int, int]:
-        """
-        Count how many nodes received tx1 before tx2 and vice versa.
-        
-        Returns:
-            (count_tx1_before_tx2, count_tx2_before_tx1)
-        """
-        count_1_before_2 = 0
-        count_2_before_1 = 0
-        
-        for node_id, orders in self.node_orders.items():
-            pos1 = orders.get(tx1)
-            pos2 = orders.get(tx2)
-            
-            if pos1 is not None and pos2 is not None:
-                if pos1 < pos2:
-                    count_1_before_2 += 1
-                elif pos2 < pos1:
-                    count_2_before_1 += 1
-        
-        return count_1_before_2, count_2_before_1
-    
-    def build_order_graph(self) -> nx.DiGraph:
-        """
-        Build the order graph using Themis protocol rules.
-        
-        Only considers transactions in txs_to_validate (which respects
-        the executed_only flag - important for SIGKILL scenarios).
-        
-        Direct port from adv_reorder.py themis_protocol():
-        
-        for first, second in pair_indices:
-            if total_counts[(first,second)] >= threshold and total_counts[(second, first)] >= threshold:
-                if total_counts[(first,second)] >= total_counts[(second,first)]:
-                    graphs[index].add_edge(*(first,second))
-                else:
-                    graphs[index].add_edge(*(second,first))
-            elif total_counts[(first,second)] >= threshold:
-                graphs[index].add_edge(*(first,second))
-            elif total_counts[(second,first)] >= threshold:
-                graphs[index].add_edge(*(second,first))
-        
-        Returns:
-            NetworkX DiGraph representing the order constraints
-        """
-        G = nx.DiGraph()
-        G.add_nodes_from(self.txs_to_validate)
-        
-        threshold = self._compute_threshold()
-        tx_list = list(self.txs_to_validate)
-        num_txs = len(tx_list)
-        
-        self._log(f"Building Themis order graph for {num_txs} transactions...")
-        
-        edges_added = 0
-        both_threshold = 0
-        single_threshold = 0
-        no_edge = 0
-        
-        for i, tx1 in enumerate(tx_list):
-            for tx2 in tx_list[i+1:]:
-                count_1_2, count_2_1 = self._count_orderings(tx1, tx2)
-                
-                # Themis protocol edge addition (exact logic from adv_reorder.py)
-                if count_1_2 >= threshold and count_2_1 >= threshold:
-                    # Both meet threshold - higher count wins
-                    both_threshold += 1
-                    if count_1_2 >= count_2_1:
-                        G.add_edge(tx1, tx2)
-                    else:
-                        G.add_edge(tx2, tx1)
-                    edges_added += 1
-                elif count_1_2 >= threshold:
-                    G.add_edge(tx1, tx2)
-                    edges_added += 1
-                    single_threshold += 1
-                elif count_2_1 >= threshold:
-                    G.add_edge(tx2, tx1)
-                    edges_added += 1
-                    single_threshold += 1
-                else:
-                    no_edge += 1
-        
-        self._log(f"Order graph: {G.number_of_nodes()} nodes, {edges_added} edges")
-        self._log(f"  Both met threshold (tiebreak): {both_threshold}")
-        self._log(f"  Single direction threshold: {single_threshold}")
-        self._log(f"  No edge (neither met threshold): {no_edge}")
-        
-        return G
-    
     def validate(self) -> ValidationResult:
-        """
-        Validate that execution order respects Themis batch-order-fairness.
+        """Run full validation with parallel sub_dag processing."""
+        print(f"\n{'='*60}", flush=True)
+        print(f"[PROGRESS] STARTING VALIDATION", flush=True)
+        print(f"[PROGRESS] gamma={self.gamma}, f={self.f}, n={self.n}", flush=True)
+        print(f"[PROGRESS] threshold = {self.n * (1 - self.gamma) + self.gamma * self.f + 1:.2f}", flush=True)
+        print(f"{'='*60}\n", flush=True)
         
-        Also detects suspicious missing transactions (received by many nodes
-        before the cutoff, but not executed).
-        
-        Only considers transactions in txs_to_validate (respects executed_only flag).
-        
-        Returns:
-            ValidationResult with detailed validation information
-        """
         if not self.node_orders:
-            raise ValueError("No node orders loaded. Call parse_logs_dir first.")
-        if not self.execution_order:
-            raise ValueError("No execution order found in logs.")
-        if not self.txs_to_validate:
-            raise ValueError("No transactions to validate (txs_to_validate is empty).")
+            raise ValueError("No data loaded. Call parse_logs first.")
         
-        # First, detect suspicious missing transactions
-        suspicious_missing = self.detect_suspicious_missing_txs()
+        # Detect suspicious missing
+        suspicious = self._detect_suspicious()
         
-        # Build order graph using Themis protocol (only for txs_to_validate)
-        G = self.build_order_graph()
+        # Prepare parallel tasks
+        tasks = [
+            (sd_id, txs, self.node_orders, self.gamma, self.f, self.n)
+            for sd_id, txs in sorted(self.subdag_txs.items())
+        ]
         
-        # Find strongly connected components (Condorcet cycles)
-        # From adv_reorder.py:
-        #   SCC = list(nx.strongly_connected_components(G))
-        #   H = nx.algorithms.components.condensation(G, SCC)
-        sccs = list(nx.strongly_connected_components(G))
-        self._log(f"Found {len(sccs)} strongly connected components")
+        total_pairs = sum(len(txs) * (len(txs) - 1) // 2 for _, txs in self.subdag_txs.items())
+        print(f"[PROGRESS] Validating {len(tasks)} sub_dags ({total_pairs:,} total pairs)...", flush=True)
         
-        scc_sizes = [len(scc) for scc in sccs]
-        largest_scc = max(scc_sizes) if scc_sizes else 0
+        start = time.time()
+        with Pool() as p:
+            results = p.map(validate_subdag, tasks)
+        elapsed = time.time() - start
+        print(f"[PROGRESS] Validation completed in {elapsed:.1f}s", flush=True)
         
-        if largest_scc > 1:
-            large_sccs = [s for s in scc_sizes if s > 1]
-            self._log(f"  {len(large_sccs)} SCCs with size > 1 (Condorcet cycles)")
-            self._log(f"  Largest SCC: {largest_scc} transactions")
+        # Aggregate
+        valid, invalid = 0, 0
+        all_violations = []
         
-        # Map each tx to its SCC index
-        tx_to_scc: Dict[str, int] = {}
-        for scc_idx, scc in enumerate(sccs):
-            for tx in scc:
-                tx_to_scc[tx] = scc_idx
+        for r in results:
+            if r.is_valid:
+                valid += 1
+            else:
+                invalid += 1
+                for tx1, tx2, reason in r.violations:
+                    all_violations.append((r.sub_dag_id, tx1, tx2, reason))
+                print(f"[PROGRESS] ✗ sub_dag {r.sub_dag_id}: {len(r.violations)} violations", flush=True)
         
-        # Build condensation graph (DAG of SCCs)
-        H = nx.algorithms.components.condensation(G, sccs)
+        is_valid = invalid == 0 and self.execution_converged and len(suspicious) == 0
         
-        # Build execution position map
-        exec_pos: Dict[str, int] = {
-            tx: pos for pos, tx in enumerate(self.execution_order)
-        }
-        
-        # Validate: check if execution respects the SCC DAG ordering
-        violations = []
-        total_pairs = 0
-        constrained_pairs = 0
-        cycle_pairs = 0
-        
-        # Only check transactions in txs_to_validate that were also executed
-        validated_txs = [tx for tx in self.txs_to_validate if tx in exec_pos]
-        
-        for i, tx1 in enumerate(validated_txs):
-            for tx2 in validated_txs[i+1:]:
-                total_pairs += 1
-                
-                scc1 = tx_to_scc.get(tx1)
-                scc2 = tx_to_scc.get(tx2)
-                
-                if scc1 is None or scc2 is None:
-                    continue
-                
-                if scc1 == scc2:
-                    # Same SCC (Condorcet cycle) - any order is valid
-                    cycle_pairs += 1
-                    continue
-                
-                constrained_pairs += 1
-                
-                # Check if there's a path in condensation graph
-                # If scc1 -> scc2 in H, then tx1 must come before tx2 in execution
-                # If scc2 -> scc1 in H, then tx2 must come before tx1 in execution
-                
-                if nx.has_path(H, scc1, scc2):
-                    # tx1 should come before tx2
-                    if exec_pos[tx1] > exec_pos[tx2]:
-                        count_1_2, count_2_1 = self._count_orderings(tx1, tx2)
-                        violations.append((
-                            tx1, tx2,
-                            f"Constraint: {count_1_2}/{self.n} nodes saw tx1 first, "
-                            f"threshold={self._compute_threshold():.1f}"
-                        ))
-                elif nx.has_path(H, scc2, scc1):
-                    # tx2 should come before tx1
-                    if exec_pos[tx2] > exec_pos[tx1]:
-                        count_1_2, count_2_1 = self._count_orderings(tx1, tx2)
-                        violations.append((
-                            tx2, tx1,
-                            f"Constraint: {count_2_1}/{self.n} nodes saw tx2 first, "
-                            f"threshold={self._compute_threshold():.1f}"
-                        ))
-        
-        # is_valid requires: no violations, execution converged, AND no suspicious missing
-        is_valid = (len(violations) == 0 and 
-                    self.execution_converged and 
-                    len(suspicious_missing) == 0)
+        print(f"\n{'='*60}", flush=True)
+        print(f"[RESULT] {'✓ VALID' if is_valid else '✗ INVALID'}", flush=True)
+        print(f"[RESULT] Valid: {valid}/{len(tasks)} sub_dags", flush=True)
+        print(f"[RESULT] Violations: {len(all_violations)}", flush=True)
+        print(f"[RESULT] Suspicious missing: {len(suspicious)}", flush=True)
+        print(f"{'='*60}\n", flush=True)
         
         return ValidationResult(
             is_valid=is_valid,
-            total_tx_pairs=total_pairs,
-            constrained_pairs=constrained_pairs,
-            cycle_pairs=cycle_pairs,
-            violations=violations,
-            num_sccs=len(sccs),
-            largest_scc_size=largest_scc,
+            total_sub_dags=len(tasks),
+            valid_sub_dags=valid,
+            invalid_sub_dags=invalid,
+            total_txs=len(self.full_exec_order),
+            violations=all_violations,
             execution_converged=self.execution_converged,
-            execution_mismatch_details=self.execution_mismatch_details,
-            suspicious_missing_txs=suspicious_missing
+            execution_mismatch_details=self.convergence_details,
+            suspicious_missing=suspicious
         )
-    
-    def get_statistics(self) -> Dict:
-        """Get detailed statistics about the ordering data."""
-        stats = {
-            'num_nodes': self.n,
-            'num_transactions_received': len(self.all_txs),
-            'num_transactions_executed': len(self.execution_order),
-            'num_transactions_validated': len(self.txs_to_validate),
-            'executed_only': self.executed_only,
-            'gamma': self.gamma,
-            'f': self.f,
-            'threshold': self._compute_threshold() if self.n > 0 else None,
-            'execution_converged': self.execution_converged,
-        }
-        
-        # Transactions received but not executed (due to SIGKILL etc)
-        if self.executed_only:
-            not_executed = len(self.all_txs) - len(self.txs_to_validate)
-            stats['txs_ignored_not_executed'] = not_executed
-        
-        # Transaction coverage per node
-        if self.node_orders:
-            coverage = [len(orders) for orders in self.node_orders.values()]
-            stats['min_txs_per_node'] = min(coverage)
-            stats['max_txs_per_node'] = max(coverage)
-            stats['avg_txs_per_node'] = sum(coverage) / len(coverage)
-        
-        return stats
-    
-    def print_order_analysis(self, tx1: str, tx2: str):
-        """Print detailed analysis of ordering between two transactions."""
-        count_1_2, count_2_1 = self._count_orderings(tx1, tx2)
-        threshold = self._compute_threshold()
-        
-        print(f"\nOrder Analysis: {tx1[:20]}... vs {tx2[:20]}...")
-        print(f"  Nodes seeing tx1 first: {count_1_2}/{self.n}")
-        print(f"  Nodes seeing tx2 first: {count_2_1}/{self.n}")
-        print(f"  Threshold: {threshold:.2f}")
-        
-        if count_1_2 >= threshold and count_2_1 >= threshold:
-            winner = "tx1 -> tx2" if count_1_2 >= count_2_1 else "tx2 -> tx1"
-            print(f"  Both meet threshold, tiebreak: {winner}")
-        elif count_1_2 >= threshold:
-            print(f"  Edge: tx1 -> tx2")
-        elif count_2_1 >= threshold:
-            print(f"  Edge: tx2 -> tx1")
-        else:
-            print(f"  No edge (neither meets threshold)")
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate Themis batch-order-fairness property in DAG BFT logs"
+        description="Validate Themis batch-order-fairness property"
     )
     parser.add_argument(
-        "--logs-dir", "-d",
-        type=str,
-        default="/var/scratch/mputnik/narwhal/benchmark/logs/",
-        help="Directory containing worker-X-0.log files"
+        "--logs-dir", "-d", type=str, default="/var/scratch/mputnik/narwhal/benchmark/logs/",
+        help="Directory containing worker-*-0.log files"
     )
     parser.add_argument(
-        "--gamma", "-g",
-        type=float,
-        default=1.0,
-        help="Order-fairness parameter γ (default: 0.51)"
+        "--gamma", "-g", type=float, default=1.0,
+        help="Order-fairness parameter γ (default: 1.0)"
     )
     parser.add_argument(
-        "--f",
-        type=int,
-        default=1,
+        "--f", type=int, default=0,
         help="Byzantine fault tolerance bound (default: 0)"
     )
     parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Print detailed progress information"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
+        "--output", "-o", type=str,
         help="Output file for results (default: stdout)"
-    )
-    parser.add_argument(
-        "--stats",
-        action="store_true",
-        help="Print detailed statistics"
-    )
-    parser.add_argument(
-        "--all-received",
-        action="store_true",
-        help="Validate ALL received transactions, not just executed ones. "
-             "By default (without this flag), only executed transactions are "
-             "validated. This is important when benchmark ends with SIGKILL, "
-             "leaving some received txs unfinalized."
     )
     
     args = parser.parse_args()
     
-    # executed_only is True by default (safe for SIGKILL scenarios)
-    # --all-received flag disables this
-    executed_only = not args.all_received
+    validator = OrderFairnessValidator(gamma=args.gamma, f=args.f)
+    validator.parse_logs(args.logs_dir)
+    result = validator.validate()
     
-    # Create validator
-    validator = BatchOrderFairnessValidator(
-        gamma=args.gamma,
-        f=args.f,
-        verbose=args.verbose,
-        executed_only=executed_only
-    )
+    output = str(result)
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(output)
+        print(f"Results written to {args.output}")
+    else:
+        print(output)
     
-    # Parse logs
-    validator.parse_logs_dir(args.logs_dir)
-    
-    # Print statistics if requested
-    if args.stats or args.verbose:
-        stats = validator.get_statistics()
-        print("\n=== Themis Order Statistics ===")
-        for key, value in stats.items():
-            print(f"  {key}: {value}")
-        print()
-    
-    # Validate
-    try:
-        result = validator.validate()
-        
-        # Output results
-        output = str(result)
-        
-        if args.output:
-            with open(args.output, 'w') as f:
-                f.write(output)
-            print(f"Results written to {args.output}")
-        else:
-            print(output)
-        
-        # Exit with appropriate code
-        sys.exit(0 if result.is_valid else 1)
-        
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
+    sys.exit(0 if result.is_valid else 1)
 
 
 if __name__ == "__main__":
