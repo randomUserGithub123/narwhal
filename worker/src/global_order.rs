@@ -508,6 +508,30 @@ impl GlobalOrder {
                     }
                 };
 
+                {
+                    let tx_digests_in_order: Vec<String> = local_order.iter()
+                        .enumerate()
+                        .filter_map(|(idx, entry)| {
+                            if idx == 0 { return None; } // Skip sequence number
+                            if entry.len() == 32 && entry.iter().all(|&b| b == 0xFF) { return None; } // Skip sentinel
+                            if entry.len() == 8 { return None; } // Skip sub_dag_id/edge_count
+                            if entry.len() == 32 {
+                                Some(format!("{:?}", Digest(entry.clone().try_into().unwrap())))
+                            } else {
+                                None // Skip compressed blobs
+                            }
+                        })
+                        .collect();
+                    
+                    log::info!(
+                        "sub_dag_id={}: Author {:?}, LocalOrder seq={}, lo_digest={:?}, tx_digests=[{}]",
+                        self.sub_dag_count,
+                        author,
+                        seq_num,
+                        lo_digest,
+                        tx_digests_in_order.join(", ")
+                    );
+                }
 
                 let mut tx_idx = 0;
                 let mut indices: Vec<usize> = Vec::new();
