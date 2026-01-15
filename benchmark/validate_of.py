@@ -20,6 +20,7 @@ import re
 import sys
 import argparse
 import networkx as nx
+import numpy as np
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
@@ -169,79 +170,168 @@ def validate_subdag(args) -> SubDagResult:
     """
     Validate a single sub_dag's order-fairness (worker function for Pool).
     
-    Builds Themis order graph and checks execution respects it.
+    Uses NUMPY VECTORIZATION for fast pair counting.
     """
     sub_dag_id, txs, node_orders, gamma, f, n = args
     
+    num_txs = len(txs)
+    num_pairs = num_txs * (num_txs - 1) // 2
+    
+    print(f"[WORKER] sub_dag {sub_dag_id}: START - {num_txs} txs, {num_pairs:,} pairs", flush=True)
+    
     if not txs:
+        print(f"[WORKER] sub_dag {sub_dag_id}: DONE (empty)", flush=True)
         return SubDagResult(sub_dag_id, 0, True, [], 0, 0)
     
-    threshold = n * (1 - gamma) + gamma * f + 1
+    threshold = n * (1 - gamma) + f + 1
+    start_time = time.time()
     
-    # Count orderings between tx pairs
-    def count_orderings(tx1: str, tx2: str) -> Tuple[int, int]:
-        c12, c21 = 0, 0
-        for orders in node_orders.values():
-            p1, p2 = orders.get(tx1), orders.get(tx2)
-            if p1 is not None and p2 is not None:
-                if p1 < p2:
-                    c12 += 1
-                elif p2 < p1:
-                    c21 += 1
-        return c12, c21
+    # =========================================================================
+    # NUMPY OPTIMIZATION: Precompute position matrix
+    # orderings[tx_idx, node_idx] = position (or -1 if not received)
+    # =========================================================================
+    print(f"[WORKER] sub_dag {sub_dag_id}: Building position matrix...", flush=True)
     
+    tx_to_idx = {tx: i for i, tx in enumerate(txs)}
+    node_list = sorted(node_orders.keys())
+    node_to_idx = {nid: i for i, nid in enumerate(node_list)}
+    
+    # Initialize with -1 (not received)
+    pos_matrix = np.full((num_txs, n), -1, dtype=np.int32)
+    
+    for nid, orders in node_orders.items():
+        node_idx = node_to_idx[nid]
+        for tx in txs:
+            if tx in orders:
+                pos_matrix[tx_to_idx[tx], node_idx] = orders[tx]
+    
+    matrix_time = time.time() - start_time
+    print(f"[WORKER] sub_dag {sub_dag_id}: Matrix built in {matrix_time:.2f}s", flush=True)
+    
+    # =========================================================================
+    # VECTORIZED count_orderings using numpy
+    # =========================================================================
+    def count_orderings_fast(i: int, j: int) -> Tuple[int, int]:
+        """Count orderings using precomputed matrix - FAST!"""
+        pos_i = pos_matrix[i, :]  # shape: (n,)
+        pos_j = pos_matrix[j, :]  # shape: (n,)
+        
+        # Both must be received (>= 0)
+        both_received = (pos_i >= 0) & (pos_j >= 0)
+        
+        c_ij = np.sum((pos_i < pos_j) & both_received)
+        c_ji = np.sum((pos_j < pos_i) & both_received)
+        
+        return int(c_ij), int(c_ji)
+    
+    # =========================================================================
     # Build Themis order graph
+    # =========================================================================
+    print(f"[WORKER] sub_dag {sub_dag_id}: Building order graph...", flush=True)
     G = nx.DiGraph()
-    G.add_nodes_from(txs)
+    G.add_nodes_from(range(num_txs))  # Use indices for speed
     
-    for i, tx1 in enumerate(txs):
-        for tx2 in txs[i+1:]:
-            c12, c21 = count_orderings(tx1, tx2)
+    edges_added = 0
+    pairs_done = 0
+    last_print = time.time()
+    
+    for i in range(num_txs):
+        for j in range(i + 1, num_txs):
+            pairs_done += 1
+            
+            # Progress every 10 seconds
+            now = time.time()
+            if now - last_print > 10:
+                pct = 100.0 * pairs_done / num_pairs if num_pairs > 0 else 100
+                elapsed = now - start_time
+                rate = pairs_done / elapsed if elapsed > 0 else 0
+                eta = (num_pairs - pairs_done) / rate if rate > 0 else 0
+                print(f"[WORKER] sub_dag {sub_dag_id}: graph {pairs_done:,}/{num_pairs:,} ({pct:.1f}%), "
+                      f"{rate:.0f}/s, ETA {eta:.0f}s", flush=True)
+                last_print = now
+            
+            c_ij, c_ji = count_orderings_fast(i, j)
             
             # Themis protocol edge logic
-            if c12 >= threshold and c21 >= threshold:
-                # Both meet threshold - higher count wins
-                if c12 >= c21:
-                    G.add_edge(tx1, tx2)
+            if c_ij >= threshold and c_ji >= threshold:
+                if c_ij >= c_ji:
+                    G.add_edge(i, j)
                 else:
-                    G.add_edge(tx2, tx1)
-            elif c12 >= threshold:
-                G.add_edge(tx1, tx2)
-            elif c21 >= threshold:
-                G.add_edge(tx2, tx1)
+                    G.add_edge(j, i)
+                edges_added += 1
+            elif c_ij >= threshold:
+                G.add_edge(i, j)
+                edges_added += 1
+            elif c_ji >= threshold:
+                G.add_edge(j, i)
+                edges_added += 1
     
-    # Find SCCs (Condorcet cycles - any order within SCC is valid)
+    graph_time = time.time() - start_time
+    print(f"[WORKER] sub_dag {sub_dag_id}: Graph done - {edges_added} edges in {graph_time:.1f}s", flush=True)
+    
+    # =========================================================================
+    # Find SCCs
+    # =========================================================================
+    print(f"[WORKER] sub_dag {sub_dag_id}: Finding SCCs...", flush=True)
     sccs = list(nx.strongly_connected_components(G))
     largest_scc = max(len(s) for s in sccs) if sccs else 0
+    print(f"[WORKER] sub_dag {sub_dag_id}: {len(sccs)} SCCs, largest={largest_scc}", flush=True)
     
-    tx_to_scc = {}
-    for idx, scc in enumerate(sccs):
-        for tx in scc:
-            tx_to_scc[tx] = idx
+    idx_to_scc = {}
+    for scc_idx, scc in enumerate(sccs):
+        for node_idx in scc:
+            idx_to_scc[node_idx] = scc_idx
     
-    # Build condensation graph (DAG of SCCs)
+    # =========================================================================
+    # Build condensation graph
+    # =========================================================================
+    print(f"[WORKER] sub_dag {sub_dag_id}: Building condensation...", flush=True)
     H = nx.condensation(G, sccs)
     
-    # Check execution order (txs list IS the execution order for this sub_dag)
-    exec_pos = {tx: i for i, tx in enumerate(txs)}
+    # =========================================================================
+    # Check violations
+    # =========================================================================
+    print(f"[WORKER] sub_dag {sub_dag_id}: Checking violations...", flush=True)
     
     violations = []
-    for i, tx1 in enumerate(txs):
-        for tx2 in txs[i+1:]:
-            scc1, scc2 = tx_to_scc.get(tx1), tx_to_scc.get(tx2)
+    check_start = time.time()
+    checks_done = 0
+    last_print = check_start
+    
+    for i in range(num_txs):
+        for j in range(i + 1, num_txs):
+            checks_done += 1
             
-            if scc1 is None or scc2 is None or scc1 == scc2:
-                continue  # Same SCC = any order OK
+            # Progress every 10 seconds
+            now = time.time()
+            if now - last_print > 10:
+                pct = 100.0 * checks_done / num_pairs if num_pairs > 0 else 100
+                print(f"[WORKER] sub_dag {sub_dag_id}: check {checks_done:,}/{num_pairs:,} ({pct:.1f}%), "
+                      f"violations={len(violations)}", flush=True)
+                last_print = now
             
-            # Check constraint in condensation graph
-            if nx.has_path(H, scc1, scc2):
-                if exec_pos[tx1] > exec_pos[tx2]:
-                    c12, c21 = count_orderings(tx1, tx2)
-                    violations.append((tx1, tx2, f"{c12}/{n} nodes saw tx1 first"))
-            elif nx.has_path(H, scc2, scc1):
-                if exec_pos[tx2] > exec_pos[tx1]:
-                    c12, c21 = count_orderings(tx1, tx2)
-                    violations.append((tx2, tx1, f"{c21}/{n} nodes saw tx2 first"))
+            scc_i, scc_j = idx_to_scc.get(i), idx_to_scc.get(j)
+            
+            if scc_i is None or scc_j is None or scc_i == scc_j:
+                continue
+            
+            # Execution order: i comes before j in txs list
+            exec_i, exec_j = i, j  # indices ARE execution positions
+            
+            if nx.has_path(H, scc_i, scc_j):
+                # i should come before j
+                if exec_i > exec_j:
+                    c_ij, c_ji = count_orderings_fast(i, j)
+                    violations.append((txs[i], txs[j], f"{c_ij}/{n} nodes saw tx_i first"))
+            elif nx.has_path(H, scc_j, scc_i):
+                # j should come before i
+                if exec_j > exec_i:
+                    c_ij, c_ji = count_orderings_fast(i, j)
+                    violations.append((txs[j], txs[i], f"{c_ji}/{n} nodes saw tx_j first"))
+    
+    total_time = time.time() - start_time
+    status = "✓ VALID" if len(violations) == 0 else f"✗ {len(violations)} VIOLATIONS"
+    print(f"[WORKER] sub_dag {sub_dag_id}: DONE in {total_time:.1f}s - {status}", flush=True)
     
     return SubDagResult(
         sub_dag_id=sub_dag_id,
@@ -428,7 +518,7 @@ class OrderFairnessValidator:
         print(f"\n{'='*60}", flush=True)
         print(f"[PROGRESS] STARTING VALIDATION", flush=True)
         print(f"[PROGRESS] gamma={self.gamma}, f={self.f}, n={self.n}", flush=True)
-        print(f"[PROGRESS] threshold = {self.n * (1 - self.gamma) + self.gamma * self.f + 1:.2f}", flush=True)
+        print(f"[PROGRESS] threshold = {self.n * (1 - self.gamma) + self.f + 1:.2f}", flush=True)
         print(f"{'='*60}\n", flush=True)
         
         if not self.node_orders:
@@ -443,14 +533,30 @@ class OrderFairnessValidator:
             for sd_id, txs in sorted(self.subdag_txs.items())
         ]
         
-        total_pairs = sum(len(txs) * (len(txs) - 1) // 2 for _, txs in self.subdag_txs.items())
-        print(f"[PROGRESS] Validating {len(tasks)} sub_dags ({total_pairs:,} total pairs)...", flush=True)
+        # Show what we're about to process
+        print(f"\n[PROGRESS] Sub_dag breakdown:", flush=True)
+        total_pairs = 0
+        for sd_id, txs in sorted(self.subdag_txs.items()):
+            n_txs = len(txs)
+            n_pairs = n_txs * (n_txs - 1) // 2
+            total_pairs += n_pairs
+            print(f"[PROGRESS]   sub_dag {sd_id}: {n_txs} txs, {n_pairs:,} pairs", flush=True)
+        
+        print(f"\n[PROGRESS] TOTAL: {len(tasks)} sub_dags, {total_pairs:,} pairs", flush=True)
+        print(f"[PROGRESS] Starting parallel validation...\n", flush=True)
         
         start = time.time()
+        
+        # Use imap_unordered to see results as they complete
+        results = []
         with Pool() as p:
-            results = p.map(validate_subdag, tasks)
+            for result in p.imap_unordered(validate_subdag, tasks):
+                results.append(result)
+                elapsed = time.time() - start
+                print(f"[PROGRESS] Completed {len(results)}/{len(tasks)} sub_dags in {elapsed:.1f}s", flush=True)
+        
         elapsed = time.time() - start
-        print(f"[PROGRESS] Validation completed in {elapsed:.1f}s", flush=True)
+        print(f"\n[PROGRESS] All validation completed in {elapsed:.1f}s", flush=True)
         
         # Aggregate
         valid, invalid = 0, 0
