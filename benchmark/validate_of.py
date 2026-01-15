@@ -1,3 +1,23 @@
+#!/usr/bin/env python3
+"""
+Batch-Order-Fairness Validator for DAG BFT Systems (Themis Protocol)
+
+This script validates that a distributed system's execution order respects
+the batch-order-fairness property as defined in Themis:
+- If γ fraction of nodes receive tx before tx', then tx should be ordered no later than tx'
+- Transactions in a Condorcet cycle can be ordered arbitrarily
+
+Based on Themis protocol implementation from adv_reorder.py
+
+Usage:
+    python validate_batch_order_fairness.py --logs-dir <path> [--gamma 0.51] [--f 0] [--verbose]
+    
+Log file format expected:
+    - Node logs: worker-X-0.log where X is node index (0 to N-1)
+    - Receive order: "Receival of tx_digest <DIGEST> at position <N>"
+    - Execution: "Executed <DIGEST>"
+"""
+
 import re
 import os
 import sys
@@ -289,14 +309,6 @@ class BatchOrderFairnessValidator:
             self.txs_to_validate = self.all_txs.copy()
             self._log(f"executed_only=False: validating all {len(self.txs_to_validate)} received txs")
     
-    def _normalize_digest(self, digest: str) -> str:
-        """Normalize transaction digest string."""
-        digest = digest.strip()
-        digest = digest.strip('"\'[](){}<>')
-        digest = re.sub(r'^Digest\(', '', digest)
-        digest = digest.rstrip(')')
-        return digest
-    
     def _compute_threshold(self) -> float:
         """
         Compute the Themis threshold for edge creation.
@@ -304,7 +316,7 @@ class BatchOrderFairnessValidator:
         From adv_reorder.py themis_protocol():
             threshold = n * (1-gamma) + f + 1
         """
-        threshold = self.n * (1 - self.gamma) + self.f + 1
+        threshold = self.n * (1 - self.gamma) + self.gamma * self.f + 1
         self._log(f"Themis threshold for n={self.n}, γ={self.gamma}, f={self.f}: {threshold}")
         return threshold
     
@@ -669,7 +681,7 @@ def main():
     parser.add_argument(
         "--logs-dir", "-d",
         type=str,
-        required=True,
+        default="/var/scratch/mputnik/narwhal/benchmark/logs/",
         help="Directory containing worker-X-0.log files"
     )
     parser.add_argument(
