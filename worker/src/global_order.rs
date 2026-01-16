@@ -1834,8 +1834,6 @@ pub fn run_utig(
         }
     }
 
-    let region_b_v: Vec<u16> = region_b_local.iter().map(|&u| u as u16).collect();
-
     let mut in_b: Vec<bool> = vec![false; k];
     for &u in &region_b_local {
         in_b[u] = true;
@@ -1899,11 +1897,19 @@ pub fn run_utig(
         "t7: {}", t7
     );
 
+    let region_b_len = region_b_local.len();
+    let shaded_len = kept_shaded.len();
+    if missing_edges.is_empty() && !region_b_local.is_empty() {
+        finalized_now.extend(&region_b_local);
+        region_b_local.clear();
+    }
+    let region_b_v: Vec<u16> = region_b_local.iter().map(|&u| u as u16).collect();
+
     log::info!(
         "finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
         finalized_now.len(),
-        region_b_local.len() - kept_shaded.len(),
-        kept_shaded.len(),
+        region_b_len - shaded_len,
+        shaded_len,
         missing_edges.len(),
         anchor,
         start_total.elapsed().as_nanos()
