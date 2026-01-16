@@ -479,6 +479,8 @@ impl GlobalOrder {
                 Some((_r, start, end)) => (*start, *end),
                 None => (usize::MAX, 0), // Author not in final round
             };
+
+            let mut indices: Vec<usize> = Vec::new();
             
             for (lo_idx, lo_digest) in lo_digests.iter().enumerate() {
                 let read_res = self.store.notify_read(lo_digest.to_vec()).await;
@@ -532,10 +534,8 @@ impl GlobalOrder {
                         tx_digests_in_order.join(", ")
                     );
                 }
-
-                let mut tx_idx = 0;
-                let mut indices: Vec<usize> = Vec::new();
                 
+                let mut tx_idx = 0;
                 while tx_idx < local_order.len() {
                     if tx_idx == 0 {
                         // Skip sequence number
@@ -583,10 +583,12 @@ impl GlobalOrder {
                     tx_idx += 1;
                 }
 
-                if !indices.is_empty() {
-                    indices_sets.push(indices);
-                }
             }
+
+            if !indices.is_empty() {
+                indices_sets.push(indices);
+            }
+
         }
 
         let k = next_idx;
