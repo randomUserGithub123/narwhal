@@ -1097,9 +1097,26 @@ impl GlobalOrder {
                             sub_dag_id, finalized_now.len()
                         );
                         
-                        let finalized_ser = bincode::serialize(&finalized_now).expect("serialize failed");
-                        self.store.write(Self::finalized_indices_key(sub_dag_id), finalized_ser).await;
-                        
+                        let state = self.store.read(Self::subdag_state_key(sub_dag_id)).await
+                            .ok().flatten().and_then(|v| v.get(0).copied()).unwrap_or(0);
+
+                        if state == 1 {
+                            let mut full = Vec::new();
+
+                            if let Ok(Some(bytes)) = self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
+                                let prefix: Vec<usize> = bincode::deserialize(&bytes).expect("deserialize prefix failed");
+                                full.extend(prefix);
+                            } else {
+                                log::error!("sub_dag_id={}: state=1 but missing prefix on disk", sub_dag_id);
+                            }
+
+                            full.extend(finalized_now);
+
+                            self.store.write(Self::finalized_indices_key(sub_dag_id), bincode::serialize(&full).unwrap()).await;
+                        } else {
+                            self.store.write(Self::finalized_indices_key(sub_dag_id), bincode::serialize(&finalized_now).unwrap()).await;
+                        }
+
                         self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
                         
                         self.pending_subdags_fair.remove(&sub_dag_id);
@@ -1143,39 +1160,30 @@ impl GlobalOrder {
                         sub_dag_id, finalized_now.len(), region_b_v.len(), missing_edges.len()
                     );
 
-                    if missing_edges.is_empty() {
-                        // No missing edges - graph is fully specified, Ready to finalize
-                        self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
-                        
-                        log::info!("sub_dag_id={}: no missing edges, marked Ready", sub_dag_id);
-                        
-                        // Try to finalize sequentially
-                        self.try_finalize_sequential().await;
-                    } else {
-                        // Has missing edges - need FairUpdate votes
-                        self.store.write(Self::subdag_state_key(sub_dag_id), vec![1]).await;
-                        
-                        // Build missing_tx_digests for LocalOrderMaker
-                        let mut missing_tx_digests: Vec<Digest> = Vec::with_capacity(missing_edge_vertices.len());
-                        for &vid in &missing_edge_vertices {
-                            let idx = vid as usize;
-                            if idx >= index_to_digest.len() {
-                                panic!("missing edge vertex idx {} out of bounds", idx);
-                            }
-                            let arr: [u8; 32] = index_to_digest[idx].clone().try_into().unwrap();
-                            missing_tx_digests.push(Digest(arr));
+                    // Has missing edges - need FairUpdate votes
+                    self.store.write(Self::subdag_state_key(sub_dag_id), vec![1]).await;
+                    
+                    // Build missing_tx_digests for LocalOrderMaker
+                    let mut missing_tx_digests: Vec<Digest> = Vec::with_capacity(missing_edge_vertices.len());
+                    for &vid in &missing_edge_vertices {
+                        let idx = vid as usize;
+                        if idx >= index_to_digest.len() {
+                            panic!("missing edge vertex idx {} out of bounds", idx);
                         }
-
-                        log::info!(
-                            "sub_dag_id={}: {} missing edges, sent to LocalOrderMaker for voting",
-                            sub_dag_id, missing_edges.len()
-                        );
-                        
-                        self.pending_subdags_fair.insert(sub_dag_id);
-                        let _ = self.tx_fair_propose
-                            .send((sub_dag_id, missing_edge_vertices, missing_tx_digests, missing_edges))
-                            .await;
+                        let arr: [u8; 32] = index_to_digest[idx].clone().try_into().unwrap();
+                        missing_tx_digests.push(Digest(arr));
                     }
+
+                    log::info!(
+                        "sub_dag_id={}: {} missing edges, sent to LocalOrderMaker for voting",
+                        sub_dag_id, missing_edges.len()
+                    );
+                    
+                    self.pending_subdags_fair.insert(sub_dag_id);
+                    let _ = self.tx_fair_propose
+                        .send((sub_dag_id, missing_edge_vertices, missing_tx_digests, missing_edges))
+                        .await;
+                    
                 },
 
                 Some((sub_dag_id, finalized_indices)) = self.rx_auncel_results.recv() => {
@@ -1554,10 +1562,9 @@ pub fn run_utig(
             }
 
             let dir_uv =
-                if kuv > kvu { true }
-                else if kvu > kuv { false }
+                if kuv >= kvu { true }
                 else {
-                    u < v
+                    false
                 };
 
             if dir_uv { edges[u].push(v as u16); }
@@ -1824,17 +1831,6 @@ pub fn run_utig(
         in_b[u] = true;
     }
 
-    let mut region_b_e: Vec<(u16, u16)> = Vec::new();
-    for &u in &region_b_local {
-        let u16 = u as u16;
-        for &v16 in &edges[u] {
-            let v = v16 as usize;
-            if v < k && in_b[v] {
-                region_b_e.push((u16, v16));
-            }
-        }
-    }
-
     #[inline]
     fn pair_key(u: usize, v: usize) -> u32 {
         let (a, b) = if u < v { (u as u16, v as u16) } else { (v as u16, u as u16) };
@@ -1889,6 +1885,16 @@ pub fn run_utig(
         region_b_local.clear();
     }
     let region_b_v: Vec<u16> = region_b_local.iter().map(|&u| u as u16).collect();
+    let mut region_b_e: Vec<(u16, u16)> = Vec::new();
+    for &u in &region_b_local {
+        let u16 = u as u16;
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
+            if v < k && in_b[v] {
+                region_b_e.push((u16, v16));
+            }
+        }
+    }
 
     log::info!(
         "finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
