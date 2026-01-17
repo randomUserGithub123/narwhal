@@ -598,6 +598,26 @@ impl GlobalOrder {
             t2, k, indices_sets.len(), found_fair_updates.len()
         );
         
+        // USED WHEN SORTING INSIDE SCC ---> Aequitas approach
+        let mut sorted_digests = index_to_digest.clone();
+        sorted_digests.sort_unstable();
+
+        let mut sorted_rank: Vec<usize> = vec![0usize; k];
+        for (new_idx, digest) in sorted_digests.iter().enumerate() {
+            let old_idx = *digest_to_local
+                .get(digest)
+                .expect("canonicalization: digest missing from digest_to_local");
+            sorted_rank[old_idx] = new_idx;
+        }
+
+        index_to_digest = sorted_digests;
+
+        for order in indices_sets.iter_mut() {
+            for idx in order.iter_mut() {
+                *idx = sorted_rank[*idx];
+            }
+        }
+        
         for (vote_sub_dag_id, vote_author, vote_lo_digest) in found_fair_updates {
             self.pending_fair_updates
                 .entry(vote_sub_dag_id)
@@ -1520,13 +1540,9 @@ pub fn run_utig(
 
     // ============================================================
     // (4) Add edges to E
-    //
-    // Here weight[u,v] acts like edge_count[u][v] in the C++ code:
-    //   edge_count[from][to]++ for every “from -> to” in local orders.
-    // Then we orient edges based on counts and thresholds.
     // ============================================================
 
-    // First: fill edge_count via local orders.
+    // Fill edge_count via local orders.
     for order in &indices_sets {
         let len = order.len();
         for from_pos in 0..len {
