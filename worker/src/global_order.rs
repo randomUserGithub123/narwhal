@@ -1282,37 +1282,21 @@ fn apply_fair_update_and_finalize(
             
             // Determine which direction has higher weight (k >= k' condition)
             // Then check if SOURCE of that direction is in enough updates
-            if kuv > kvu {
+            if kuv >= kvu {
                 // Direction would be u → v
                 if u_in_enough && kuv >= non_blank_threshold {
                     region_b_e.push((u, v));
                     existing_edges.insert((u, v));
                     new_edges_count += 1;
                 }
-            } else if kvu > kuv {
+            } else {
                 // Direction would be v → u
                 if v_in_enough && kvu >= non_blank_threshold {
                     region_b_e.push((v, u));
                     existing_edges.insert((v, u));
                     new_edges_count += 1;
                 }
-            } else {
-                // kuv == kvu: tiebreaker by smaller vertex index (deterministic choice)
-                // Per paper: "If k = k', then one of the two edges can be added deterministically"
-                if u < v {
-                    if u_in_enough && kuv >= non_blank_threshold {
-                        region_b_e.push((u, v));
-                        existing_edges.insert((u, v));
-                        new_edges_count += 1;
-                    }
-                } else {
-                    if v_in_enough && kvu >= non_blank_threshold {
-                        region_b_e.push((v, u));
-                        existing_edges.insert((v, u));
-                        new_edges_count += 1;
-                    }
-                }
-            }
+            } 
         }
     }
     
@@ -1326,8 +1310,6 @@ fn apply_fair_update_and_finalize(
     for &(u, v) in &region_b_e {
         edges[u as usize].push(v);
     }
-    
-    // ... Tarjan SCC algorithm (unchanged from your current code) ...
     
     let mut index_counter: i32 = 0;
     let mut stack: Vec<usize> = Vec::new();
@@ -1423,9 +1405,8 @@ fn apply_fair_update_and_finalize(
         if comp.len() == 1 {
             finalized_now.push(comp[0]);
         } else {
-            // TODO: Hamiltonian cycle for proper ordering per paper
             let mut sorted = comp.clone();
-            sorted.sort_unstable();
+            sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
             finalized_now.extend(sorted);
         }
     }
@@ -1831,7 +1812,9 @@ pub fn run_utig(
             if comp.len() == 1 {
                 region_b_local.push(comp[0]);
             } else {
-                region_b_local.extend(comp.clone());
+                let mut sorted = comp.clone();
+                sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper  
+                region_b_local.extend(sorted);
             }
         }
     }
