@@ -36,6 +36,12 @@ pub struct UTIGMatrix {
     pub is_solid: Vec<bool>,
     pub edges: Vec<Vec<u16>>,
 
+    // === Tarjan working memory ===
+    pub dfn: Vec<i32>,
+    pub low: Vec<i32>,
+    pub on_stack: Vec<bool>,
+    pub scc_id: Vec<i32>,
+
     // === AUNCEL fields ===
     pub positions: Vec<u16>,
     pub weight_sum: Vec<f64>,
@@ -52,6 +58,12 @@ impl UTIGMatrix {
             is_solid: vec![false; MAX_TX],
             edges: (0..MAX_TX).map(|_| Vec::with_capacity(64)).collect(),
 
+            // Tarjan - pre-allocated
+            dfn: vec![0; MAX_TX],
+            low: vec![0; MAX_TX],
+            on_stack: vec![false; MAX_TX],
+            scc_id: vec![-1; MAX_TX],
+
             // AUNCEL
             positions: vec![u16::MAX; MAX_TX * MAX_ORDERS],
             weight_sum: vec![0.0; MAX_TX],
@@ -66,6 +78,13 @@ impl UTIGMatrix {
         self.support[..k].fill(0);
         self.is_non_blank[..k].fill(false);
         self.is_solid[..k].fill(false);
+
+        // Reset Tarjan state
+        self.dfn[..k].fill(0);
+        self.low[..k].fill(0);
+        self.on_stack[..k].fill(false);
+        self.scc_id[..k].fill(-1);
+
         for e in &mut self.edges[..k] { e.clear(); }
     }
 
@@ -467,7 +486,7 @@ impl GlobalOrder {
         authors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         for author in authors {
-            
+
             let lo_digests = &author_to_lo_digests_subdag[&author];
             let mut indices: Vec<usize> = Vec::new();
             
@@ -490,39 +509,39 @@ impl GlobalOrder {
                     }
                 };
 
-                // Determine the sequence number of this LocalOrder
-                let seq_num = match Self::parse_seq_le(&local_order) {
-                    Some(seq) => seq,
-                    None => {
-                        log::warn!("Could not parse seq for LocalOrder {:?}", lo_digest);
-                        0 // Fallback, but this shouldn't happen
-                    }
-                };
+                // // Determine the sequence number of this LocalOrder
+                // let seq_num = match Self::parse_seq_le(&local_order) {
+                //     Some(seq) => seq,
+                //     None => {
+                //         log::warn!("Could not parse seq for LocalOrder {:?}", lo_digest);
+                //         0 // Fallback, but this shouldn't happen
+                //     }
+                // };
 
-                {
-                    let tx_digests_in_order: Vec<String> = local_order.iter()
-                        .enumerate()
-                        .filter_map(|(idx, entry)| {
-                            if idx == 0 { return None; } // Skip sequence number
-                            if entry.len() == 32 && entry.iter().all(|&b| b == 0xFF) { return None; } // Skip sentinel
-                            if entry.len() == 8 { return None; } // Skip sub_dag_id/edge_count
-                            if entry.len() == 32 {
-                                Some(format!("{:?}", Digest(entry.clone().try_into().unwrap())))
-                            } else {
-                                None // Skip compressed blobs
-                            }
-                        })
-                        .collect();
+                // {
+                //     let tx_digests_in_order: Vec<String> = local_order.iter()
+                //         .enumerate()
+                //         .filter_map(|(idx, entry)| {
+                //             if idx == 0 { return None; } // Skip sequence number
+                //             if entry.len() == 32 && entry.iter().all(|&b| b == 0xFF) { return None; } // Skip sentinel
+                //             if entry.len() == 8 { return None; } // Skip sub_dag_id/edge_count
+                //             if entry.len() == 32 {
+                //                 Some(format!("{:?}", Digest(entry.clone().try_into().unwrap())))
+                //             } else {
+                //                 None // Skip compressed blobs
+                //             }
+                //         })
+                //         .collect();
                     
-                    log::info!(
-                        "sub_dag_id={}: Author {:?}, LocalOrder seq={}, lo_digest={:?}, tx_digests=[{}]",
-                        self.sub_dag_count,
-                        author,
-                        seq_num,
-                        lo_digest,
-                        tx_digests_in_order.join(", ")
-                    );
-                }
+                //     log::info!(
+                //         "sub_dag_id={}: Author {:?}, LocalOrder seq={}, lo_digest={:?}, tx_digests=[{}]",
+                //         self.sub_dag_count,
+                //         author,
+                //         seq_num,
+                //         lo_digest,
+                //         tx_digests_in_order.join(", ")
+                //     );
+                // }
                 
                 let mut tx_idx = 0;
                 while tx_idx < local_order.len() {
@@ -1610,21 +1629,23 @@ pub fn run_utig(
 
     let mut index_counter: i32 = 0;
     let mut stack: Vec<usize> = Vec::new();
-    let mut on_stack: Vec<bool> = vec![false; k];
-    let mut dfn: Vec<i32> = vec![0; k];
-    let mut low: Vec<i32> = vec![0; k];
-    let mut scc_id: Vec<i32> = vec![-1; k];
+    
+    let dfn = &mut matrix.dfn;
+    let low = &mut matrix.low;
+    let on_stack = &mut matrix.on_stack;
+    let scc_id = &mut matrix.scc_id;
+
     let mut sccs: Vec<Vec<usize>> = Vec::new();
 
     fn strongconnect(
         u: usize,
         index_counter: &mut i32,
         stack: &mut Vec<usize>,
-        on_stack: &mut [bool],
-        dfn: &mut [i32],
-        low: &mut [i32],
+        on_stack: &mut [bool],      // Slice from pool
+        dfn: &mut [i32],            // Slice from pool
+        low: &mut [i32],            // Slice from pool
         edges: &Vec<Vec<u16>>,
-        scc_id: &mut [i32],
+        scc_id: &mut [i32],         // Slice from pool
         sccs: &mut Vec<Vec<usize>>,
     ) {
         *index_counter += 1;
@@ -1679,11 +1700,11 @@ pub fn run_utig(
                 u,
                 &mut index_counter,
                 &mut stack,
-                &mut on_stack,
-                &mut dfn,
-                &mut low,
+                on_stack,
+                dfn,
+                low,
                 edges,
-                &mut scc_id,
+                scc_id,
                 &mut sccs,
             );
         }
