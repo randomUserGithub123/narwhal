@@ -278,8 +278,12 @@ pub struct GlobalOrder {
     
     pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
 
-    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
-    rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // OTHERWISE THIS IS SUFFICIENT
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    rx_utig_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 
     finalized_subdags: HashSet<u64>,
     pending_subdags_fair: HashSet<u64>,
@@ -293,8 +297,13 @@ pub struct GlobalOrder {
     auncel_weight_k: f64,
     auncel_use_final_phase: bool,
 
-    tx_auncel_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>)>,
-    rx_auncel_results: tokio::sync::mpsc::Receiver<(u64, Vec<Vec<usize>>)>,
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // tx_auncel_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>)>,
+    // rx_auncel_results: tokio::sync::mpsc::Receiver<(u64, Vec<Vec<usize>>)>,
+    // OTHERWISE THIS IS SUFFICIENT
+    tx_auncel_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>)>,
+    rx_auncel_results: tokio::sync::mpsc::Receiver<(u64, Vec<usize>)>,
+
 }
 
 impl GlobalOrder {
@@ -896,62 +905,117 @@ impl GlobalOrder {
                     break;
                 }
             };
-            // Load finalized SCC batches from disk.
+
+            // ENABLE IF THERE IS NEED TO SEE tx's SCC 
             // Each inner Vec is the (sorted) transactions of one SCC, in execution order.
-            let finalized_sccs: Vec<Vec<usize>> = match self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
+            // let finalized_sccs: Vec<Vec<usize>> = match self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
+            //     Ok(Some(data)) => bincode::deserialize(&data).expect("deserialize failed"),
+            //     _ => {
+            //         log::error!("sub_dag_id={}: finalized_indices not found!", sub_dag_id);
+            //         break;
+            //     }
+            // };
+            
+            // // Map indices to digests, filtering already_finalized. While doing so, log SCC.
+            // let mut executed: Vec<(u64, Digest)> = Vec::new();
+
+            // let mut skipped_count = 0;
+
+            // for (scc_pos, group) in finalized_sccs.iter().enumerate() {
+            //     let scc_label: u64 = if self.use_auncel { sub_dag_id } else { scc_pos as u64 };
+
+            //     for idx in group {
+            //         if *idx >= index_to_digest.len() {
+            //             log::warn!(
+            //                 "sub_dag_id={}: index {} out of bounds (len={})",
+            //                 sub_dag_id, idx, index_to_digest.len()
+            //             );
+            //             continue;
+            //         }
+
+            //         let digest_bytes = &index_to_digest[*idx];
+            //         if digest_bytes.len() != 32 {
+            //             log::warn!(
+            //                 "sub_dag_id={}: invalid digest length {} at index {}",
+            //                 sub_dag_id, digest_bytes.len(), idx
+            //             );
+            //             continue;
+            //         }
+
+            //         let arr: [u8; 32] = digest_bytes.clone().try_into().unwrap();
+            //         let digest = Digest(arr);
+
+            //         if self.already_finalized.contains(&digest) {
+            //             skipped_count += 1;
+            //         } else {
+            //             self.already_finalized.insert(digest.clone());
+            //             executed.push((scc_label, digest));
+            //         }
+            //     }
+            // }
+
+            // log::info!(
+            //     "sub_dag_id={}: FINALIZED! {} transactions ({} duplicates skipped)",
+            //     sub_dag_id,
+            //     executed.len(),
+            //     skipped_count
+            // );
+
+            // LOGGING
+            // for (scc_label, digest) in executed.iter() {
+            //     log::info!("sub_dag_id={}: scc={}: Executed {:?}", sub_dag_id, scc_label, digest);
+            // }
+
+            // OTHERWISE
+            let finalized_indices: Vec<usize> = match self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
                 Ok(Some(data)) => bincode::deserialize(&data).expect("deserialize failed"),
                 _ => {
                     log::error!("sub_dag_id={}: finalized_indices not found!", sub_dag_id);
                     break;
                 }
             };
+            let mut output_digests: Vec<Digest> = Vec::new();
 
-            // Map indices to digests, filtering already_finalized. While doing so, log SCC.
-            let mut executed: Vec<(u64, Digest)> = Vec::new();
             let mut skipped_count = 0;
 
-            for (scc_pos, group) in finalized_sccs.iter().enumerate() {
-                let scc_label: u64 = if self.use_auncel { sub_dag_id } else { scc_pos as u64 };
-
-                for idx in group {
-                    if *idx >= index_to_digest.len() {
-                        log::warn!(
-                            "sub_dag_id={}: index {} out of bounds (len={})",
-                            sub_dag_id, idx, index_to_digest.len()
-                        );
-                        continue;
-                    }
-
-                    let digest_bytes = &index_to_digest[*idx];
-                    if digest_bytes.len() != 32 {
-                        log::warn!(
-                            "sub_dag_id={}: invalid digest length {} at index {}",
-                            sub_dag_id, digest_bytes.len(), idx
-                        );
-                        continue;
-                    }
-
-                    let arr: [u8; 32] = digest_bytes.clone().try_into().unwrap();
-                    let digest = Digest(arr);
-
-                    if self.already_finalized.contains(&digest) {
-                        skipped_count += 1;
-                    } else {
-                        self.already_finalized.insert(digest.clone());
-                        executed.push((scc_label, digest));
-                    }
+            for idx in &finalized_indices {
+                if *idx >= index_to_digest.len() {
+                    log::warn!(
+                        "sub_dag_id={}: index {} out of bounds (len={})",
+                        sub_dag_id, idx, index_to_digest.len()
+                    );
+                    continue;
+                }
+                
+                let digest_bytes = &index_to_digest[*idx];
+                if digest_bytes.len() != 32 {
+                    log::warn!(
+                        "sub_dag_id={}: invalid digest length {} at index {}",
+                        sub_dag_id, digest_bytes.len(), idx
+                    );
+                    continue;
+                }
+                
+                let arr: [u8; 32] = digest_bytes.clone().try_into().unwrap();
+                let digest = Digest(arr);
+                
+                if self.already_finalized.contains(&digest) {
+                    skipped_count += 1;
+                } else {
+                    self.already_finalized.insert(digest.clone());
+                    output_digests.push(digest);
                 }
             }
 
             log::info!(
                 "sub_dag_id={}: FINALIZED! {} transactions ({} duplicates skipped)",
                 sub_dag_id,
-                executed.len(),
+                output_digests.len(),
                 skipped_count
             );
 
             // LOGGING
-            // for (scc_label, digest) in executed.iter() {
+            // for digest in output_digests.iter() {
             //     log::info!("sub_dag_id={}: scc={}: Executed {:?}", sub_dag_id, scc_label, digest);
             // }
             
@@ -1119,27 +1183,70 @@ impl GlobalOrder {
                 },
                 
                 Some((sub_dag_id, finalized_now, region_b_v, region_b_e, missing_edge_vertices, missing_edges)) = self.rx_utig_results.recv() => {
-                    let finalized_tx_count: usize = finalized_now.iter().map(|g| g.len()).sum();
+                    
+                    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+                    // let finalized_tx_count: usize = finalized_now.iter().map(|g| g.len()).sum();
 
+                    // log::info!(
+                    //     "rx_utig_results: sub_dag_id={}, finalized_txs={}, finalized_sccs={}, region_b_v={}, region_b_e={}, missing_edges={}",
+                    //     sub_dag_id, finalized_tx_count, finalized_now.len(), region_b_v.len(), region_b_e.len(), missing_edges.len()
+                    // );
+
+                    // if !finalized_now.is_empty() && region_b_v.is_empty() && region_b_e.is_empty() && missing_edges.is_empty() {
+                    //     log::info!(
+                    //         "sub_dag_id={}: FairUpdate+Finalize completed, {} txs ({} sccs)",
+                    //         sub_dag_id, finalized_tx_count, finalized_now.len()
+                    //     );
+                        
+                    //     let state = self.store.read(Self::subdag_state_key(sub_dag_id)).await
+                    //         .ok().flatten().and_then(|v| v.get(0).copied()).unwrap_or(0);
+
+                    //     if state == 1 {
+                    //         let mut full: Vec<Vec<usize>> = Vec::new();
+
+                    //         if let Ok(Some(bytes)) = self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
+                    //             let prefix: Vec<Vec<usize>> = bincode::deserialize(&bytes).expect("deserialize prefix failed");
+                    //             full.extend(prefix);
+                    //         } else {
+                    //             log::error!("sub_dag_id={}: state=1 but missing prefix on disk", sub_dag_id);
+                    //         }
+
+                    //         full.extend(finalized_now);
+
+                    //         self.store.write(Self::finalized_indices_key(sub_dag_id), bincode::serialize(&full).unwrap()).await;
+                    //     } else {
+                    //         self.store.write(Self::finalized_indices_key(sub_dag_id), bincode::serialize(&finalized_now).unwrap()).await;
+                    //     }
+
+                    //     self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
+                        
+                    //     self.pending_subdags_fair.remove(&sub_dag_id);
+                        
+                    //     self.try_finalize_sequential().await;
+                    //     continue;
+                    // }
+
+                    // OTHERWISE
                     log::info!(
-                        "rx_utig_results: sub_dag_id={}, finalized_txs={}, finalized_sccs={}, region_b_v={}, region_b_e={}, missing_edges={}",
-                        sub_dag_id, finalized_tx_count, finalized_now.len(), region_b_v.len(), region_b_e.len(), missing_edges.len()
+                        "rx_utig_results: sub_dag_id={}, finalized={}, region_b_v={}, region_b_e={}, missing_edges={}",
+                        sub_dag_id, finalized_now.len(), region_b_v.len(), region_b_e.len(), missing_edges.len()
                     );
 
                     if !finalized_now.is_empty() && region_b_v.is_empty() && region_b_e.is_empty() && missing_edges.is_empty() {
+                        
                         log::info!(
-                            "sub_dag_id={}: FairUpdate+Finalize completed, {} txs ({} sccs)",
-                            sub_dag_id, finalized_tx_count, finalized_now.len()
+                            "sub_dag_id={}: FairUpdate+Finalize completed, {} indices",
+                            sub_dag_id, finalized_now.len()
                         );
                         
                         let state = self.store.read(Self::subdag_state_key(sub_dag_id)).await
                             .ok().flatten().and_then(|v| v.get(0).copied()).unwrap_or(0);
 
                         if state == 1 {
-                            let mut full: Vec<Vec<usize>> = Vec::new();
+                            let mut full = Vec::new();
 
                             if let Ok(Some(bytes)) = self.store.read(Self::finalized_indices_key(sub_dag_id)).await {
-                                let prefix: Vec<Vec<usize>> = bincode::deserialize(&bytes).expect("deserialize prefix failed");
+                                let prefix: Vec<usize> = bincode::deserialize(&bytes).expect("deserialize prefix failed");
                                 full.extend(prefix);
                             } else {
                                 log::error!("sub_dag_id={}: state=1 but missing prefix on disk", sub_dag_id);
@@ -1194,8 +1301,8 @@ impl GlobalOrder {
                     self.store.write(Self::region_data_key(sub_dag_id), compressed).await;
 
                     log::info!(
-                        "sub_dag_id={}: stored to disk, finalized_solid_txs={}, finalized_solid_sccs={}, region_b_v={}, missing_edges={}",
-                        sub_dag_id, finalized_tx_count, finalized_now.len(), region_b_v.len(), missing_edges.len()
+                        "sub_dag_id={}: stored to disk, finalized_solid={}, region_b_v={}, missing_edges={}",
+                        sub_dag_id, finalized_now.len(), region_b_v.len(), missing_edges.len()
                     );
 
                     // Has missing edges - need FairUpdate votes
@@ -1223,15 +1330,14 @@ impl GlobalOrder {
                         .await;
                     
                 },
-                Some((sub_dag_id, finalized_sccs)) = self.rx_auncel_results.recv() => {
-                    let finalized_tx_count: usize = finalized_sccs.iter().map(|g| g.len()).sum();
+                Some((sub_dag_id, finalized_indices)) = self.rx_auncel_results.recv() => {
 
                     log::info!(
                         "rx_auncel_results: sub_dag_id={}, finalized={} txs (single-round)",
-                        sub_dag_id, finalized_tx_count
+                        sub_dag_id, finalized_indices.len()
                     );
 
-                    let finalized_ser = bincode::serialize(&finalized_sccs).expect("serialize failed");
+                    let finalized_ser = bincode::serialize(&finalized_indices).expect("serialize failed");
                     self.store.write(Self::finalized_indices_key(sub_dag_id), finalized_ser).await;
                     
                     self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
@@ -1251,7 +1357,10 @@ fn apply_fair_update_and_finalize(
     n: u64,
     f: u64,
     gamma: f64,
-    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // OTHERWISE
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 ) {
     let start_time = Instant::now();
 
@@ -1454,21 +1563,32 @@ fn apply_fair_update_and_finalize(
         }
     }
 
-    let mut finalized_now: Vec<Vec<usize>> = Vec::new();
-    let mut finalized_tx_count: usize = 0;
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // let mut finalized_now: Vec<Vec<usize>> = Vec::new();
+    // let mut finalized_tx_count: usize = 0;
+    // OTHERWISE
+    let mut finalized_now: Vec<usize> = Vec::new();
+
     for &scc_idx in &topo {
-        let mut group = sccs[scc_idx].clone();
-        group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
-        finalized_tx_count += group.len();
-        finalized_now.push(group);
+        // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+        // let mut group = sccs[scc_idx].clone();
+        // group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+        // finalized_tx_count += group.len();
+        // finalized_now.push(group);
+        // OTHERWISE
+        let comp = &sccs[scc_idx];
+        if comp.len() == 1 {
+            finalized_now.push(comp[0]);
+        } else {
+            let mut sorted = comp.clone();
+            sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+            finalized_now.extend(sorted);
+        }
     }
 
     log::info!(
-        "apply_fair_finalize: sub_dag_id={}, finalized {} txs ({} sccs) in {}ns",
-        sub_dag_id,
-        finalized_tx_count,
-        finalized_now.len(),
-        start_time.elapsed().as_nanos()
+        "apply_fair_finalize: sub_dag_id={}, finalized {} txs in {}ns",
+        sub_dag_id, finalized_now.len(), start_time.elapsed().as_nanos()
     );
 
     let _ = tx_utig_results.blocking_send((sub_dag_id, finalized_now, vec![], vec![], vec![], vec![]));
@@ -1481,7 +1601,10 @@ pub fn run_utig(
     k: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
-    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+    // OTHERWISE
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 ) {
 
     let start_total = Instant::now();
@@ -1841,12 +1964,25 @@ pub fn run_utig(
         }
     }
 
-    let mut finalized_now: Vec<Vec<usize>> = Vec::new();
-    for topo_pos in 0..start_b {
-        let mut group = sccs[topo[topo_pos]].clone();
-        group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
-        finalized_now.push(group);
-    }
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // let mut finalized_now: Vec<Vec<usize>> = Vec::new();
+    // for topo_pos in 0..start_b {
+    //     let mut group = sccs[topo[topo_pos]].clone();
+    //     group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+    //     finalized_now.push(group);
+    // }
+    // OTHERWISE
+    let mut finalized_now: Vec<usize> = Vec::new();
+     for topo_pos in 0..start_b {
+        let comp = &sccs[topo[topo_pos]];
+        if comp.len() == 1 {
+            finalized_now.push(comp[0]);
+        } else {
+            let mut sorted = comp.clone();
+            sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+            finalized_now.extend(sorted);
+        }
+     }
 
     // ============================================================
     // (7) Remove txs that are part of SCCs after V in S
@@ -1854,13 +1990,28 @@ pub fn run_utig(
     // ============================================================
 
     let mut region_b_local: Vec<usize> = Vec::new();
-    let mut region_b_sccs: Vec<Vec<usize>> = Vec::new();
+
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    // let mut region_b_sccs: Vec<Vec<usize>> = Vec::new();
+    // if start_b <= anchor {
+    //     for topo_pos in start_b..=anchor {
+    //         let mut group = sccs[topo[topo_pos]].clone();
+    //         group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+    //         region_b_local.extend(group.iter().copied());
+    //         region_b_sccs.push(group);
+    //     }
+    // }
+    // OTHERWISE
     if start_b <= anchor {
         for topo_pos in start_b..=anchor {
-            let mut group = sccs[topo[topo_pos]].clone();
-            group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
-            region_b_local.extend(group.iter().copied());
-            region_b_sccs.push(group);
+            let comp = &sccs[topo[topo_pos]];
+            if comp.len() == 1 {
+                region_b_local.push(comp[0]);
+            } else {
+                let mut sorted = comp.clone();
+                sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper  
+                region_b_local.extend(sorted);
+            }
         }
     }
 
@@ -1919,10 +2070,16 @@ pub fn run_utig(
     let region_b_len = region_b_local.len();
     let shaded_len = kept_shaded.len();
     if missing_edges.is_empty() && !region_b_local.is_empty() {
-        finalized_now.extend(region_b_sccs);
+        // ENABLE IF THERE IS NEED TO SEE tx's SCC
+        // finalized_now.extend(region_b_sccs);
+        // OTHERWISE
+        finalized_now.extend(&region_b_local);
         region_b_local.clear();
     }
-    let finalized_tx_count: usize = finalized_now.iter().map(|g| g.len()).sum();
+
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC
+    // let finalized_tx_count: usize = finalized_now.iter().map(|g| g.len()).sum();
+    
     let region_b_v: Vec<u16> = region_b_local.iter().map(|&u| u as u16).collect();
     let mut region_b_e: Vec<(u16, u16)> = Vec::new();
     for &u in &region_b_local {
@@ -1936,8 +2093,7 @@ pub fn run_utig(
     }
 
     log::info!(
-        "finalized prefix txs = {}, finalized_sccs = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
-        finalized_tx_count,
+        "finalized prefix length = {}, solid_nodes = {}, shaded_nodes = {}, missing_edges = {}, anchor_scc_idx = {}, total ns = {}",
         finalized_now.len(),
         region_b_len - shaded_len,
         shaded_len,
@@ -1977,7 +2133,10 @@ pub fn run_auncel_order(
     non_blank_threshold: usize,
     weight_k: f64,
     use_final_order_phase: bool,
-    tx_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>)>,
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC
+    // tx_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>)>,
+    // OTHERWISE
+    tx_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>)>,
 ) {
     let start_time = Instant::now();
 
@@ -2082,7 +2241,10 @@ pub fn run_auncel_order(
     );
 
 
-    let _ = tx_results.blocking_send((sub_dag_id, vec![final_order]));
+    // ENABLE IF THERE IS NEED TO SEE tx's SCC
+    // let _ = tx_results.blocking_send((sub_dag_id, vec![final_order]));
+    // OTHERWISE
+    let _ = tx_results.blocking_send((sub_dag_id, final_order));
 
     matrix.reset_auncel(k, num_orders);
     // ===== Release slot =====
