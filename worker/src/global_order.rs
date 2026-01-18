@@ -13,7 +13,7 @@ use crypto::{Digest, Hash, PublicKey};
 use nohash::{IntMap, IntSet};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use lz4_flex::decompress_size_prepended;
+use lz4_flex::{decompress_size_prepended, compress_prepend_size};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
@@ -194,7 +194,7 @@ fn unpack_and_decompress_edges(compressed: &[u8], expected_count: usize) -> Vec<
         Ok(d) => d,
         Err(e) => {
             log::error!("Failed to decompress edges: {}", e);
-            return vec![];
+            panic!("Could not decompress missing edges");
         }
     };
     
@@ -467,19 +467,8 @@ impl GlobalOrder {
         authors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         for author in authors {
+            
             let lo_digests = &author_to_lo_digests_subdag[&author];
-            
-            // Determine which LocalOrders to extract fair proposals from
-            // Option 1: Only from final round
-            // Get the author's round boundaries to find which LOs belong to final round
-            let round_boundaries = self.author_round_boundaries.get(&author).unwrap();
-            let final_round_boundary = round_boundaries.iter().find(|(r, _, _)| *r == final_round);
-            
-            let (final_round_start, final_round_end) = match final_round_boundary {
-                Some((_r, start, end)) => (*start, *end),
-                None => (usize::MAX, 0), // Author not in final round
-            };
-
             let mut indices: Vec<usize> = Vec::new();
             
             for (lo_idx, lo_digest) in lo_digests.iter().enumerate() {
@@ -746,7 +735,7 @@ impl GlobalOrder {
         }
         
         // Load region_b data and spawn FairUpdate
-        let combined_data = match self.store.read(Self::region_data_key(sub_dag_id)).await {
+        let compressed_combined_data = match self.store.read(Self::region_data_key(sub_dag_id)).await {
             Ok(Some(data)) => data,
             _ => {
                 log::error!("sub_dag_id={}: region_data not found", sub_dag_id);
@@ -766,7 +755,7 @@ impl GlobalOrder {
         
         let _handler = tokio_rayon::spawn(move || {
             apply_fair_update_and_finalize(
-                combined_data,
+                compressed_combined_data,
                 sub_dag_id,
                 author_edges_map,
                 n,
@@ -1166,20 +1155,23 @@ impl GlobalOrder {
                     self.store.write(Self::finalized_indices_key(sub_dag_id), solid_ser).await;
 
                     // Store region_b data to disk (for FairUpdate later if needed)
-                    let mut combined_data: Vec<u8> = Vec::new();
                     let region_b_v_ser = bincode::serialize(&region_b_v).expect("serialize");
+                    let region_b_e_ser = bincode::serialize(&region_b_e).expect("serialize");
+
+                    let total_size = 8 + region_b_v_ser.len() + 8 + 8 + region_b_e_ser.len();
+                    let mut combined_data: Vec<u8> = Vec::with_capacity(total_size);
+
                     combined_data.extend_from_slice(&(region_b_v_ser.len() as u64).to_le_bytes());
                     combined_data.extend_from_slice(&region_b_v_ser);
                     combined_data.extend_from_slice(&[0xFF; 8]);
-                    let region_b_e_ser = bincode::serialize(&region_b_e).expect("serialize");
                     combined_data.extend_from_slice(&(region_b_e_ser.len() as u64).to_le_bytes());
                     combined_data.extend_from_slice(&region_b_e_ser);
-                    combined_data.extend_from_slice(&[0xFF; 8]);
-                    // Also store index_to_digest in combined_data for FairUpdate
-                    let index_ser = bincode::serialize(&index_to_digest).expect("serialize");
-                    combined_data.extend_from_slice(&(index_ser.len() as u64).to_le_bytes());
-                    combined_data.extend_from_slice(&index_ser);
-                    self.store.write(Self::region_data_key(sub_dag_id), combined_data).await;
+                    
+                    // NO COMPRESSION:
+                    // self.store.write(Self::region_data_key(sub_dag_id), combined_data).await;
+                    // WITH COMPRESSION:
+                    let compressed = compress_prepend_size(&combined_data);
+                    self.store.write(Self::region_data_key(sub_dag_id), compressed).await;
 
                     log::info!(
                         "sub_dag_id={}: stored to disk, finalized_solid_txs={}, finalized_solid_sccs={}, region_b_v={}, missing_edges={}",
@@ -1233,7 +1225,7 @@ impl GlobalOrder {
 }
 
 fn apply_fair_update_and_finalize(
-    combined_data: Vec<u8>,
+    compressed_combined_data: Vec<u8>,
     sub_dag_id: u64,
     author_edges_map: HashMap<PublicKey, Vec<u32>>,
     n: u64,
@@ -1242,6 +1234,14 @@ fn apply_fair_update_and_finalize(
     tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
 ) {
     let start_time = Instant::now();
+
+    let combined_data = match decompress_size_prepended(&compressed_combined_data) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("Failed to decompress edges: {}", e);
+            panic!("Could not decompress combined data");
+        }
+    };
     
     // Deserialize region_b data
     let mut offset = 0;
