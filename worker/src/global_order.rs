@@ -950,9 +950,10 @@ impl GlobalOrder {
                 skipped_count
             );
 
-            for (scc_label, digest) in executed.iter() {
-                log::info!("sub_dag_id={}: scc={}: Executed {:?}", sub_dag_id, scc_label, digest);
-            }
+            // LOGGING
+            // for (scc_label, digest) in executed.iter() {
+            //     log::info!("sub_dag_id={}: scc={}: Executed {:?}", sub_dag_id, scc_label, digest);
+            // }
             
             // Mark as Finalized (3)
             self.store.write(Self::subdag_state_key(sub_dag_id), vec![3]).await;

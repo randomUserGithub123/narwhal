@@ -174,11 +174,12 @@ impl LocalOrderMaker {
                 Some(tx_digest) = self.rx_tx_digests.recv() => {
                     if !self.tx_digest_to_order.contains_key(&tx_digest) {
 
-                        log::info!(
-                            "Receival of tx_digest {:?} at position {}", 
-                            tx_digest, 
-                            self.global_tx_counter
-                        );
+                        // LOGGING
+                        // log::info!(
+                        //     "Receival of tx_digest {:?} at position {}", 
+                        //     tx_digest, 
+                        //     self.global_tx_counter
+                        // );
 
                         self.tx_digest_to_order.insert(tx_digest.clone(), self.global_tx_counter);
                         self.global_tx_counter += 1;
