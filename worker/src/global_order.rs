@@ -27,7 +27,7 @@ pub enum WorkerMessage {
 
 use crate::batch_maker::Batch;
 
-const MAX_TX: usize = 65535;
+const MAX_TX: usize = 65_535;
 const MAX_ORDERS: usize = 500;  // Max LocalOrders per subdag
 const MATRIX_POOL_SIZE: usize = 1; // M
 
@@ -266,7 +266,7 @@ pub struct GlobalOrder {
 
     author_to_lo_digests: HashMap<PublicKey, Vec<Option<Digest>>>,
     digest_to_seq: HashMap<PublicKey, HashMap<Digest, usize>>,
-    author_round_boundaries: HashMap<PublicKey, Vec<(Round, usize, usize)>>,
+    author_round_boundaries: HashMap<PublicKey, Vec<(Round, Vec<usize>)>>,
     pending_headers: HashMap<PublicKey, Vec<(Round, Vec<Digest>)>>,
     
     pending_subdags: VecDeque<Vec<(Round, Vec<PublicKey>)>>,
@@ -417,24 +417,24 @@ impl GlobalOrder {
         Some(seq_u64 as usize)
     }
 
-    fn has_full_range(&self, author: &PublicKey, start: usize, end: usize) -> bool {
+    fn has_all_indices(&self, author: &PublicKey, indices: &[usize]) -> bool {
         let Some(v) = self.author_to_lo_digests.get(author) else { return false; };
-        if end >= v.len() { return false; }
-        v[start..=end].iter().all(|x| x.is_some())
+        indices.iter().all(|&idx| idx < v.len() && v[idx].is_some())
     }
 
     fn can_process_subdag(&self, sub_dag: &[(Round, Vec<PublicKey>)]) -> bool {
         for (round, authors) in sub_dag {
             for author in authors {
                 let Some(bounds) = self.author_round_boundaries.get(author) else { return false; };
-                let Some((_, start, end)) = bounds.iter().find(|(r,_,_)| r == round) else { return false; };
-                if !self.has_full_range(author, *start, *end) { return false; }
+                let Some((_, indices)) = bounds.iter().find(|(r, _)| r == round) else { return false; };
+                if !self.has_all_indices(author, indices) { return false; }
             }
         }
         true
     }
 
     async fn process_subdag(&mut self, sub_dag: Vec<(Round, Vec<PublicKey>)>) {
+        
         let start_time = Instant::now();
 
         let rounds: Vec<Round> = sub_dag.iter().map(|(r, _)| *r).collect();
@@ -455,43 +455,85 @@ impl GlobalOrder {
             log::info!("  round {}: {} authors", round, authors.len());
         }
 
-        let mut author_to_lo_digests_subdag: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
-
-        // Find the final (maximum) round
-        let final_round = sub_dag.iter().map(|(r, _)| *r).max().unwrap_or(0);
-        log::info!("process_subdag: final_round={}", final_round);
+        // =====================================================================
+        // STEP 1: Collect ALL indices per author across ALL rounds in subdag
+        // =====================================================================
+        let mut author_to_all_indices: HashMap<PublicKey, Vec<usize>> = HashMap::new();
 
         for (round, authors) in sub_dag.iter() {
             for author in authors {
                 let round_boundaries = self.author_round_boundaries.get(author).unwrap();
-                let Some((_r, start_idx, end_idx)) = round_boundaries.iter().find(|(r, _, _)| r == round) else {
+                let Some((_r, indices)) = round_boundaries.iter().find(|(r, _)| r == round) else {
                     panic!("Missing boundary for author {:?}, round {} (should have been checked)", author, round);
                 };
 
-                let Some(author_local_orders) = self.author_to_lo_digests.get(author) else {
-                    panic!("Author {:?} not found in author_to_lo_digests", author);
-                };
+                // Collect indices (don't fetch digests yet)
+                author_to_all_indices
+                    .entry(*author)
+                    .or_default()
+                    .extend(indices.iter().copied());
+            }
+        }
 
-                if *end_idx >= author_local_orders.len() {
+        // =====================================================================
+        // STEP 2: Sort and deduplicate indices per author, then fetch digests
+        // =====================================================================
+        let mut author_to_lo_digests_subdag: HashMap<PublicKey, Vec<Digest>> = HashMap::new();
+
+        // Sort authors for deterministic ordering across nodes
+        let mut authors: Vec<PublicKey> = author_to_all_indices.keys().cloned().collect();
+        authors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        for author in &authors {
+            let indices = author_to_all_indices.get_mut(author).unwrap();
+            
+            // Sort by sequence number
+            indices.sort_unstable();
+            
+            // Remove duplicates (same LocalOrder might be referenced in retransmission)
+            indices.dedup();
+
+            let Some(author_local_orders) = self.author_to_lo_digests.get(author) else {
+                panic!("Author {:?} not found in author_to_lo_digests", author);
+            };
+
+            // Now fetch digests in sorted sequence order
+            for &idx in indices.iter() {
+                if idx >= author_local_orders.len() {
                     panic!(
-                        "Invalid boundary ({},{}) for author {:?} - only {} local orders",
-                        start_idx, end_idx, author, author_local_orders.len()
+                        "Invalid index {} for author {:?} - only {} local orders available",
+                        idx, author, author_local_orders.len()
                     );
                 }
 
-                let lo_slice = &author_local_orders[*start_idx..=*end_idx];
-                
-                for maybe_digest in lo_slice {
-                    if let Some(digest) = maybe_digest {
+                match &author_local_orders[idx] {
+                    Some(digest) => {
                         author_to_lo_digests_subdag
                             .entry(*author)
                             .or_default()
                             .push(digest.clone());
-                    } else {
-                        panic!("None digest in boundary for author {:?}, round {}", author, round);
+                    }
+                    None => {
+                        panic!(
+                            "None digest at index {} for author {:?} (should have been checked)",
+                            idx, author
+                        );
                     }
                 }
             }
+
+            log::info!(
+                "process_subdag: author {:?}, {} LocalOrders, seq range {:?}",
+                author,
+                author_to_lo_digests_subdag.get(author).map(|v| v.len()).unwrap_or(0),
+                if indices.is_empty() { 
+                    "[]".to_string() 
+                } else if indices.len() <= 5 {
+                    format!("{:?}", indices)
+                } else {
+                    format!("[{}..{}] ({})", indices[0], indices[indices.len()-1], indices.len())
+                }
+            );
         }
 
         let t1 = start_time.elapsed().as_nanos();
@@ -1167,7 +1209,7 @@ impl GlobalOrder {
 
                 Some((author, round, lo_digests)) = self.rx_header_update.recv() => {
                     log::info!("rx_header_update: author {:?}, round {}, {} digests",
-                              author, round, lo_digests.len());
+                            author, round, lo_digests.len());
 
                     let maybe_seq_map = self.digest_to_seq.get(&author);
 
@@ -1180,6 +1222,7 @@ impl GlobalOrder {
                         continue;
                     };
 
+                    // Check if all digests have known sequence numbers
                     if lo_digests.iter().any(|d| !seq_map.contains_key(d)) {
                         log::warn!(
                             "rx_header_update: deferring header (author={:?}, round={}): missing lo_digests in digest_to_seq",
@@ -1189,32 +1232,39 @@ impl GlobalOrder {
                         continue;
                     }
 
-                    let mut start = usize::MAX;
-                    let mut end = 0usize;
-                    let mut uniq = HashSet::with_capacity(lo_digests.len());
-
-                    for d in &lo_digests {
-                        uniq.insert(d.clone());
-                        let s = seq_map[d];
-                        start = start.min(s);
-                        end = end.max(s);
-                    }
-
-                    if uniq.len() != lo_digests.len() {
-                        panic!("rx_header_update: duplicate LO digests in header for {:?}, round {}", author, round);
-                    }
-
-                    if end + 1 - start != lo_digests.len() {
-                        panic!(
-                            "rx_header_update: non-contiguous seq window for {:?}, round {} (start={}, end={}, count={})",
-                            author, round, start, end, lo_digests.len()
+                    // Collect the actual sequence indices (may be non-contiguous due to retransmission)
+                    let mut indices: Vec<usize> = lo_digests.iter()
+                        .map(|d| seq_map[d])
+                        .collect();
+                    
+                    // Sort for consistent ordering (digests may arrive out of order)
+                    indices.sort_unstable();
+                    
+                    // Check for duplicates within this header (shouldn't happen but let's be safe)
+                    let unique_count = {
+                        let mut uniq = indices.clone();
+                        uniq.dedup();
+                        uniq.len()
+                    };
+                    
+                    if unique_count != lo_digests.len() {
+                        log::warn!(
+                            "rx_header_update: duplicate seq indices in header for {:?}, round {} ({} digests, {} unique)",
+                            author, round, lo_digests.len(), unique_count
                         );
                     }
+
+                    log::info!(
+                        "rx_header_update: author {:?}, round {}, indices {:?} (count={})",
+                        author, round, 
+                        if indices.len() <= 10 { format!("{:?}", indices) } else { format!("[{}..{}]", indices[0], indices[indices.len()-1]) },
+                        indices.len()
+                    );
 
                     self.author_round_boundaries
                         .entry(author)
                         .or_default()
-                        .push((round, start, end));
+                        .push((round, indices));
                     
                     // Check if any pending sub-dags can now be processed
                     self.try_process_pending_subdags().await;
@@ -1251,30 +1301,28 @@ impl GlobalOrder {
                         };
 
                         let mut unresolved: Vec<(Round, Vec<Digest>)> = Vec::new();
-                        let mut newly_resolved: Vec<(Round, usize, usize)> = Vec::new();
+                        let mut newly_resolved: Vec<(Round, Vec<usize>)> = Vec::new();
 
                         for (r, ds) in pending.drain(..) {
+                            // Check if all digests now have sequence numbers
                             if ds.iter().any(|d| !seq_map.contains_key(d)) {
                                 unresolved.push((r, ds));
                                 continue;
                             }
 
-                            let mut start = usize::MAX;
-                            let mut end = 0usize;
-                            for d in &ds {
-                                let s = seq_map[d];
-                                start = start.min(s);
-                                end = end.max(s);
-                            }
+                            // Collect and sort the indices
+                            let mut indices: Vec<usize> = ds.iter()
+                                .map(|d| seq_map[d])
+                                .collect();
+                            indices.sort_unstable();
 
-                            if end + 1 - start != ds.len() {
-                                panic!(
-                                    "pending header non-contiguous seq window for {:?}, round {} (start={}, end={}, count={})",
-                                    author, r, start, end, ds.len()
-                                );
-                            }
+                            log::info!(
+                                "pending header resolved: author {:?}, round {}, indices {:?}",
+                                author, r,
+                                if indices.len() <= 10 { format!("{:?}", indices) } else { format!("[{}..{}] ({})", indices[0], indices[indices.len()-1], indices.len()) }
+                            );
 
-                            newly_resolved.push((r, start, end));
+                            newly_resolved.push((r, indices));
                         }
 
                         if !unresolved.is_empty() {
