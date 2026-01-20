@@ -27,7 +27,7 @@ pub enum WorkerMessage {
 
 use crate::batch_maker::Batch;
 
-const MAX_TX: usize = 80_000;
+const MAX_TX: usize = 65535;
 const MAX_ORDERS: usize = 500;  // Max LocalOrders per subdag
 const MATRIX_POOL_SIZE: usize = 1; // M
 
