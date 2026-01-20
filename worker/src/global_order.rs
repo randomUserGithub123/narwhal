@@ -29,7 +29,7 @@ use crate::batch_maker::Batch;
 
 const MAX_TX: usize = 65_535;
 const MAX_ORDERS: usize = 500;  // Max LocalOrders per subdag
-const MATRIX_POOL_SIZE: usize = 1; // M
+const MATRIX_POOL_SIZE: usize = 10; // M
 
 pub struct UTIGMatrix {
     // === UTIG fields ===
@@ -381,7 +381,7 @@ impl GlobalOrder {
             pending_fair_updates: HashMap::new(),
             next_to_finalize: 0,
             already_finalized: HashSet::new(),
-            use_utig_paper: true,
+            use_utig_paper: false,
             utig_paper_slot: None,
             utig_paper_tx_map: HashMap::new(),
             utig_paper_idx_to_digest: HashMap::new(),
