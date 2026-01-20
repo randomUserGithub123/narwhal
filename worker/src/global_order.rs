@@ -4,10 +4,12 @@ use store::Store;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use tokio::sync::mpsc::Receiver;
 use tokio::task;
+use tokio::sync::Semaphore;
 use std::convert::TryInto as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
+// use std::cell::UnsafeCell;
 use std::time::Instant;
 use crypto::{Digest, Hash, PublicKey};
 use nohash::{IntMap, IntSet};
@@ -24,9 +26,9 @@ pub enum WorkerMessage {
 
 use crate::batch_maker::Batch;
 
-const MAX_TX: usize = 60_000;
+const MAX_TX: usize = 80_000;
 const MAX_ORDERS: usize = 500;  // Max LocalOrders per subdag
-const MATRIX_POOL_SIZE: usize = 10; // M
+const MATRIX_POOL_SIZE: usize = 1; // M
 
 pub struct UTIGMatrix {
     // === UTIG fields ===
@@ -163,18 +165,7 @@ pub struct UTIGMatrixPool {
 impl UTIGMatrixPool {
     pub fn new() -> Self {
         UTIGMatrixPool {
-            pool: [
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-                UTIGMatrix::new(),
-            ],
+            pool: std::array::from_fn(|_| UTIGMatrix::new()),
             used: [false; MATRIX_POOL_SIZE],
             next: 0,
         }
@@ -200,6 +191,7 @@ impl UTIGMatrixPool {
 }
 
 
+static RAYON_SERIAL: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
 static UTIG_POOL: Lazy<Mutex<UTIGMatrixPool>> =
     Lazy::new(|| Mutex::new(UTIGMatrixPool::new()));
 
@@ -293,6 +285,15 @@ pub struct GlobalOrder {
     next_to_finalize: u64,
     already_finalized: HashSet<Digest>,
 
+    // UTIG PAPER
+    use_utig_paper: bool,
+    utig_paper_slot: Option<usize>,
+    utig_paper_tx_map: HashMap<Vec<u8>, usize>,      // digest → global index
+    utig_paper_idx_to_digest: HashMap<usize, Vec<u8>>, // reverse map
+    utig_paper_free_list: Vec<usize>,                // recycled indices
+    utig_paper_next_idx: usize,
+
+    // AUNCEL PAPER
     use_auncel: bool,
     auncel_weight_k: f64,
     auncel_use_final_phase: bool,
@@ -328,6 +329,12 @@ impl GlobalOrder {
     
     fn finalized_indices_key(sub_dag_id: u64) -> Vec<u8> {
         let mut key = vec![0xFC; 8];
+        key.extend_from_slice(&sub_dag_id.to_le_bytes());
+        key
+    }
+
+    fn global_to_local_key(sub_dag_id: u64) -> Vec<u8> {
+        let mut key = vec![0xFB; 8];
         key.extend_from_slice(&sub_dag_id.to_le_bytes());
         key
     }
@@ -373,6 +380,12 @@ impl GlobalOrder {
             pending_fair_updates: HashMap::new(),
             next_to_finalize: 0,
             already_finalized: HashSet::new(),
+            use_utig_paper: false,
+            utig_paper_slot: None,
+            utig_paper_tx_map: HashMap::new(),
+            utig_paper_idx_to_digest: HashMap::new(),
+            utig_paper_free_list: Vec::new(),
+            utig_paper_next_idx: 0,
             use_auncel: false,
             auncel_weight_k: 0.5,
             auncel_use_final_phase: false,
@@ -684,6 +697,98 @@ impl GlobalOrder {
                 "process_subdag: spawned AUNCEL ordering (k={}, weight_k={}, final_phase={}) in {}ns",
                 k, auncel_weight_k, auncel_use_final_phase, start_time.elapsed().as_nanos()
             );
+        }  else if self.use_utig_paper {
+            
+            // Acquire persistent slot once
+            if self.utig_paper_slot.is_none() {
+                let mut pool = UTIG_POOL.lock().expect("UTIG_POOL mutex poisoned");
+                let slot = pool.acquire_slot().expect("MatrixPool exhausted");
+                self.utig_paper_slot = Some(slot);
+                log::info!("UTIG_PAPER: acquired persistent slot {}", slot);
+            }
+            let slot_idx = self.utig_paper_slot.unwrap();
+
+            // Map local indices to global persistent indices (with recycling)
+            let mut global_indices_sets: Vec<Vec<usize>> = Vec::new();
+            let mut recycled_this_batch: Vec<usize> = Vec::new();
+
+            for local_order in &indices_sets {
+                let mapped: Vec<usize> = local_order.iter().map(|&local_idx| {
+                    let digest = &index_to_digest[local_idx];
+                    
+                    if let Some(&existing) = self.utig_paper_tx_map.get(digest) {
+                        return existing;
+                    }
+                    
+                    let new_idx = self.utig_paper_free_list.pop().map(|recycled| {
+                        recycled_this_batch.push(recycled);
+                        recycled
+                    }).unwrap_or_else(|| {
+                        let idx = self.utig_paper_next_idx;
+                        self.utig_paper_next_idx += 1;
+                        idx
+                    });
+                    
+                    self.utig_paper_tx_map.insert(digest.clone(), new_idx);
+                    self.utig_paper_idx_to_digest.insert(new_idx, digest.clone());
+                    new_idx
+                }).collect();
+                global_indices_sets.push(mapped);
+            }
+
+            if self.utig_paper_next_idx > MAX_TX {
+                log::error!("UTIG_PAPER: next_idx={} exceeds MAX_TX={}", self.utig_paper_next_idx, MAX_TX);
+                return;
+            }
+
+            let mut global_to_local_map: HashMap<usize, usize> = HashMap::new();
+            for (local_idx, digest) in index_to_digest.iter().enumerate() {
+                let global_idx = self.utig_paper_tx_map[digest];
+                global_to_local_map.insert(global_idx, local_idx);
+            }
+            
+            // Store the mapping
+            let mapping_ser = bincode::serialize(&global_to_local_map).expect("serialize failed");
+            self.store.write(Self::global_to_local_key(sub_dag_id), mapping_ser).await;
+
+            let non_blank = self.non_blank_threshold as u8;
+            let solid = self.solid_threshold as u8;
+            let tx_utig_results = self.tx_utig_results.clone();
+
+            let slot = slot_idx;  // usize is Send-safe
+
+            log::info!(
+                "UTIG_PAPER: sub_dag_id={}, local_k={}, global_next_idx={}, recycled={}, free_list={}",
+                sub_dag_id, k, self.utig_paper_next_idx, recycled_this_batch.len(), self.utig_paper_free_list.len()
+            );
+
+            let sem = RAYON_SERIAL.clone();
+            tokio::spawn(async move {
+                let permit = sem.acquire_owned().await.unwrap();
+                let _handler = tokio_rayon::spawn(move || {
+
+                    let _permit = permit;
+                    
+                    let mut pool = UTIG_POOL.lock().expect("UTIG_POOL mutex poisoned");
+                    let matrix: &mut UTIGMatrix = &mut pool.pool[slot];
+                    
+                    run_utig(
+                        sub_dag_id,
+                        global_indices_sets,
+                        recycled_this_batch,
+                        non_blank,
+                        solid,
+                        matrix,
+                        tx_utig_results,
+                    );
+                });
+
+                log::info!(
+                    "process_subdag: spawned UTIG_PAPER incremental in {}ns",
+                    start_time.elapsed().as_nanos()
+                );
+            });
+             
         } else {
             
             let non_blank = self.non_blank_threshold;
@@ -691,7 +796,7 @@ impl GlobalOrder {
             let tx_utig_results = self.tx_utig_results.clone();
             
             let _handler = tokio_rayon::spawn(move || {
-                run_utig(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
+                run_themis(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
             });
 
             log::info!(
@@ -1232,6 +1337,48 @@ impl GlobalOrder {
                         sub_dag_id, finalized_now.len(), region_b_v.len(), region_b_e.len(), missing_edges.len()
                     );
 
+                    if self.use_utig_paper && !finalized_now.is_empty() {
+
+                        let global_to_local_data = match self.store.read(Self::global_to_local_key(sub_dag_id)).await {
+                            Ok(Some(data)) => data,
+                            _ => {
+                                log::error!("sub_dag_id={}: global_to_local mapping not found", sub_dag_id);
+                                continue;
+                            }
+                        };
+                        
+                        let global_to_local: HashMap<usize, usize> = bincode::deserialize(&global_to_local_data)
+                            .expect("Failed to deserialize global_to_local");
+                        
+                        // Convert global indices to local indices
+                        let mut local_finalized: Vec<usize> = Vec::new();
+
+                        for &global_idx in &finalized_now {
+                            if let Some(&local_idx) = global_to_local.get(&global_idx) {
+                                local_finalized.push(local_idx);
+                            } else {
+                                log::warn!("sub_dag_id={}: global index {} not in mapping", sub_dag_id, global_idx);
+                            }
+                            if let Some(digest) = self.utig_paper_idx_to_digest.remove(&global_idx) {
+                                self.utig_paper_tx_map.remove(&digest);
+                                self.utig_paper_free_list.push(global_idx);
+                            }
+                        }
+
+                        log::info!(
+                            "UTIG_PAPER: recycled {} indices, free_list={}",
+                            finalized_now.len(), self.utig_paper_free_list.len()
+                        );
+
+                        let finalized_ser = bincode::serialize(&local_finalized).expect("serialize failed");
+                        self.store.write(Self::finalized_indices_key(sub_dag_id), finalized_ser).await;
+                        
+                        self.store.write(Self::subdag_state_key(sub_dag_id), vec![2]).await;
+                        self.pending_subdags_fair.remove(&sub_dag_id);
+                        self.try_finalize_sequential().await;
+                        continue;
+                    }
+
                     if !finalized_now.is_empty() && region_b_v.is_empty() && region_b_e.is_empty() && missing_edges.is_empty() {
                         
                         log::info!(
@@ -1267,7 +1414,7 @@ impl GlobalOrder {
                         continue;
                     }
 
-                    // This is from run_utig - has region_b data
+                    // This is from run_themis - has region_b data
                     
                     // Load index_to_digest from DISK (not RAM)
                     let index_to_digest: Vec<Vec<u8>> = bincode::deserialize(
@@ -1595,7 +1742,7 @@ fn apply_fair_update_and_finalize(
 
 }
 
-pub fn run_utig(
+pub fn run_themis(
     sub_dag_id: u64,
     indices_sets: Vec<Vec<usize>>,
     k: usize,
@@ -2124,6 +2271,444 @@ pub fn run_utig(
         " t8: {}", t8
     );
 
+}
+
+/// UTIG Paper Algorithm - Incremental update on persistent matrix
+/// 
+/// Key properties:
+/// 1. Weights ACCUMULATE across batches (matrix NOT reset)
+/// 2. Only DirtyNodes/DirtyPairs trigger edge recomputation  
+pub fn run_utig(
+    sub_dag_id: u64,
+    indices_sets: Vec<Vec<usize>>,       // Global persistent indices for this batch
+    recycled_indices: Vec<usize>,         // Indices recycled this batch - need weight clearing
+    non_blank_threshold: u8,
+    solid_threshold: u8,
+    matrix: &mut UTIGMatrix,
+    tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<usize>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
+) {
+    let start_total = Instant::now();
+
+    if indices_sets.is_empty() {
+        log::info!("run_utig: sub_dag_id={}, empty batch", sub_dag_id);
+        let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
+        return;
+    }
+
+    // CRITICAL: Use MAX_TX as fixed stride for stable indexing across batches
+    // (indices get recycled, so we can't use a variable k)
+    #[inline(always)]
+    fn w_idx(i: usize, j: usize) -> usize {
+        i * MAX_TX + j
+    }
+
+    let weight = &mut matrix.weight;
+    let support = &mut matrix.support;
+    let is_non_blank = &mut matrix.is_non_blank;
+    let is_solid = &mut matrix.is_solid;
+    let edges = &mut matrix.edges;
+
+    let t_edge = non_blank_threshold;
+
+    // ============================================================
+    // Step 0: Clear weights for recycled indices BEFORE processing
+    // This ensures reused indices don't inherit stale weights
+    // ============================================================
+    for &idx in &recycled_indices {
+        // Clear row: W(idx, j) for all j - contiguous in memory
+        let row_start_byte = (idx * MAX_TX) >> 1;
+        let row_end_byte = row_start_byte + (MAX_TX >> 1);
+        weight[row_start_byte..row_end_byte].fill(0);
+        
+        // Clear column: W(j, idx) for all j - strided access
+        for j in 0..MAX_TX {
+            set_weight(weight, w_idx(j, idx), 0);
+        }
+        
+        // Also ensure state is clean
+        support[idx] = 0;
+        is_non_blank[idx] = false;
+        is_solid[idx] = false;
+        edges[idx].clear();
+    }
+
+    let t0 = start_total.elapsed().as_nanos();
+    if !recycled_indices.is_empty() {
+        log::info!(
+            "run_utig t0 (clear {} recycled): {}ns",
+            recycled_indices.len(), t0
+        );
+    }
+
+    // Collect all indices mentioned in this batch
+    let mut batch_indices_set: HashSet<usize> = HashSet::new();
+    for order in &indices_sets {
+        for &idx in order {
+            batch_indices_set.insert(idx);
+        }
+    }
+
+    // ============================================================
+    // Algorithm 1, Step 1: State Update + DirtyNodes tracking
+    // Determine which transactions changed state this batch
+    // ============================================================
+    let mut dirty_nodes: HashSet<usize> = HashSet::new();
+    
+    // Count per-batch support (how many local orders contain each tx)
+    let mut batch_support: HashMap<usize, u8> = HashMap::new();
+    for order in &indices_sets {
+        for &tx in order {
+            *batch_support.entry(tx).or_insert(0) = 
+                batch_support.get(&tx).unwrap_or(&0).saturating_add(1);
+        }
+    }
+    
+    // Update states based on batch support
+    for (&tx, &count) in &batch_support {
+        let old_non_blank = is_non_blank[tx];
+        let old_solid = is_solid[tx];
+        
+        // Update support (per-batch for state determination)
+        support[tx] = count;
+        is_non_blank[tx] = count >= non_blank_threshold;
+        is_solid[tx] = count >= solid_threshold;
+        
+        // Track state changes
+        if old_non_blank != is_non_blank[tx] || old_solid != is_solid[tx] {
+            dirty_nodes.insert(tx);
+        }
+    }
+
+    let t1 = start_total.elapsed().as_nanos();
+    log::info!(
+        "run_utig t1 (state update): {}ns, batch_txs={}, dirty_nodes={}",
+        t1 - t0, batch_indices_set.len(), dirty_nodes.len()
+    );
+
+    // ============================================================
+    // Algorithm 1, Step 2: Cumulative Weight Update + DirtyPairs
+    // KEY INSIGHT: Weights ACCUMULATE - they are NOT reset!
+    // ============================================================
+    let mut dirty_pairs: HashSet<(usize, usize)> = HashSet::new();
+
+    for order in &indices_sets {
+        let len = order.len();
+        for from_pos in 0..len {
+            let u = order[from_pos];
+            for to_pos in (from_pos + 1)..len {
+                let v = order[to_pos];
+                
+                let idx = w_idx(u, v);
+                let old_w = get_weight(weight, idx);
+                inc_weight(weight, idx);  // CUMULATIVE increment!
+                let new_w = get_weight(weight, idx);
+                
+                // Track pairs that crossed the Tedge threshold
+                if old_w < t_edge && new_w >= t_edge {
+                    dirty_pairs.insert((u.min(v), u.max(v)));
+                }
+            }
+        }
+    }
+
+    let t2 = start_total.elapsed().as_nanos();
+    log::info!(
+        "run_utig t2 (weight accumulate): {}ns, dirty_pairs={}",
+        t2 - t1, dirty_pairs.len()
+    );
+
+    // ============================================================
+    // Algorithm 1, Step 3: Optimized Edge Recomputation
+    // Only recompute edges for AffectedPairs, not all O(n²)!
+    // Affected = DirtyPairs ∪ {(u,v) : u ∈ DirtyNodes, v ∈ Vnb}
+    // ============================================================
+    
+    // Vnb = non-blank vertices in this batch
+    let active: Vec<usize> = batch_indices_set.iter()
+        .copied()
+        .filter(|&u| is_non_blank[u])
+        .collect();
+    let active_set: HashSet<usize> = active.iter().copied().collect();
+    
+    if active.is_empty() {
+        log::info!("run_utig: no non-blank txs in batch");
+        let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
+        return;
+    }
+
+    // Build affected set
+    let mut affected: HashSet<(usize, usize)> = dirty_pairs;
+    for &u in &dirty_nodes {
+        for &v in &active_set {
+            if u != v {
+                affected.insert((u.min(v), u.max(v)));
+            }
+        }
+    }
+
+    // Recompute edges ONLY for affected pairs
+    for &(u, v) in &affected {
+        // Remove existing edges in both directions
+        edges[u].retain(|&x| x as usize != v);
+        edges[v].retain(|&x| x as usize != u);
+        
+        // Skip if either is blank
+        if !is_non_blank[u] || !is_non_blank[v] {
+            continue;
+        }
+        
+        let w_uv = get_weight(weight, w_idx(u, v));
+        let w_vu = get_weight(weight, w_idx(v, u));
+        
+        // P(u→v) ≡ [W(u,v) ≥ Tedge] ∧ ([W(v,u) < Tedge] ∨ [W(u,v) > W(v,u)] ∨ ([W(u,v) = W(v,u)] ∧ u < v))
+        let p_uv = (w_uv >= t_edge) && 
+                   ((w_vu < t_edge) || (w_uv > w_vu) || ((w_uv == w_vu) && (u < v)));
+        let p_vu = (w_vu >= t_edge) && 
+                   ((w_uv < t_edge) || (w_vu > w_uv) || ((w_vu == w_uv) && (v < u)));
+        
+        // At most one can be true (predicate is anti-symmetric)
+        if p_uv {
+            edges[u].push(v as u16);
+        } else if p_vu {
+            edges[v].push(u as u16);
+        }
+        // If neither: no edge yet - weights will continue accumulating!
+    }
+
+    let t3 = start_total.elapsed().as_nanos();
+    log::info!(
+        "run_utig t3 (edge recompute): {}ns, affected_pairs={}",
+        t3 - t2, affected.len()
+    );
+
+    // ============================================================
+    // Algorithm 2: Extract Fair Prefix
+    // Steps: Tarjan SCC → Condensation → Topo Sort → Solid Anchor → Extract
+    // ============================================================
+
+    // Reset Tarjan working memory for active nodes only
+    for &u in &active {
+        matrix.dfn[u] = 0;
+        matrix.low[u] = 0;
+        matrix.on_stack[u] = false;
+        matrix.scc_id[u] = -1;
+    }
+
+    let dfn = &mut matrix.dfn;
+    let low = &mut matrix.low;
+    let on_stack = &mut matrix.on_stack;
+    let scc_id = &mut matrix.scc_id;
+
+    let mut index_counter: i32 = 0;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    // Tarjan's SCC algorithm - only follows edges within active_set
+    fn strongconnect(
+        u: usize,
+        index_counter: &mut i32,
+        stack: &mut Vec<usize>,
+        on_stack: &mut [bool],
+        dfn: &mut [i32],
+        low: &mut [i32],
+        edges: &[Vec<u16>],
+        scc_id: &mut [i32],
+        sccs: &mut Vec<Vec<usize>>,
+        active_set: &HashSet<usize>,
+    ) {
+        *index_counter += 1;
+        dfn[u] = *index_counter;
+        low[u] = *index_counter;
+        stack.push(u);
+        on_stack[u] = true;
+
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
+            // Only consider edges to other active (non-blank) nodes
+            if !active_set.contains(&v) {
+                continue;
+            }
+            if dfn[v] == 0 {
+                strongconnect(v, index_counter, stack, on_stack, dfn, low, edges, scc_id, sccs, active_set);
+                if low[v] < low[u] {
+                    low[u] = low[v];
+                }
+            } else if on_stack[v] && dfn[v] < low[u] {
+                low[u] = dfn[v];
+            }
+        }
+
+        if low[u] == dfn[u] {
+            let mut comp = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack[w] = false;
+                scc_id[w] = sccs.len() as i32;
+                comp.push(w);
+                if w == u {
+                    break;
+                }
+            }
+            sccs.push(comp);
+        }
+    }
+
+    for &u in &active {
+        if dfn[u] == 0 {
+            strongconnect(
+                u, &mut index_counter, &mut stack, on_stack, dfn, low,
+                edges, scc_id, &mut sccs, &active_set,
+            );
+        }
+    }
+
+    let scc_n = sccs.len();
+    if scc_n == 0 {
+        log::info!("run_utig: no SCCs found");
+        let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
+        return;
+    }
+
+    // Build condensation graph (DAG of SCCs)
+    let mut gc: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
+    let mut indegree: Vec<usize> = vec![0; scc_n];
+
+    for &u in &active {
+        let su = scc_id[u];
+        if su < 0 {
+            continue;
+        }
+        for &v16 in &edges[u] {
+            let v = v16 as usize;
+            if !active_set.contains(&v) {
+                continue;
+            }
+            let sv = scc_id[v];
+            if sv < 0 || su == sv {
+                continue;
+            }
+            gc[su as usize].push(sv as usize);
+        }
+    }
+
+    // Deduplicate edges in condensation graph
+    for u in 0..scc_n {
+        gc[u].sort_unstable();
+        gc[u].dedup();
+        for &v in &gc[u] {
+            indegree[v] += 1;
+        }
+    }
+
+    // Topological sort (Kahn's algorithm)
+    let mut topo: Vec<usize> = Vec::with_capacity(scc_n);
+    let mut q: VecDeque<usize> = VecDeque::new();
+    for s in 0..scc_n {
+        if indegree[s] == 0 {
+            q.push_back(s);
+        }
+    }
+    while let Some(u) = q.pop_front() {
+        topo.push(u);
+        for &v in &gc[u] {
+            indegree[v] -= 1;
+            if indegree[v] == 0 {
+                q.push_back(v);
+            }
+        }
+    }
+
+    let t4 = start_total.elapsed().as_nanos();
+    log::info!(
+        "run_utig t4 (SCC + topo): {}ns, sccs={}",
+        t4 - t3, scc_n
+    );
+
+    // ============================================================
+    // Find Solid Anchor: last SCC in topo order containing a solid tx
+    // ============================================================
+    let mut anchor_idx: Option<usize> = None;
+    for (idx, &scc_index) in topo.iter().enumerate() {
+        if sccs[scc_index].iter().any(|&tx| is_solid[tx]) {
+            anchor_idx = Some(idx);
+        }
+    }
+
+    let Some(anchor) = anchor_idx else {
+        log::info!(
+            "run_utig: no solid anchor found, total={}ns",
+            start_total.elapsed().as_nanos()
+        );
+        let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
+        return;
+    };
+
+    // // ============================================================
+    // // Optimization: All-solid prefix can be finalized immediately
+    // // Find first SCC with any non-solid (shaded) transaction
+    // // ============================================================
+    // let mut start_b = anchor + 1;
+    // for topo_pos in 0..=anchor {
+    //     if sccs[topo[topo_pos]].iter().any(|&tx| !is_solid[tx]) {
+    //         start_b = topo_pos;
+    //         break;
+    //     }
+    // }
+
+    // ============================================================
+    // Extract finalized prefix 
+    // ============================================================
+    let mut finalized_now: Vec<usize> = Vec::new();
+    for topo_pos in 0..=anchor {
+        let comp = &sccs[topo[topo_pos]];
+        if comp.len() == 1 {
+            finalized_now.push(comp[0]);
+        } else {
+            let mut sorted = comp.clone();
+            sorted.sort_unstable();
+            finalized_now.extend(sorted);
+        }
+    }
+
+    // ============================================================
+    // Cleanup finalized transactions
+    // Clear state and edges (weights cleared on reallocation)
+    // ============================================================
+    for &tx in &finalized_now {
+        // Clear state
+        support[tx] = 0;
+        is_non_blank[tx] = false;
+        is_solid[tx] = false;
+        
+        // Clear outgoing edges
+        edges[tx].clear();
+        
+        // Remove incoming edges from other active nodes
+        for &other in &active {
+            if other != tx {
+                edges[other].retain(|&target| target as usize != tx);
+            }
+        }
+        
+    }
+
+    let t6 = start_total.elapsed().as_nanos();
+    log::info!(
+        "run_utig: COMPLETE sub_dag_id={}, finalized={}, total={}ns",
+        sub_dag_id, finalized_now.len(), t6
+    );
+
+    // Send results
+    // Note: Empty region_b vectors because NO FairUpdate protocol is needed!
+    // Weights will continue accumulating in subsequent batches.
+    let _ = tx_utig_results.blocking_send((
+        sub_dag_id,
+        finalized_now,
+        vec![],  // No region_b_v
+        vec![],  // No region_b_e  
+        vec![],  // No missing_edge_vertices
+        vec![],  // No missing_edges
+    ));
 }
 
 pub fn run_auncel_order(
