@@ -16,6 +16,7 @@ use nohash::{IntMap, IntSet};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use lz4_flex::{decompress_size_prepended, compress_prepend_size};
+use rayon::prelude::*;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
@@ -2283,6 +2284,8 @@ pub fn run_themis(
 /// Key properties:
 /// 1. Weights ACCUMULATE across batches (matrix NOT reset)
 /// 2. Only DirtyNodes/DirtyPairs trigger edge recomputation  
+/// UTIG Paper Algorithm - Incremental update on persistent matrix
+/// 
 pub fn run_utig(
     sub_dag_id: u64,
     indices_sets: Vec<Vec<usize>>,
@@ -2300,6 +2303,7 @@ pub fn run_utig(
         Vec<u32>,
     )>,
 ) {
+    
     let start_total = Instant::now();
     let mut last = start_total;
 
@@ -2309,8 +2313,6 @@ pub fn run_utig(
         return;
     }
 
-    // NOTE: you're currently using Tedge == Tnonblank (paper separates them).
-    // If the paper uses a distinct Tedge, you should pass it explicitly.
     let t_edge = non_blank_threshold;
 
     #[inline(always)]
@@ -2324,7 +2326,6 @@ pub fn run_utig(
         return;
     }
 
-    // Borrow matrix fields once (avoids E0502 patterns)
     let weight: &mut [u8] = &mut matrix.weight;
     let support: &mut [u8] = &mut matrix.support;
     let is_non_blank: &mut [bool] = &mut matrix.is_non_blank;
@@ -2335,17 +2336,14 @@ pub fn run_utig(
     // Step 0: clear recycled indices
     // ============================================================
     for &idx in &recycled_indices {
-        // Clear row
         let row_start_byte = (idx * MAX_TX) >> 1;
         let row_end_byte = row_start_byte + (MAX_TX >> 1);
         weight[row_start_byte..row_end_byte].fill(0);
 
-        // Clear col
         for j in 0..MAX_TX {
             set_weight(weight, w_idx(j, idx), 0);
         }
 
-        // Clear per-tx state
         support[idx] = 0;
         is_non_blank[idx] = false;
         is_solid[idx] = false;
@@ -2420,27 +2418,40 @@ pub fn run_utig(
     }
 
     // ============================================================
-    // Algorithm 1, Step 2: Weight Update + DirtyPairs
+    // Algorithm 1, Step 2: Weight Update + DirtyPairs (PARALLELIZED)
     // ============================================================
+    
+    // Phase 2a: Parallel accumulation into thread-local HashMaps
+    let local_increments: Vec<HashMap<(usize, usize), u8>> = indices_sets
+        .par_iter()
+        .map(|order| {
+            let mut inc: HashMap<(usize, usize), u8> = HashMap::new();
+            let len = order.len();
+            for from_pos in 0..len {
+                let u = order[from_pos];
+                for to_pos in (from_pos + 1)..len {
+                    let v = order[to_pos];
+                    *inc.entry((u, v)).or_insert(0) = inc.get(&(u, v)).unwrap_or(&0).saturating_add(1);
+                }
+            }
+            inc
+        })
+        .collect();
+
+    // Phase 2b: Sequential merge (weight array updates must be sequential)
     let mut dirty_pairs: HashSet<(usize, usize)> = HashSet::new();
     let mut pair_increments: usize = 0;
 
-    for order in &indices_sets {
-        let len = order.len();
-        for from_pos in 0..len {
-            let u = order[from_pos];
-            for to_pos in (from_pos + 1)..len {
-                let v = order[to_pos];
-                pair_increments += 1;
+    for inc in local_increments {
+        for ((u, v), count) in inc {
+            pair_increments += count as usize;
+            let idx = w_idx(u, v);
+            let old_w = get_weight(weight, idx);
+            let new_w = old_w.saturating_add(count).min(15);
+            set_weight(weight, idx, new_w);
 
-                let idx = w_idx(u, v);
-                let old_w = get_weight(weight, idx);
-                inc_weight(weight, idx);
-                let new_w = get_weight(weight, idx);
-
-                if old_w < t_edge && new_w >= t_edge {
-                    dirty_pairs.insert((u.min(v), u.max(v)));
-                }
+            if old_w < t_edge && new_w >= t_edge {
+                dirty_pairs.insert((u.min(v), u.max(v)));
             }
         }
     }
@@ -2459,11 +2470,9 @@ pub fn run_utig(
     }
 
     // ============================================================
-    // Algorithm 1, Step 3: Edge recompute on AffectedPairs
-    // Vnb is GLOBAL: all non-blank in UTIG (0..max_idx)
+    // Algorithm 1, Step 3: Edge recompute (OPTIMIZED)
     // ============================================================
-    let mut active: Vec<usize> = Vec::new();
-    active.reserve(max_idx);
+    let mut active: Vec<usize> = Vec::with_capacity(max_idx);
     for u in 0..max_idx {
         if is_non_blank[u] {
             active.push(u);
@@ -2476,52 +2485,185 @@ pub fn run_utig(
         return;
     }
 
-    let mut affected: HashSet<(usize, usize)> = dirty_pairs;
-    for &u in &dirty_nodes {
+    // OPTIMIZATION: Choose strategy based on dirty_nodes size
+    // If dirty_nodes × active is huge, use rebuild strategy instead of affected-pairs
+    let use_rebuild_strategy = dirty_nodes.len() > 0 
+        && (dirty_nodes.len() * active.len() > 500_000 || dirty_nodes.len() > active.len() / 8);
+
+    let edges_added: usize;
+
+    if use_rebuild_strategy {
+        // ============================================================
+        // STRATEGY B: Rebuild edges for dirty nodes entirely
+        // More efficient when dirty_nodes is large
+        // ============================================================
+        
+        // Step 1: Clear outgoing edges from dirty nodes
+        for &u in &dirty_nodes {
+            edges[u].clear();
+        }
+
+        // Step 2: Remove incoming edges TO dirty nodes from non-dirty nodes
+        // (Single pass per non-dirty node instead of per-pair retain)
         for &v in &active {
-            if u != v {
-                affected.insert((u.min(v), u.max(v)));
+            if !dirty_nodes.contains(&v) {
+                edges[v].retain(|&target| !dirty_nodes.contains(&(target as usize)));
             }
         }
-    }
 
-    {
-        let now = Instant::now();
-        log::info!(
-            "run_utig t4: dt={}ns total={}ns sub_dag_id={} active_len={} affected_pairs={}",
-            now.duration_since(last).as_nanos(),
-            now.duration_since(start_total).as_nanos(),
-            sub_dag_id,
-            active.len(),
-            affected.len(),
-        );
-        last = now;
-    }
-
-    let mut edges_added: usize = 0;
-    for &(u, v) in &affected {
-        edges[u].retain(|&x| x as usize != v);
-        edges[v].retain(|&x| x as usize != u);
-
-        if !is_non_blank[u] || !is_non_blank[v] {
-            continue;
+        // Step 3: Also handle dirty_pairs for non-dirty nodes
+        for &(u, v) in &dirty_pairs {
+            if !dirty_nodes.contains(&u) && !dirty_nodes.contains(&v) {
+                edges[u].retain(|&x| x as usize != v);
+                edges[v].retain(|&x| x as usize != u);
+            }
         }
 
-        let w_uv = get_weight(weight, w_idx(u, v));
-        let w_vu = get_weight(weight, w_idx(v, u));
-
-        let p_uv = (w_uv >= t_edge)
-            && ((w_vu < t_edge) || (w_uv > w_vu) || ((w_uv == w_vu) && (u < v)));
-        let p_vu = (w_vu >= t_edge)
-            && ((w_uv < t_edge) || (w_vu > w_uv) || ((w_vu == w_uv) && (v < u)));
-
-        if p_uv {
-            edges[u].push(v as u16);
-            edges_added += 1;
-        } else if p_vu {
-            edges[v].push(u as u16);
-            edges_added += 1;
+        {
+            let now = Instant::now();
+            log::info!(
+                "run_utig t4: dt={}ns total={}ns sub_dag_id={} active_len={} REBUILD_STRATEGY dirty_nodes={}",
+                now.duration_since(last).as_nanos(),
+                now.duration_since(start_total).as_nanos(),
+                sub_dag_id,
+                active.len(),
+                dirty_nodes.len(),
+            );
+            last = now;
         }
+
+        // Step 4: Rebuild all edges involving dirty nodes
+        let mut added = 0usize;
+        
+        // 4a: Edges FROM dirty nodes TO all active
+        for &u in &dirty_nodes {
+            if !is_non_blank[u] { continue; }
+            
+            for &v in &active {
+                if u == v || !is_non_blank[v] { continue; }
+                
+                let w_uv = get_weight(weight, w_idx(u, v));
+                let w_vu = get_weight(weight, w_idx(v, u));
+                
+                let p_uv = (w_uv >= t_edge)
+                    && ((w_vu < t_edge) || (w_uv > w_vu) || ((w_uv == w_vu) && (u < v)));
+                
+                if p_uv {
+                    edges[u].push(v as u16);
+                    added += 1;
+                }
+            }
+        }
+        
+        // 4b: Edges FROM non-dirty active TO dirty nodes
+        for &v in &active {
+            if dirty_nodes.contains(&v) || !is_non_blank[v] { continue; }
+            
+            for &u in &dirty_nodes {
+                if !is_non_blank[u] { continue; }
+                
+                let w_vu = get_weight(weight, w_idx(v, u));
+                let w_uv = get_weight(weight, w_idx(u, v));
+                
+                let p_vu = (w_vu >= t_edge)
+                    && ((w_uv < t_edge) || (w_vu > w_uv) || ((w_vu == w_uv) && (v < u)));
+                
+                if p_vu {
+                    edges[v].push(u as u16);
+                    added += 1;
+                }
+            }
+        }
+        
+        // 4c: Re-evaluate dirty_pairs between non-dirty nodes
+        for &(u, v) in &dirty_pairs {
+            if dirty_nodes.contains(&u) || dirty_nodes.contains(&v) { continue; }
+            if !is_non_blank[u] || !is_non_blank[v] { continue; }
+            
+            let w_uv = get_weight(weight, w_idx(u, v));
+            let w_vu = get_weight(weight, w_idx(v, u));
+
+            let p_uv = (w_uv >= t_edge)
+                && ((w_vu < t_edge) || (w_uv > w_vu) || ((w_uv == w_vu) && (u < v)));
+            let p_vu = (w_vu >= t_edge)
+                && ((w_uv < t_edge) || (w_vu > w_uv) || ((w_vu == w_uv) && (v < u)));
+
+            if p_uv {
+                edges[u].push(v as u16);
+                added += 1;
+            } else if p_vu {
+                edges[v].push(u as u16);
+                added += 1;
+            }
+        }
+        
+        edges_added = added;
+
+    } else {
+        // ============================================================
+        // STRATEGY A: Original affected-pairs (better when dirty_nodes is small)
+        // But with batched removal optimization
+        // ============================================================
+        
+        let mut affected: HashSet<(usize, usize)> = dirty_pairs.clone();
+        for &u in &dirty_nodes {
+            for &v in &active {
+                if u != v {
+                    affected.insert((u.min(v), u.max(v)));
+                }
+            }
+        }
+
+        {
+            let now = Instant::now();
+            log::info!(
+                "run_utig t4: dt={}ns total={}ns sub_dag_id={} active_len={} affected_pairs={}",
+                now.duration_since(last).as_nanos(),
+                now.duration_since(start_total).as_nanos(),
+                sub_dag_id,
+                active.len(),
+                affected.len(),
+            );
+            last = now;
+        }
+
+        // OPTIMIZATION: Batch removals by node
+        // Build a map: node -> set of targets to remove
+        let mut removals_by_node: HashMap<usize, HashSet<u16>> = HashMap::new();
+        for &(u, v) in &affected {
+            removals_by_node.entry(u).or_default().insert(v as u16);
+            removals_by_node.entry(v).or_default().insert(u as u16);
+        }
+
+        // Single-pass removal per node (instead of per-pair retain)
+        for (&node, targets) in &removals_by_node {
+            edges[node].retain(|x| !targets.contains(x));
+        }
+
+        // Now add edges
+        let mut added = 0usize;
+        for &(u, v) in &affected {
+            if !is_non_blank[u] || !is_non_blank[v] {
+                continue;
+            }
+
+            let w_uv = get_weight(weight, w_idx(u, v));
+            let w_vu = get_weight(weight, w_idx(v, u));
+
+            let p_uv = (w_uv >= t_edge)
+                && ((w_vu < t_edge) || (w_uv > w_vu) || ((w_uv == w_vu) && (u < v)));
+            let p_vu = (w_vu >= t_edge)
+                && ((w_uv < t_edge) || (w_vu > w_uv) || ((w_vu == w_uv) && (v < u)));
+
+            if p_uv {
+                edges[u].push(v as u16);
+                added += 1;
+            } else if p_vu {
+                edges[v].push(u as u16);
+                added += 1;
+            }
+        }
+        edges_added = added;
     }
 
     {
@@ -2581,7 +2723,6 @@ pub fn run_utig(
 
         for &v16 in &edges[u] {
             let v = v16 as usize;
-            // E|Vnb filter
             if v >= max_idx || !is_non_blank[v] {
                 continue;
             }
@@ -2738,12 +2879,14 @@ pub fn run_utig(
         edges[tx].clear();
     }
 
-    // Remove edges to blank targets (cheap “incoming edges” cleanup)
+    // Remove edges to blank targets (optimized single pass)
     for &u in &active {
-        edges[u].retain(|&t| {
-            let v = t as usize;
-            v < max_idx && is_non_blank[v]
-        });
+        if !finalized_now.contains(&u) {
+            edges[u].retain(|&t| {
+                let v = t as usize;
+                v < max_idx && is_non_blank[v]
+            });
+        }
     }
 
     log::info!(
