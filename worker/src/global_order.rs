@@ -380,7 +380,7 @@ impl GlobalOrder {
             pending_fair_updates: HashMap::new(),
             next_to_finalize: 0,
             already_finalized: HashSet::new(),
-            use_utig_paper: false,
+            use_utig_paper: true,
             utig_paper_slot: None,
             utig_paper_tx_map: HashMap::new(),
             utig_paper_idx_to_digest: HashMap::new(),
@@ -2285,11 +2285,11 @@ pub fn run_themis(
 /// 2. Only DirtyNodes/DirtyPairs trigger edge recomputation  
 pub fn run_utig(
     sub_dag_id: u64,
-    indices_sets: Vec<Vec<usize>>,        // Global persistent indices for this batch
-    recycled_indices: Vec<usize>,         // Indices recycled this batch - need weight clearing
+    indices_sets: Vec<Vec<usize>>,
+    recycled_indices: Vec<usize>,
     non_blank_threshold: u8,
     solid_threshold: u8,
-    max_idx: usize,                       // current global allocated upper bound (utig_paper_next_idx)
+    max_idx: usize,
     matrix: &mut UTIGMatrix,
     tx_utig_results: tokio::sync::mpsc::Sender<(
         u64,
@@ -2301,6 +2301,7 @@ pub fn run_utig(
     )>,
 ) {
     let start_total = Instant::now();
+    let mut last = start_total;
 
     if indices_sets.is_empty() {
         log::info!("run_utig: sub_dag_id={}, empty batch", sub_dag_id);
@@ -2308,9 +2309,9 @@ pub fn run_utig(
         return;
     }
 
-    // Optional: post-anchor shaded pruning (paper allows this; horizon/H needs extra metadata).
-    // Leave false until you add R/last_seen + hysteresis if you want the full pruning policy.
-    const PRUNE_POST_ANCHOR_SHADED: bool = false;
+    // NOTE: you're currently using Tedge == Tnonblank (paper separates them).
+    // If the paper uses a distinct Tedge, you should pass it explicitly.
+    let t_edge = non_blank_threshold;
 
     #[inline(always)]
     fn w_idx(i: usize, j: usize) -> usize {
@@ -2323,38 +2324,45 @@ pub fn run_utig(
         return;
     }
 
-    // Borrow matrix fields once
+    // Borrow matrix fields once (avoids E0502 patterns)
     let weight: &mut [u8] = &mut matrix.weight;
     let support: &mut [u8] = &mut matrix.support;
     let is_non_blank: &mut [bool] = &mut matrix.is_non_blank;
     let is_solid: &mut [bool] = &mut matrix.is_solid;
     let edges: &mut [Vec<u16>] = &mut matrix.edges;
 
-    let t_edge = non_blank_threshold;
-
     // ============================================================
-    // Step 0 (implementation detail): clear recycled indices
+    // Step 0: clear recycled indices
     // ============================================================
     for &idx in &recycled_indices {
-        debug_assert!(idx < MAX_TX);
-
-        // Clear row: W(idx, j) for all j (contiguous bytes)
+        // Clear row
         let row_start_byte = (idx * MAX_TX) >> 1;
         let row_end_byte = row_start_byte + (MAX_TX >> 1);
         weight[row_start_byte..row_end_byte].fill(0);
 
-        // Clear column: W(j, idx) for all j (strided)
+        // Clear col
         for j in 0..MAX_TX {
             set_weight(weight, w_idx(j, idx), 0);
         }
 
-        // Clear per-tx state and adjacency
+        // Clear per-tx state
         support[idx] = 0;
         is_non_blank[idx] = false;
         is_solid[idx] = false;
         edges[idx].clear();
+    }
 
-        // If you add R/last_seen/post_anchor metadata, reset it here too.
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t0: dt={}ns total={}ns sub_dag_id={} recycled={} max_idx={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            recycled_indices.len(),
+            max_idx
+        );
+        last = now;
     }
 
     // ============================================================
@@ -2362,17 +2370,30 @@ pub fn run_utig(
     // ============================================================
     let mut dirty_nodes: HashSet<usize> = HashSet::new();
 
-    // CountBatchSupport(Lbatch)
     let mut batch_support: HashMap<usize, u8> = HashMap::new();
+    let mut total_mentions: usize = 0;
     for order in &indices_sets {
+        total_mentions += order.len();
         for &tx in order {
-            debug_assert!(tx < MAX_TX);
             let e = batch_support.entry(tx).or_insert(0);
             *e = e.saturating_add(1);
         }
     }
 
-    // Update state map S[tx] based on batch support; track DirtyNodes
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t1: dt={}ns total={}ns sub_dag_id={} orders={} total_mentions={} unique_txs_in_batch={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            indices_sets.len(),
+            total_mentions,
+            batch_support.len(),
+        );
+        last = now;
+    }
+
     for (&tx, &count) in &batch_support {
         let old_nb = is_non_blank[tx];
         let old_sol = is_solid[tx];
@@ -2381,19 +2402,28 @@ pub fn run_utig(
         is_non_blank[tx] = count >= non_blank_threshold;
         is_solid[tx] = count >= solid_threshold;
 
-        // Paper also has R[tx] = r here (last seen round).
-        // If you add R, do: R[tx] = sub_dag_id;
-
         if old_nb != is_non_blank[tx] || old_sol != is_solid[tx] {
             dirty_nodes.insert(tx);
         }
     }
 
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t2: dt={}ns total={}ns sub_dag_id={} dirty_nodes={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            dirty_nodes.len(),
+        );
+        last = now;
+    }
+
     // ============================================================
-    // Algorithm 1, Step 2: Cumulative Weight Update + DirtyPairs
-    // W(u,v) <- W(u,v) + Wbatch(u,v)
+    // Algorithm 1, Step 2: Weight Update + DirtyPairs
     // ============================================================
     let mut dirty_pairs: HashSet<(usize, usize)> = HashSet::new();
+    let mut pair_increments: usize = 0;
 
     for order in &indices_sets {
         let len = order.len();
@@ -2401,13 +2431,13 @@ pub fn run_utig(
             let u = order[from_pos];
             for to_pos in (from_pos + 1)..len {
                 let v = order[to_pos];
+                pair_increments += 1;
 
                 let idx = w_idx(u, v);
                 let old_w = get_weight(weight, idx);
                 inc_weight(weight, idx);
                 let new_w = get_weight(weight, idx);
 
-                // DirtyPairs: unordered {u,v} when a directional weight crosses Tedge for the first time
                 if old_w < t_edge && new_w >= t_edge {
                     dirty_pairs.insert((u.min(v), u.max(v)));
                 }
@@ -2415,13 +2445,23 @@ pub fn run_utig(
         }
     }
 
-    // ============================================================
-    // Algorithm 1, Step 3: Optimized Edge Recomputation
-    // Vnb = {tx ∈ V : S[tx] != Blank}
-    // Affected = DirtyPairs ∪ {(u,v): u∈DirtyNodes, v∈Vnb, u!=v}
-    // ============================================================
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t3: dt={}ns total={}ns sub_dag_id={} pair_increments={} dirty_pairs={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            pair_increments,
+            dirty_pairs.len(),
+        );
+        last = now;
+    }
 
-    // Global Vnb (paper): all currently non-blank transactions in UTIG (within 0..max_idx)
+    // ============================================================
+    // Algorithm 1, Step 3: Edge recompute on AffectedPairs
+    // Vnb is GLOBAL: all non-blank in UTIG (0..max_idx)
+    // ============================================================
     let mut active: Vec<usize> = Vec::new();
     active.reserve(max_idx);
     for u in 0..max_idx {
@@ -2431,12 +2471,11 @@ pub fn run_utig(
     }
 
     if active.is_empty() {
-        log::info!("run_utig: sub_dag_id={}, Vnb empty", sub_dag_id);
+        log::info!("run_utig: sub_dag_id={} Vnb empty, nothing to finalize", sub_dag_id);
         let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
         return;
     }
 
-    // Build affected set (pairs only). We keep HashSet for pairs; we removed vertex HashSet.
     let mut affected: HashSet<(usize, usize)> = dirty_pairs;
     for &u in &dirty_nodes {
         for &v in &active {
@@ -2446,13 +2485,24 @@ pub fn run_utig(
         }
     }
 
-    // Recompute edges ONLY for affected pairs
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t4: dt={}ns total={}ns sub_dag_id={} active_len={} affected_pairs={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            active.len(),
+            affected.len(),
+        );
+        last = now;
+    }
+
+    let mut edges_added: usize = 0;
     for &(u, v) in &affected {
-        // Remove any existing edge between u and v
         edges[u].retain(|&x| x as usize != v);
         edges[v].retain(|&x| x as usize != u);
 
-        // If either is blank, no edge can exist (paper line 22-23)
         if !is_non_blank[u] || !is_non_blank[v] {
             continue;
         }
@@ -2460,7 +2510,6 @@ pub fn run_utig(
         let w_uv = get_weight(weight, w_idx(u, v));
         let w_vu = get_weight(weight, w_idx(v, u));
 
-        // Predicate P(u->v) from paper (anti-symmetric, deterministic tie-break)
         let p_uv = (w_uv >= t_edge)
             && ((w_vu < t_edge) || (w_uv > w_vu) || ((w_uv == w_vu) && (u < v)));
         let p_vu = (w_vu >= t_edge)
@@ -2468,16 +2517,29 @@ pub fn run_utig(
 
         if p_uv {
             edges[u].push(v as u16);
+            edges_added += 1;
         } else if p_vu {
             edges[v].push(u as u16);
+            edges_added += 1;
         }
     }
 
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t5: dt={}ns total={}ns sub_dag_id={} edges_added={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            edges_added
+        );
+        last = now;
+    }
+
     // ============================================================
-    // Algorithm 2: Extract Fair Prefix from Gext = (Vnb, E|Vnb)
+    // Algorithm 2: Extract from Gext = (Vnb, E|Vnb)
     // ============================================================
 
-    // Reset Tarjan memory for Vnb only
     for &u in &active {
         matrix.dfn[u] = 0;
         matrix.low[u] = 0;
@@ -2490,8 +2552,6 @@ pub fn run_utig(
     let on_stack: &mut [bool] = &mut matrix.on_stack;
     let scc_id: &mut [i32] = &mut matrix.scc_id;
 
-    // Immutable views for traversal; this is your E|Vnb filter:
-    // only follow edges to v where is_non_blank[v] == true.
     let edges_ro: &[Vec<u16>] = &*edges;
     let nb_ro: &[bool] = &*is_non_blank;
     let solid_ro: &[bool] = &*is_solid;
@@ -2521,17 +2581,13 @@ pub fn run_utig(
 
         for &v16 in &edges[u] {
             let v = v16 as usize;
-
-            // This is exactly E|Vnb:
+            // E|Vnb filter
             if v >= max_idx || !is_non_blank[v] {
                 continue;
             }
 
             if dfn[v] == 0 {
-                strongconnect(
-                    v, index_counter, stack, on_stack, dfn, low,
-                    edges, is_non_blank, max_idx, scc_id, sccs,
-                );
+                strongconnect(v, index_counter, stack, on_stack, dfn, low, edges, is_non_blank, max_idx, scc_id, sccs);
                 if low[v] < low[u] {
                     low[u] = low[v];
                 }
@@ -2555,20 +2611,28 @@ pub fn run_utig(
 
     for &u in &active {
         if dfn[u] == 0 {
-            strongconnect(
-                u, &mut index_counter, &mut stack, on_stack, dfn, low,
-                edges_ro, nb_ro, max_idx, scc_id, &mut sccs,
-            );
+            strongconnect(u, &mut index_counter, &mut stack, on_stack, dfn, low, edges_ro, nb_ro, max_idx, scc_id, &mut sccs);
         }
     }
 
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t6: dt={}ns total={}ns sub_dag_id={} sccs={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            sccs.len()
+        );
+        last = now;
+    }
+
     if sccs.is_empty() {
-        log::info!("run_utig: sub_dag_id={}, no SCCs found", sub_dag_id);
+        log::info!("run_utig: sub_dag_id={} no SCCs", sub_dag_id);
         let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
         return;
     }
 
-    // Condensation graph
     let scc_n = sccs.len();
     let mut gc: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
     let mut indegree: Vec<usize> = vec![0; scc_n];
@@ -2580,11 +2644,7 @@ pub fn run_utig(
 
         for &v16 in &edges_ro[u] {
             let v = v16 as usize;
-
-            // Enforce E|Vnb again
-            if v >= max_idx || !nb_ro[v] {
-                continue;
-            }
+            if v >= max_idx || !nb_ro[v] { continue; }
 
             let sv = scc_id[v];
             if sv < 0 { continue; }
@@ -2604,25 +2664,31 @@ pub fn run_utig(
         }
     }
 
-    // Toposort
     let mut topo: Vec<usize> = Vec::with_capacity(scc_n);
     let mut q: VecDeque<usize> = VecDeque::new();
     for s in 0..scc_n {
-        if indegree[s] == 0 {
-            q.push_back(s);
-        }
+        if indegree[s] == 0 { q.push_back(s); }
     }
     while let Some(u) = q.pop_front() {
         topo.push(u);
         for &v in &gc[u] {
             indegree[v] -= 1;
-            if indegree[v] == 0 {
-                q.push_back(v);
-            }
+            if indegree[v] == 0 { q.push_back(v); }
         }
     }
 
-    // Anchor = last SCC in topo with at least one solid tx (paper step 4)
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t7: dt={}ns total={}ns sub_dag_id={} topo_len={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            topo.len()
+        );
+        last = now;
+    }
+
     let mut anchor_idx: Option<usize> = None;
     for (i, &scc_i) in topo.iter().enumerate() {
         if sccs[scc_i].iter().any(|&tx| solid_ro[tx]) {
@@ -2631,12 +2697,14 @@ pub fn run_utig(
     }
 
     let Some(anchor) = anchor_idx else {
-        log::info!("run_utig: sub_dag_id={}, no solid anchor", sub_dag_id);
+        log::info!(
+            "run_utig: sub_dag_id={} no solid anchor (active_len={} scc_n={})",
+            sub_dag_id, active.len(), scc_n
+        );
         let _ = tx_utig_results.blocking_send((sub_dag_id, vec![], vec![], vec![], vec![], vec![]));
         return;
     };
 
-    // Build final order F up to anchor (your linearization policy is kept as-is)
     let mut finalized_now: Vec<usize> = Vec::new();
     for topo_pos in 0..=anchor {
         let comp = &sccs[topo[topo_pos]];
@@ -2649,40 +2717,28 @@ pub fn run_utig(
         }
     }
 
-    // ============================================================
-    // Pruning & cleanup (paper-aligned rules)
-    // 1) remove committed final order txs immediately
-    // 2) keep edges only among non-blank (E should be subset of Vnb×Vnb)
-    // 3) optional: prune shaded nodes strictly after anchor (soft pruning)
-    // ============================================================
+    {
+        let now = Instant::now();
+        log::info!(
+            "run_utig t8: dt={}ns total={}ns sub_dag_id={} anchor={} finalized_now={}",
+            now.duration_since(last).as_nanos(),
+            now.duration_since(start_total).as_nanos(),
+            sub_dag_id,
+            anchor,
+            finalized_now.len()
+        );
+        last = now;
+    }
 
-    // Rule 1: finalized txs become inactive immediately
+    // Cleanup finalized
     for &tx in &finalized_now {
         support[tx] = 0;
         is_non_blank[tx] = false;
         is_solid[tx] = false;
         edges[tx].clear();
-        // If you add R/metadata: clear or mark as finalized here.
     }
 
-    // Rule 3 (optional): prune shaded nodes strictly after anchor
-    if PRUNE_POST_ANCHOR_SHADED {
-        for topo_pos in (anchor + 1)..topo.len() {
-            let comp = &sccs[topo[topo_pos]];
-            for &tx in comp {
-                // shaded = non-blank && !solid
-                if is_non_blank[tx] && !is_solid[tx] {
-                    support[tx] = 0;
-                    is_non_blank[tx] = false;
-                    is_solid[tx] = false;
-                    edges[tx].clear();
-                }
-            }
-        }
-    }
-
-    // Enforce E ⊆ Vnb×Vnb by removing edges to now-blank targets in one pass.
-    // (This also removes all incoming edges to finalized/pruned nodes.)
+    // Remove edges to blank targets (cheap “incoming edges” cleanup)
     for &u in &active {
         edges[u].retain(|&t| {
             let v = t as usize;
@@ -2691,7 +2747,7 @@ pub fn run_utig(
     }
 
     log::info!(
-        "run_utig: COMPLETE sub_dag_id={}, finalized={}, total={}ns",
+        "run_utig DONE: sub_dag_id={} finalized={} total={}ns",
         sub_dag_id,
         finalized_now.len(),
         start_total.elapsed().as_nanos()
@@ -2700,10 +2756,10 @@ pub fn run_utig(
     let _ = tx_utig_results.blocking_send((
         sub_dag_id,
         finalized_now,
-        vec![], // region_b_v
-        vec![], // region_b_e
-        vec![], // missing_edge_vertices
-        vec![], // missing_edges
+        vec![],
+        vec![],
+        vec![],
+        vec![],
     ));
 }
 
