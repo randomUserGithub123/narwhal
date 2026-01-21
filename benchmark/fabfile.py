@@ -158,15 +158,15 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # ###### N = 17 ######
         # (1, 3, 0, 2, 17, 1, 5000),
         # (2, 3, 0, 2, 17, 1, 5000),
-        # (0, 1, 4, 2, 17, 1, 500),
-        # (0, 1, 4, 2, 17, 1, 1000),
-        # (0, 1, 4, 2, 17, 1, 1500),
-        (0, 1, 4, 2, 17, 1, 2000),
-        # (0, 1, 4, 2, 17, 1, 2500),
-        # (0, 1, 4, 2, 17, 1, 3000),
-        # (0, 1, 4, 2, 17, 3, 3500),
-        # (0, 1, 4, 2, 17, 3, 4000),
-        # (0, 1, 4, 2, 17, 3, 4500),
+        (0, 1, 4, 2, 17, 5, 500),
+        (0, 1, 4, 2, 17, 5, 1000),
+        (0, 1, 4, 2, 17, 5, 1500),
+        (0, 1, 4, 2, 17, 5, 2000),
+        (0, 1, 4, 2, 17, 5, 2500),
+        (0, 1, 4, 2, 17, 5, 3000),
+        (0, 1, 4, 2, 17, 5, 3500),
+        (0, 1, 4, 2, 17, 5, 4000),
+        (0, 1, 4, 2, 17, 5, 4500),
         # (0, 1, 4, 2, 17, 3, 5000),
         # (3, 1, 4, 2, 17, 3, 6000),
         # (3, 1, 4, 2, 17, 3, 7000),
@@ -241,15 +241,22 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                 workers_per_node,
                 nodes,
             )
-            for i in range(runs):
-                print(f"\n=============================\nDAS experiment[{attack_type, arbitragers, faults, workers_per_node, nodes}] run[{i}]\n=============================\n")
+            run = 0
+            while run < runs:
+                print(f"\n=============================\nDAS experiment[{attack_type, arbitragers, faults, workers_per_node, nodes, input_rate}] run[{run}]\n=============================\n")
                 ret = DASBench(
                     bench_params, 
                     node_params, 
                     username
                 ).run(debug, console, build)
+
+                consensus_tps_raw, _, _ = ret._consensus_throughput()
+                if int(consensus_tps_raw) <= 1e-9:
+                    continue # Skip until DAS nodes work
+
                 print(ret.result())
                 ret.print(filename)
+                run += 1
 
             if attack_type == 1:
                 succ_num, total_num = _get_fissure_total(filename)
