@@ -648,7 +648,7 @@ class LogParser:
         max_batch_delay = self.configs[0]['max_batch_delay']
 
         consensus_latency = self._consensus_latency() * 1_000
-        consensus_tps, consensus_bps, _ = self._consensus_throughput()
+        consensus_tps, consensus_bps, consensus_duration = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency, num_txs_end_to_end_latency = self._end_to_end_latency()
         end_to_end_latency *= 1000
@@ -701,6 +701,7 @@ class LogParser:
             f' Collocate primary and workers: {self.collocate}\n'
             f' Input rate: {sum(self.rate):,} tx/s\n'
             f' Transaction size: {self.size[0]:,} B\n'
+            f' Consensus time: {round(consensus_duration):,} s\n'
             f' Execution time: {round(duration):,} s\n'
             '\n'
             f' Header size: {header_size:,} B\n'
