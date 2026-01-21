@@ -313,7 +313,7 @@ impl Worker {
                 rx_header_update,
                 rx_consensus_update,
                 self.committee.size() as u64,
-                self.parameters.faults,
+                self.parameters.fault_threshold,
                 self.parameters.gamma,
                 tx_fair_propose
             );

@@ -8,6 +8,7 @@ from time import sleep
 import time
 import re
 from pathlib import Path
+import math
 
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
@@ -24,10 +25,10 @@ def local(ctx, debug=True):
     ''' Run benchmarks on localhost '''
     # log format: local-{attack_type}-{arbitragers}-{faults}-{workers}-{nodes}.txt
     benchmark_configurations = [
-        (1, 3, 0, 2, 10, 1),
-        (2, 3, 0, 2, 10, 1),
-        (3, 3, 0, 2, 10, 1),
-        (4, 3, 0, 2, 10, 1)
+        (0, 1, 1, 2, 6, 1),
+        # (2, 3, 0, 2, 10, 1),
+        # (3, 3, 0, 2, 10, 1),
+        # (4, 3, 0, 2, 10, 1)
     ]  # benchmark format: (attack_type, frontrunners, crashes, workers, nodes, runs)
     start_time = time.time()
     for at, arbis, ff, wks, nds, rs in benchmark_configurations:
@@ -44,9 +45,9 @@ def local(ctx, debug=True):
             "attack_type": attack_type,  # frontrunning strategies: 0: no attack; 1: fissure; 2: sluggish; 3: speculative; 10: baseline
             "nodes": nodes,  # nodes: the number of nodes n
             "workers": workers,  # workers: the number of workers f_w
-            "rate": 3_000,  # rate: the transaction sending rate
-            "tx_size": 512,
-            "duration": 60,
+            "rate": 300,  # rate: the transaction sending rate
+            "tx_size": 128,
+            "duration": 20,
         }
         node_params = {
             "header_size": 1_000,  # bytes
@@ -56,7 +57,26 @@ def local(ctx, debug=True):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 500_000,  # bytes
             "max_batch_delay": 200,  # ms
+            "lo_size": 200, # number of entries in LocalOrder queue
+            "lo_max_delay": 100, # ms
+            "gamma": 1.0, # batch-OF parameter
         }
+
+        node_params.update(
+            {
+                "fault_threshold": int(math.floor(
+                    (bench_params["nodes"] - 1) / 4
+                ))
+            }
+        )
+
+        assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
+        assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+        assert bench_params['nodes'] > (
+            (4 * node_params['fault_threshold']) /
+            (2 * node_params['gamma'] - 1)
+        )
+
         try:
             filename = PathMaker.local_result_file(
                 attack_type,
@@ -171,31 +191,33 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             'rate': input_rate,
             'tx_size': 128,
             'duration': 60,
-            "collocate": False,
+            "collocate": True,
         }
         node_params = {
             "header_size": 512,  # bytes
-            "max_header_delay": 150,  # ms
+            "max_header_delay": 2000,  # ms
             "gc_depth": 50,  # rounds
             "sync_retry_delay": 5_000,  # ms
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 4_000,  # bytes
-            "max_batch_delay": 100,  # ms
+            "max_batch_delay": 1000,  # ms
             "lo_size": 200, # number of entries in LocalOrder queue
-            "lo_max_delay": 100, # ms
+            "lo_max_delay": 1000, # ms
             "gamma": 1.0, # batch-OF parameter
         }
 
         node_params.update(
             {
-                "faults": bench_params["faults"]
+                "fault_threshold": int(math.floor(
+                    (bench_params["nodes"] - 1) / 4
+                ))
             }
         )
 
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
         assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
         assert bench_params['nodes'] > (
-            (4 * node_params['faults']) /
+            (4 * node_params['fault_threshold']) /
             (2 * node_params['gamma'] - 1)
         )
 

@@ -85,7 +85,7 @@ pub struct Parameters {
     pub lo_max_delay: u64,
 
     pub gamma: f64,
-    pub faults: u64
+    pub fault_threshold: u64
 
 }
 
@@ -102,7 +102,7 @@ impl Default for Parameters {
             lo_size: 500,
             lo_max_delay: 100,
             gamma: 1.0,
-            faults: 1
+            fault_threshold: 1
         }
     }
 }
@@ -121,7 +121,7 @@ impl Parameters {
         info!("LocalOrder size set to {} B", self.lo_size);
         info!("Max LocalOrder delay set to {} ms", self.lo_max_delay);
         info!("Gamma set to {}", self.gamma);
-        info!("Node faults set to {}", self.faults);
+        info!("Node fault_threshold set to {}", self.fault_threshold);
     }
 }
 
@@ -193,8 +193,8 @@ impl Committee {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (2 N + 3) / 3 = 2f + 1 + (2k + 2)/3 = 2f + 1 + k = N - f
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        // 2 * total_votes / 3 + 1
-        3 * ((total_votes - 1) / 4) + 1
+        3 * total_votes / 4 + 1
+        // 3 * ((total_votes - 1) / 4) + 1
     }
 
     /// Returns the stake required to reach availability (f+1).
@@ -202,8 +202,8 @@ impl Committee {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        // (total_votes + 2) / 3
-        ((total_votes - 1) / 4) + 1
+        (total_votes + 3) / 4
+        // ((total_votes - 1) / 4) + 1
     }
 
     /// Returns the primary addresses of the target primary.
