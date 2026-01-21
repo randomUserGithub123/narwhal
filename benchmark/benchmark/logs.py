@@ -547,7 +547,7 @@ class LogParser:
 
     def _end_to_end_throughput(self):
         if not self.finalization_events:
-            return 0, 0, 0
+            return 0, 0, -1
 
         start = min(self.start)
         end = max(self.commits.values())
