@@ -549,11 +549,8 @@ class LogParser:
         if not self.finalization_events:
             return 0, 0, 0
 
-        start = min(self.proposals.values())
-        end = max(
-            max(self.commits.values()),
-            max(ts for ts, _ in self.finalization_events.values())
-        )
+        start = min(self.start)
+        end = max(self.commits.values())
         duration = end - start
 
         total_finalized_txs = sum(count for _, count in self.finalization_events.values())
@@ -615,7 +612,10 @@ class LogParser:
             if min_latency is not None:
                 latency.append(min_latency)
 
-        return mean(latency) if latency else 0
+        return (
+            mean(latency) if latency else 0,
+            len(latency)
+        )
 
     def _end_to_end_latency_commit_based(self):
         latency = []
@@ -650,7 +650,8 @@ class LogParser:
         consensus_latency = self._consensus_latency() * 1_000
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        end_to_end_latency = self._end_to_end_latency() * 1_000
+        end_to_end_latency, num_txs_end_to_end_latency = self._end_to_end_latency()
+        end_to_end_latency *= 1000
         end_to_end_latency_commit = self._end_to_end_latency_commit_based() * 1_000
 
         # Attack calculation (header-level)
@@ -718,7 +719,7 @@ class LogParser:
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms\n'
+            f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms, (num sample txs: {num_txs_end_to_end_latency})\n'
             f' End-to-end latency (commit-based): {round(end_to_end_latency_commit):,} ms\n'
             '\n'
             ' + ATTACK:\n'

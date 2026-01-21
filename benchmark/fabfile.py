@@ -70,6 +70,8 @@ def local(ctx, debug=True):
             }
         )
 
+        assert bench_params['faults'] <= node_params['fault_threshold']
+
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
         assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
         assert bench_params['nodes'] > (
@@ -156,14 +158,20 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # ###### N = 17 ######
         # (1, 3, 0, 2, 17, 1, 5000),
         # (2, 3, 0, 2, 17, 1, 5000),
-        (3, 1, 4, 2, 17, 3, 2000),
-        (3, 1, 4, 2, 17, 3, 3000),
-        (3, 1, 4, 2, 17, 3, 4000),
-        (3, 1, 4, 2, 17, 3, 5000),
-        (3, 1, 4, 2, 17, 3, 6000),
-        (3, 1, 4, 2, 17, 3, 7000),
-        (3, 1, 4, 2, 17, 3, 8000),
-        (3, 1, 4, 2, 17, 3, 9000),
+        # (0, 1, 4, 2, 17, 1, 500),
+        # (0, 1, 4, 2, 17, 1, 1000),
+        # (0, 1, 4, 2, 17, 1, 1500),
+        (0, 1, 4, 2, 17, 1, 2000),
+        # (0, 1, 4, 2, 17, 1, 2500),
+        # (0, 1, 4, 2, 17, 1, 3000),
+        # (0, 1, 4, 2, 17, 3, 3500),
+        # (0, 1, 4, 2, 17, 3, 4000),
+        # (0, 1, 4, 2, 17, 3, 4500),
+        # (0, 1, 4, 2, 17, 3, 5000),
+        # (3, 1, 4, 2, 17, 3, 6000),
+        # (3, 1, 4, 2, 17, 3, 7000),
+        # (3, 1, 4, 2, 17, 3, 8000),
+        # (3, 1, 4, 2, 17, 3, 9000),
         # (3, 1, 4, 2, 17, 3, 10_000),
         # (3, 1, 4, 2, 17, 3, 15_000),
         # (3, 1, 4, 2, 17, 3, 20_000),
@@ -213,6 +221,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                 ))
             }
         )
+
+        assert bench_params['faults'] <= node_params['fault_threshold']
 
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
         assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
