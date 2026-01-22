@@ -138,7 +138,7 @@ impl Synchronizer {
 
                             // Add the digest to the waiter.
                             let deliver = digest.clone();
-                            let (tx_cancel, rx_cancel) = channel(1);
+                            let (tx_cancel, rx_cancel) = channel(1_000);
                             let fut = Self::waiter(digest.clone(), self.store.clone(), deliver, rx_cancel);
                             waiting.push(fut);
                             self.pending.insert(digest, (self.round, tx_cancel, now));

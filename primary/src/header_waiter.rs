@@ -148,7 +148,7 @@ impl HeaderWaiter {
                                     (key.to_vec(), self.store.clone())
                                 })
                                 .collect();
-                            let (tx_cancel, rx_cancel) = channel(1);
+                            let (tx_cancel, rx_cancel) = channel(1_000);
                             self.pending.insert(header_id, (round, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
@@ -191,7 +191,7 @@ impl HeaderWaiter {
                                 .cloned()
                                 .map(|x| (x.to_vec(), self.store.clone()))
                                 .collect();
-                            let (tx_cancel, rx_cancel) = channel(1);
+                            let (tx_cancel, rx_cancel) = channel(1_000);
                             self.pending.insert(header_id, (round, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);

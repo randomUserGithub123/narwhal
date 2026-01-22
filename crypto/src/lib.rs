@@ -228,7 +228,7 @@ pub struct SignatureService {
 
 impl SignatureService {
     pub fn new(secret: SecretKey) -> Self {
-        let (tx, mut rx): (Sender<(_, oneshot::Sender<_>)>, _) = channel(100);
+        let (tx, mut rx): (Sender<(_, oneshot::Sender<_>)>, _) = channel(10_000);
         tokio::spawn(async move {
             while let Some((digest, sender)) = rx.recv().await {
                 let signature = Signature::new(&digest, &secret);

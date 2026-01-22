@@ -42,7 +42,7 @@ impl SimpleSender {
 
     /// Helper function to spawn a new connection.
     fn spawn_connection(address: SocketAddr) -> Sender<Bytes> {
-        let (tx, rx) = channel(1_000);
+        let (tx, rx) = channel(100_000);
         Connection::spawn(address, rx);
         tx
     }
