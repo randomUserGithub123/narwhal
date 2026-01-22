@@ -28,7 +28,7 @@ use tokio::sync::mpsc::{channel, Sender};
 pub mod worker_tests;
 
 /// The default channel capacity for each channel of the worker.
-pub const CHANNEL_CAPACITY: usize = 1_000;
+pub const CHANNEL_CAPACITY: usize = 100_000;
 
 /// The primary round number.
 // TODO: Move to the primary.
