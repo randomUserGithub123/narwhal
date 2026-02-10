@@ -295,7 +295,7 @@ class PreserveManager:
             "name": "narwhal-bench",
             "command": "sleep infinity",
             "resources": resource_str,
-            "types": ["allow_classic_ssh"],
+            "types": ["allow_classic_ssh", "exotic"],
         })
         job_id = int(resp["uid"])
         print(f"[Grid'5000] Job submitted — ID {job_id}")
