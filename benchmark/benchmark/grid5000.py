@@ -19,7 +19,7 @@ from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.grid5000_preserve import PreserveManager
 
 
-BANNED_NODES: list[str] = []
+BANNED_NODES = []
 
 
 class Grid5000Bench:
@@ -61,7 +61,7 @@ class Grid5000Bench:
         ssh = f"ssh -o StrictHostKeyChecking=no {hostname} '{remote}'"
         subprocess.Popen(ssh, shell=True)
 
-    def _run_on_host(self, command: str, hostname: str) -> str:
+    def _run_on_host(self, command: str, hostname: str):
         """Run *command* synchronously on *hostname*, return stdout."""
         remote = f"source /etc/profile; cd {self._wd}; {command}"
         ssh = f"ssh -o StrictHostKeyChecking=no {hostname} '{remote}'"
@@ -97,7 +97,7 @@ class Grid5000Bench:
                 self._amount_for_nodes + ceil(nodes * (self.workers - 1) / 4)
             )
 
-    def _distribute_across_clusters(self, nodes: int) -> dict[str, int]:
+    def _distribute_across_clusters(self, nodes: int):
         """
         Distribute *nodes* primaries (and their workers) across available
         clusters as uniformly as possible.
@@ -124,8 +124,8 @@ class Grid5000Bench:
 
         # Round-robin assign primaries to clusters
         cluster_names = [c["uid"] for c in available]
-        assignment: dict[str, int] = {name: 0 for name in cluster_names}
-        primary_to_cluster: dict[int, str] = {}
+        assignment = {name: 0 for name in cluster_names}
+        primary_to_cluster = {}
 
         for i in range(nodes):
             cluster = cluster_names[i % len(cluster_names)]
@@ -170,7 +170,7 @@ class Grid5000Bench:
         Print.info(f"Waiting for Grid'5000 job {self._job_id} to start ...")
         self.preserve_manager.wait_for_reservation(self._job_id, timeout=600)
 
-    def _get_hostnames(self) -> list[str]:
+    def _get_hostnames(self):
         if self._hostnames:
             return self._hostnames
         reservations = self.preserve_manager.get_own_reservations()

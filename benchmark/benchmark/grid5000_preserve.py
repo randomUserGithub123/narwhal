@@ -72,14 +72,14 @@ _STATE_MAP = {
     "terminated": "T", "error": "E", "hold": "W",
 }
 
-def _normalise_state(oar_state: str) -> str:
+def _normalise_state(oar_state: str):
     return _STATE_MAP.get(oar_state.lower(), oar_state[0].upper())
 
-def _short_hostname(fqdn: str) -> str:
+def _short_hostname(fqdn: str):
     """``parasilo-1.rennes.grid5000.fr`` → ``parasilo-1``"""
     return fqdn.split(".")[0]
 
-def _seconds_to_walltime(seconds: int) -> str:
+def _seconds_to_walltime(seconds: int):
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
@@ -121,19 +121,19 @@ def _reservation_from_job(job: dict) -> Grid5000Reservation:
 
 
 # ── Cluster & site discovery ───────────────────────────────────────────────
-def discover_sites() -> list[str]:
+def discover_sites():
     """Return all Grid'5000 site names."""
     data = _api_get("sites")
     return sorted([s["uid"] for s in data.get("items", [])])
 
 
-def discover_clusters(site: str) -> list[dict]:
+def discover_clusters(site: str):
     """
     Return all clusters on *site* with node counts.
 
     Returns
     -------
-    list[dict]
+    list of dict
         ``[{"uid": "parasilo", "nodes_count": 24, "queues": [...]}, ...]``
     """
     data = _api_get(f"sites/{site}/clusters")
@@ -154,16 +154,6 @@ def discover_clusters(site: str) -> list[dict]:
 class PreserveManager:
     """
     Manages Grid'5000 OAR jobs via the REST API.
-
-    Drop-in replacement for DAS ``PreserveManager``.
-    No config files needed — transparent auth from any G5K frontend.
-
-    Parameters
-    ----------
-    username : str
-        Grid'5000 login (e.g. ``"jdecouch"``).
-    site : str
-        Site you're on (e.g. ``"rennes"``).
     """
 
     def __init__(self, username: str, site: str):
@@ -188,28 +178,28 @@ class PreserveManager:
         return self.__site
 
     @property
-    def clusters(self) -> list[dict]:
+    def clusters(self):
         return self._clusters
 
     @property
-    def cluster_names(self) -> list[str]:
+    def cluster_names(self):
         return [c["uid"] for c in self._clusters]
 
-    def cluster_node_count(self, cluster_name: str) -> int:
+    def cluster_node_count(self, cluster_name: str):
         for c in self._clusters:
             if c["uid"] == cluster_name:
                 return c["nodes_count"]
         return 0
 
     # ── Listing ─────────────────────────────────────────────────────────
-    def get_reservations(self) -> dict[int, Grid5000Reservation]:
+    def get_reservations(self):
         data = _api_get(f"{self._jobs_path}?state=waiting,launching,running")
         return {
             _reservation_from_job(j).reservation_id: _reservation_from_job(j)
             for j in data.get("items", [])
         }
 
-    def get_own_reservations(self) -> dict[int, Grid5000Reservation]:
+    def get_own_reservations(self):
         data = _api_get(
             f"{self._jobs_path}?state=waiting,launching,running"
             f"&user={self.__username}"
@@ -221,7 +211,7 @@ class PreserveManager:
 
     # ── Single-cluster reservation ──────────────────────────────────────
     def create_reservation(self, num_machines: int, walltime: str,
-                           cluster: str | None = None) -> int:
+                           cluster: None = None):
         """
         Reserve *num_machines* whole nodes for *walltime*.
 
@@ -231,7 +221,7 @@ class PreserveManager:
             Number of physical nodes.
         walltime : str
             ``HH:MM:SS`` or bare seconds.
-        cluster : str | None
+        cluster : None
             Restrict to one cluster.  ``None`` → any on the site.
         """
         if num_machines < 1:
@@ -262,9 +252,9 @@ class PreserveManager:
     # ── Multi-cluster reservation (single OAR job) ──────────────────────
     def create_multi_cluster_reservation(
         self,
-        cluster_requests: dict[str, int],
+        cluster_requests,
         walltime: str,
-    ) -> int:
+    ):
         """
         Reserve nodes across multiple clusters in ONE OAR job.
 
@@ -273,7 +263,7 @@ class PreserveManager:
 
         Parameters
         ----------
-        cluster_requests : dict[str, int]
+        cluster_requests 
             ``{"parasilo": 3, "paravance": 4}``
         walltime : str
             Duration as ``HH:MM:SS``.
@@ -358,7 +348,7 @@ class PreserveManager:
         return _reservation_from_job(job)
 
     # ── Kill ────────────────────────────────────────────────────────────
-    def kill_reservation(self, reservation_id) -> None:
+    def kill_reservation(self, reservation_id):
         if str(reservation_id).upper() == "LAST":
             own = self.get_own_reservations()
             if not own:
@@ -373,13 +363,13 @@ class PreserveManager:
 
     # ── Utility: group hostnames by cluster ─────────────────────────────
     @staticmethod
-    def group_nodes_by_cluster(hostnames: list[str]) -> dict[str, list[str]]:
+    def group_nodes_by_cluster(hostnames):
         """
         ``["parasilo-1", "parasilo-2", "paravance-5"]``
         → ``{"parasilo": ["parasilo-1", "parasilo-2"],
               "paravance": ["paravance-5"]}``
         """
-        groups: dict[str, list[str]] = {}
+        groups = {}
         for h in hostnames:
             parts = h.rsplit("-", 1)
             cluster = parts[0] if len(parts) == 2 and parts[1].isdigit() else h
