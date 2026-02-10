@@ -19,6 +19,7 @@ from benchmark.plot import Ploter, PlotError
 from benchmark.instance import InstanceManager
 from benchmark.remote import Bench, BenchError
 from benchmark.das import DASBench
+from benchmark.grid5000 import Grid5000Bench
 
 @task
 def local(ctx, debug=True):
@@ -248,6 +249,164 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                     bench_params, 
                     node_params, 
                     username
+                ).run(debug, console, build)
+
+                consensus_tps_raw, _, _ = ret._consensus_throughput()
+                if int(consensus_tps_raw) <= 1e-9:
+                    continue # Skip until DAS nodes work
+
+                print(ret.result())
+                ret.print(filename)
+                run += 1
+
+            if attack_type == 1:
+                succ_num, total_num = _get_fissure_total(filename)
+                fissure_total_result = ""
+                if total_num != 0:
+                    fissure_total_result = f"\nCumulative fissure front-running results: {round(succ_num/total_num*100, 2):,}% ({succ_num:,}/{total_num:,}) \n"
+                with open(filename, "a") as f:
+                    f.write(fissure_total_result)
+                    print(fissure_total_result)
+            elif attack_type == 2:
+                succ_num, total_num = _get_sluggish_attack_total(filename)
+                sluggish_total_result = ""
+                if total_num != 0:
+                    sluggish_total_result = f"\nCumulative sluggish front-running results: {round(succ_num/total_num*100, 2):,}% ({succ_num:,}/{total_num:,}) \n"
+                with open(filename, "a") as f:
+                    f.write(sluggish_total_result)
+                    print(sluggish_total_result)
+            elif attack_type == 3:
+                succ_num, total_num = _get_speculative_attack_total(filename)
+                speculative_total_result = ""
+                if total_num != 0:
+                    speculative_total_result = f"\nCumulative speculative front-running results: {round(succ_num/total_num*100, 2):,}% ({succ_num:,}/{total_num:,}) \n"
+                with open(filename, "a") as f:
+                    f.write(speculative_total_result)
+                    print(speculative_total_result)
+            elif attack_type == 10:
+                succ_num, total_num = _get_monitor_total(filename)
+                monitor_total_result = ""
+                if total_num != 0:
+                    monitor_total_result = f"\nCumulative baseline front-running results: {round(succ_num/total_num*100, 2):,}% ({succ_num:,}/{total_num:,}) \n"
+                with open(filename, "a") as f:
+                    f.write(monitor_total_result)
+                    print(monitor_total_result)
+                
+        except BenchError as e:
+            Print.error(e)
+
+@task
+def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", site="grenoble"):
+    for attack_type, arbitragers, faults, workers_per_node, nodes, runs, input_rate in [
+        # ###### N = 5 ######
+        # (1, 1, 0, 2, 5, 1, 5000),
+        # (2, 1, 0, 2, 5, 1, 5000),
+        # (3, 1, 0, 2, 5, 1, 5000),
+        # (10, 1, 0, 2, 5, 1, 5000),
+        # ###### N = 9 ######
+        # (1, 3, 0, 2, 9, 1, 5000),
+        # (2, 3, 0, 2, 9, 1, 5000),
+        # (3, 3, 0, 2, 9, 1, 5000),
+        # (10, 3, 0, 2, 9, 1, 5000),
+        # ###### N = 14 ######
+        # (1, 3, 0, 2, 14, 1, 5000),
+        # (2, 3, 0, 2, 14, 1, 5000),
+        # (3, 3, 0, 2, 14, 1, 5000),
+        # (10, 3, 0, 2, 14, 1, 5000),
+        # ###### N = 17 ######
+        # (1, 3, 0, 2, 17, 1, 5000),
+        # (2, 3, 0, 2, 17, 1, 5000),
+        # (0, 1, 4, 2, 17, 5, 500),
+        # (0, 1, 4, 2, 17, 5, 1000),
+        # (0, 1, 4, 2, 17, 5, 1500),
+        # (0, 1, 4, 2, 17, 5, 2000),
+        # (0, 1, 4, 2, 17, 5, 2500),
+        (0, 1, 4, 2, 17, 1, 3000),
+        # (0, 1, 4, 2, 17, 5, 3500),
+        # (0, 1, 4, 2, 17, 5, 4000),
+        # (0, 1, 4, 2, 17, 5, 4500),
+        # (0, 1, 4, 2, 17, 3, 5000),
+        # (3, 1, 4, 2, 17, 3, 6000),
+        # (3, 1, 4, 2, 17, 3, 7000),
+        # (3, 1, 4, 2, 17, 3, 8000),
+        # (3, 1, 4, 2, 17, 3, 9000),
+        # (3, 1, 4, 2, 17, 3, 10_000),
+        # (3, 1, 4, 2, 17, 3, 15_000),
+        # (3, 1, 4, 2, 17, 3, 20_000),
+        # (3, 1, 4, 2, 17, 3, 25_000),
+        # (3, 1, 4, 2, 17, 3, 30_000),
+        # (3, 1, 4, 2, 17, 3, 35_000),
+        # (10, 3, 0, 2, 17, 1, 5000),
+    ]:
+        
+        assert attack_type in [
+            0, # no attack
+            1, # fissure
+            2, # sluggish
+            3, # speculative
+            10 # baseline
+        ]
+
+        """Run benchmarks on DAS5"""
+        bench_params = {
+            'faults': faults,
+            "arbitragers": arbitragers,  # arbitragers: the number of frontrunning attackers f_a
+            "attack_type": attack_type,  # frontrunning strategies: 0: no attack; 1: fissure; 2: sluggish; 3: speculative; 10: baseline
+            'nodes': nodes,
+            'workers': workers_per_node,
+            'rate': input_rate,
+            'tx_size': 128,
+            'duration': 60,
+            "collocate": True,
+        }
+        node_params = {
+            "header_size": 512,  # bytes
+            "max_header_delay": 2000,  # ms
+            "gc_depth": 50,  # rounds
+            "sync_retry_delay": 5_000,  # ms
+            "sync_retry_nodes": 3,  # number of nodes
+            "batch_size": 4_000,  # bytes
+            "max_batch_delay": 1000,  # ms
+            "lo_size": 200, # number of entries in LocalOrder queue
+            "lo_max_delay": 1000, # ms
+            "gamma": 1.0, # batch-OF parameter
+        }
+
+        node_params.update(
+            {
+                "fault_threshold": int(math.floor(
+                    (bench_params["nodes"] - 1) / 4
+                ))
+            }
+        )
+
+        assert bench_params['faults'] <= node_params['fault_threshold']
+
+        assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
+        assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+        assert bench_params['nodes'] > (
+            (4 * node_params['fault_threshold']) /
+            (2 * node_params['gamma'] - 1)
+        )
+
+        if console:
+            os.system('export RUSTFLAGS="--cfg tokio_unstable"')
+        try:
+            filename = PathMaker.local_result_file(
+                attack_type,
+                arbitragers,
+                faults,
+                workers_per_node,
+                nodes,
+            )
+            run = 0
+            while run < runs:
+                print(f"\n=============================\Grid5000 experiment[{attack_type, arbitragers, faults, workers_per_node, nodes, input_rate}] run[{run}]\n=============================\n")
+                ret = Grid5000Bench(
+                    bench_params, 
+                    node_params, 
+                    username,
+                    site
                 ).run(debug, console, build)
 
                 consensus_tps_raw, _, _ = ret._consensus_throughput()
