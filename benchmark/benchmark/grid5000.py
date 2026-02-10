@@ -23,7 +23,7 @@ BANNED_NODES = []
 
 
 class Grid5000Bench:
-    
+
     BASE_PORT = 4000
 
     def __init__(
@@ -97,24 +97,20 @@ class Grid5000Bench:
                 self._amount_for_nodes + ceil(nodes * (self.workers - 1) / 4)
             )
 
-    def _distribute_across_clusters(self, nodes: int):
+    def _distribute_across_clusters(self, nodes):
         """
-        Distribute *nodes* primaries (and their workers) across available
-        clusters as uniformly as possible.
+        Distribute *nodes* primaries across the largest viable clusters.
 
-        Strategy:
-        - Each primary + its collocated workers should be on the SAME cluster
-          (for network locality)
-        - Spread primaries round-robin across clusters
-        - Return a dict ``{cluster_name: num_physical_machines}`` for OAR
-
-        If only 1 cluster exists, everything goes there.
+        - Only considers clusters large enough to hold >= 1 primary+workers
+        - Picks at most 4 of the largest clusters
+        - Never requests more nodes than a cluster actually has
         """
+        MAX_CLUSTERS = 4
+
         available = self.preserve_manager.clusters
         if not available:
             raise BenchError("No clusters found on this site!", None)
 
-        # Machines needed per primary (including workers + client share)
         if self.collocate:
             machines_per_primary = 1
         else:
@@ -122,8 +118,28 @@ class Grid5000Bench:
 
         client_machines = ceil(nodes * (self.workers - 1) / 4)
 
-        # Round-robin assign primaries to clusters
-        cluster_names = [c["uid"] for c in available]
+        # Only clusters big enough for at least 1 primary, sorted largest first
+        viable = [c for c in available
+                  if c["nodes_count"] >= machines_per_primary]
+        viable.sort(key=lambda c: c["nodes_count"], reverse=True)
+
+        if not viable:
+            # Fallback: just use the single biggest cluster
+            viable = sorted(available,
+                            key=lambda c: c["nodes_count"], reverse=True)[:1]
+
+        use_clusters = viable[:min(MAX_CLUSTERS, nodes, len(viable))]
+        cluster_names = [c["uid"] for c in use_clusters]
+        cluster_capacity = {c["uid"]: c["nodes_count"] for c in use_clusters}
+
+        Print.info(
+            "Using %d cluster(s): %s" % (
+                len(cluster_names),
+                ", ".join("%s(cap=%d)" % (n, cluster_capacity[n])
+                          for n in cluster_names),
+            )
+        )
+
         assignment = {name: 0 for name in cluster_names}
         primary_to_cluster = {}
 
@@ -132,16 +148,21 @@ class Grid5000Bench:
             assignment[cluster] += machines_per_primary
             primary_to_cluster[i] = cluster
 
-        # Add client machines to whichever cluster has the most capacity
-        # (or spread them too)
         for i in range(client_machines):
             cluster = cluster_names[i % len(cluster_names)]
             assignment[cluster] += 1
 
-        # Store mapping for later use in node assignment
-        self._primary_to_cluster = primary_to_cluster
+        # Never exceed cluster capacity
+        for name in list(assignment.keys()):
+            cap = cluster_capacity[name]
+            if assignment[name] > cap:
+                Print.info(
+                    "Clamping %s from %d to %d (capacity limit)"
+                    % (name, assignment[name], cap)
+                )
+                assignment[name] = cap
 
-        # Remove clusters with 0 machines
+        self._primary_to_cluster = primary_to_cluster
         return {k: v for k, v in assignment.items() if v > 0}
 
     def _preserve_machines(self, nodes: int):

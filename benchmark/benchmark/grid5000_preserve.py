@@ -95,7 +95,9 @@ def _api_get(path: str) -> dict:
 def _api_post(path: str, payload: dict) -> dict:
     url = f"{API_BASE}/{path.lstrip('/')}"
     r = requests.post(url, json=payload)
-    r.raise_for_status()
+    if not r.ok:
+        print(f"[Grid'5000] API error {r.status_code}: {r.text}")
+        r.raise_for_status()
     return r.json()
 
 def _api_delete(path: str):
@@ -152,10 +154,6 @@ def discover_clusters(site: str):
 
 # ── Manager ─────────────────────────────────────────────────────────────────
 class PreserveManager:
-    """
-    Manages Grid'5000 OAR jobs via the REST API.
-    """
-
     def __init__(self, username: str, site: str):
         self.__username = username
         self.__site = site
