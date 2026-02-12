@@ -296,7 +296,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", site="grenoble"):
+def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", site="luxembourg"):
     for attack_type, arbitragers, faults, workers_per_node, nodes, runs, input_rate in [
         # ###### N = 5 ######
         # (1, 1, 0, 2, 5, 1, 5000),

@@ -88,13 +88,13 @@ def _seconds_to_walltime(seconds: int):
 def _api_get(path: str) -> dict:
     """GET from the Grid'5000 API.  No auth needed from a frontend."""
     url = f"{API_BASE}/{path.lstrip('/')}"
-    r = requests.get(url)
+    r = requests.get(url, verify=False)
     r.raise_for_status()
     return r.json()
 
 def _api_post(path: str, payload: dict) -> dict:
     url = f"{API_BASE}/{path.lstrip('/')}"
-    r = requests.post(url, json=payload)
+    r = requests.post(url, json=payload, verify=False)
     if not r.ok:
         print(f"[Grid'5000] API error {r.status_code}: {r.text}")
         r.raise_for_status()
@@ -102,7 +102,7 @@ def _api_post(path: str, payload: dict) -> dict:
 
 def _api_delete(path: str):
     url = f"{API_BASE}/{path.lstrip('/')}"
-    r = requests.delete(url)
+    r = requests.delete(url, verify=False)
     if r.status_code not in (200, 202, 204):
         r.raise_for_status()
 

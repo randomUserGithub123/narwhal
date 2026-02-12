@@ -10,6 +10,17 @@
 4. `tmux`
     - `sudo apt install tmux`
 
+## Grid5000 Setup
+1. `ssh USERNAME@access.grid5000.fr`
+2. SSH into one of the sites from the list: [`grenoble lille louvain luxembourg lyon nancy nantes rennes sophia strasbourg toulouse`]
+    - e.g., `ssh grenoble`
+3. Setup the environment:
+    - Miniconda: `mkdir -p ~/tmp`, `cd ~/tmp`, `curl -L -o miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh`, `bash miniconda.sh -b -p ~/software/miniconda/miniconda3`, `echo 'export PATH="$HOME/software/miniconda/miniconda3/bin:$PATH"' >> ~/.bashrc`, `echo 'if [ -f ~/.bashrc ]; then . ~/.bashrc; fi' > ~/.profile`, `source ~/.profile`, `conda init`, CLOSE AND RE-OPEN SHELL, `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`, `source ~/.bashrc`, `conda create -n workenv python=3.10`, `conda activate workenv`
+    - Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+    - Other: `conda activate workenv`, `conda install -y -c conda-forge "clang=20.*" "clangxx=20.*" "lld=20.*" "llvm-tools=20.*" "libclang=20.*"`, `conda install -y -c conda-forge tmux`, `echo 'export LIBCLANG_PATH="$HOME/software/miniconda/miniconda3/envs/workenv/lib"' >> ~/.bashrc`
+    - Clone project in `~` dir: `git clone https://github.com/randomUserGithub123/narwhal.git`
+    - Install Python libraries: `conda activate workenv`, `pip install -r ~/narwhal/benchmark/requirements.txt`
+
 ## DAS Setup
 1. Contact `das-account@cs.vu.nl` for access (you will get credentials via email)
 2. Nodes need to be accessed from university ip address (e.g. [TU Delft VPN](https://docs.eduvpn.org/client/linux/installation.html))
