@@ -129,24 +129,60 @@ def discover_sites():
     return sorted([s["uid"] for s in data.get("items", [])])
 
 
+def _get_busy_node_counts(site: str) -> dict:
+    """
+    Return {cluster_name: busy_node_count} by inspecting all currently
+    *running* jobs on *site*.
+
+    A node is considered busy if it appears in any running job's
+    assigned_nodes list — this includes admin/maintenance reservations,
+    which is exactly the signal we need: if a maintenance job holds all of
+    dahu, every dahu node shows up here and free_nodes drops to zero,
+    causing the scheduler to pick a different cluster automatically.
+
+    Returns an empty dict on any API error (fail-open: the caller falls
+    back to using total capacity as the sort key).
+    """
+    try:
+        data = _api_get(f"sites/{site}/jobs?state=running&limit=500")
+        busy = {}
+        for job in data.get("items", []):
+            for fqdn in job.get("assigned_nodes", []):
+                short = _short_hostname(fqdn)          # e.g. "dahu-7"
+                parts = short.rsplit("-", 1)
+                cluster = (parts[0]
+                           if len(parts) == 2 and parts[1].isdigit()
+                           else short)
+                busy[cluster] = busy.get(cluster, 0) + 1
+        return busy
+    except Exception:
+        return {}
+
+
 def discover_clusters(site: str):
     """
-    Return all clusters on *site* with node counts and exotic flag.
+    Return all clusters on *site* with node counts, free-node counts, and
+    exotic flag.
 
     Returns
     -------
     list of dict
-        ``[{"uid": "parasilo", "nodes_count": 24, "queues": [...],
-            "exotic": False}, ...]``
+        [{"uid": "dahu", "nodes_count": 32, "free_nodes": 18,
+          "queues": [...], "exotic": False}, ...]
 
-    Notes
-    -----
-    Grid'5000 *exotic* clusters (motion-capture studios, specialised GPU
-    racks, etc.) require the OAR ``exotic`` job type AND cannot be mixed
-    with standard clusters inside a single multi-resource (``+``) OAR job.
-    The ``exotic`` flag is detected from three complementary API signals so
-    that the caller can separate the two populations before scheduling.
+    ``free_nodes`` is computed by subtracting nodes currently assigned to
+    *running* jobs (including admin/maintenance reservations) from the total.
+    This means a cluster under maintenance will show free_nodes=0, causing
+    the scheduler to prefer a different cluster automatically.
+
+    Notes on exotic detection
+    -------------------------
+    Exotic clusters require the OAR exotic job type AND cannot be mixed with
+    standard clusters in a single multi-resource (+) OAR job.
     """
+    # Fetch busy counts once for the whole site (one API call, not per cluster)
+    busy_counts = _get_busy_node_counts(site)
+
     data = _api_get(f"sites/{site}/clusters")
     clusters = []
     for item in data.get("items", []):
@@ -154,14 +190,14 @@ def discover_clusters(site: str):
         nodes_data = _api_get(f"sites/{site}/clusters/{uid}/nodes")
         nodes_items = nodes_data.get("items", [])
         node_count = len(nodes_items)
+        busy = busy_counts.get(uid, 0)
+        free_nodes = max(0, node_count - busy)
 
         # ── Exotic detection (three complementary signals) ───────────────
-        # Signal 1: cluster-level "type" or "supported_job_types" field
         cluster_types = (
             item.get("supported_job_types", [])
             + ([item["type"]] if "type" in item else [])
         )
-        # Signal 2: first node's supported_job_types (same hardware class)
         node_types = (
             nodes_items[0].get("supported_job_types", [])
             if nodes_items else []
@@ -175,6 +211,7 @@ def discover_clusters(site: str):
         clusters.append({
             "uid": uid,
             "nodes_count": node_count,
+            "free_nodes": free_nodes,
             "queues": item.get("queues", ["default"]),
             "exotic": is_exotic,
         })
@@ -192,7 +229,8 @@ class PreserveManager:
         print(f"[Grid'5000] Discovering clusters on {site} ...")
         self._clusters = discover_clusters(site)
         summary = ", ".join(
-            f"{c['uid']}({c['nodes_count']})" for c in self._clusters
+            f"{c['uid']}({c['free_nodes']}/{c['nodes_count']} free)"
+            for c in self._clusters
         )
         print(f"[Grid'5000] Available clusters: {summary}")
 

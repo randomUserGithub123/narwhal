@@ -136,46 +136,74 @@ class Grid5000Bench:
         # ── Separate standard (non-exotic) from exotic clusters ──────────
         standard = [c for c in available if not c.get("exotic", False)]
         exotic   = [c for c in available if     c.get("exotic", False)]
-        standard.sort(key=lambda c: c["nodes_count"], reverse=True)
-        exotic.sort(  key=lambda c: c["nodes_count"], reverse=True)
 
-        viable_std = [c for c in standard if c["nodes_count"] >= machines_per_primary]
-        viable_ext = [c for c in exotic   if c["nodes_count"] >= machines_per_primary]
+        # Sort by FREE nodes descending (not total capacity).
+        # This means a cluster under maintenance or with a large running job
+        # will naturally sort to the bottom and be skipped.
+        standard.sort(key=lambda c: c["free_nodes"], reverse=True)
+        exotic.sort(  key=lambda c: c["free_nodes"], reverse=True)
+
+        viable_std = [c for c in standard if c["free_nodes"] >= machines_per_primary]
+        viable_ext = [c for c in exotic   if c["free_nodes"] >= machines_per_primary]
+
+        # ── Early warning: site may be too busy ──────────────────────────
+        max_free = max((c["free_nodes"] for c in standard), default=0)
+        if max_free < total_machines_needed:
+            Print.info(
+                "[WARNING] No single standard cluster has enough FREE nodes "
+                "for this experiment right now.\n"
+                "          Need %d, best available is %d free.\n"
+                "          Possible causes:\n"
+                "            - Scheduled maintenance (check login banner)\n"
+                "            - Cluster is fully booked by other users\n"
+                "          Options:\n"
+                "            - Wait and retry later\n"
+                "            - Switch site: fab grid5000 --site nancy\n"
+                "              (Nancy 'gros' has 124 nodes)\n"
+                "          Proceeding anyway — OAR will queue the job."
+                % (total_machines_needed, max_free)
+            )
 
         # ── Cluster selection ────────────────────────────────────────────
-        if viable_std and viable_std[0]["nodes_count"] >= total_machines_needed:
-            # Single standard cluster can satisfy the entire request → safest path
+        if viable_std and viable_std[0]["free_nodes"] >= total_machines_needed:
+            # Single standard cluster has enough FREE nodes → safest path
             use_clusters = [viable_std[0]]
             Print.info(
-                "Single-cluster mode: %s (cap=%d, need=%d)"
-                % (viable_std[0]["uid"], viable_std[0]["nodes_count"],
-                   total_machines_needed)
+                "Single-cluster mode: %s (%d/%d nodes free, need %d)"
+                % (viable_std[0]["uid"], viable_std[0]["free_nodes"],
+                   viable_std[0]["nodes_count"], total_machines_needed)
             )
         elif viable_std:
-            # Spread across standard clusters only (safe for OAR multi-resource)
+            # Spread across standard clusters (all still non-exotic, OAR safe)
             use_clusters = viable_std[:min(MAX_CLUSTERS, nodes, len(viable_std))]
         elif viable_ext:
             # No viable standard cluster — fall back to exotic-only
-            # (all-exotic multi-resource jobs are valid with the exotic job type)
             Print.info(
                 "[WARNING] No standard cluster available; "
                 "falling back to exotic clusters only."
             )
             use_clusters = viable_ext[:min(MAX_CLUSTERS, nodes, len(viable_ext))]
         else:
-            # Last resort: biggest cluster regardless of type
+            # Last resort: biggest cluster by total capacity regardless of type
             use_clusters = sorted(
                 available, key=lambda c: c["nodes_count"], reverse=True
             )[:1]
 
         # ── Assignment ───────────────────────────────────────────────────
         cluster_names    = [c["uid"] for c in use_clusters]
-        cluster_capacity = {c["uid"]: c["nodes_count"] for c in use_clusters}
+        # Store both free and total so the print and clamping use free nodes
+        cluster_capacity = {
+            c["uid"]: {"free": c["free_nodes"], "total": c["nodes_count"]}
+            for c in use_clusters
+        }
 
         Print.info(
             "Using %d cluster(s): %s" % (
                 len(cluster_names),
-                ", ".join("%s(cap=%d)" % (n, cluster_capacity[n])
+                ", ".join("%s(%d/%d free)" % (
+                              n,
+                              cluster_capacity[n]["free"],
+                              cluster_capacity[n]["total"])
                           for n in cluster_names),
             )
         )
@@ -192,12 +220,12 @@ class Grid5000Bench:
             cluster = cluster_names[i % len(cluster_names)]
             assignment[cluster] += 1
 
-        # Never exceed cluster capacity
+        # Never request more nodes than are currently free
         for name in list(assignment.keys()):
-            cap = cluster_capacity[name]
+            cap = cluster_capacity[name]["free"]
             if assignment[name] > cap:
                 Print.info(
-                    "Clamping %s from %d to %d (capacity limit)"
+                    "Clamping %s from %d to %d (free node limit)"
                     % (name, assignment[name], cap)
                 )
                 assignment[name] = cap
@@ -252,6 +280,39 @@ class Grid5000Bench:
             return self._hostnames
         return []
 
+    # ── Remote-node helpers ─────────────────────────────────────────────
+    def _prepare_remote_dirs(self, all_hostnames: list, nodes: int):
+        """
+        SSH into every reserved node and pre-create the /tmp directories that
+        RocksDB will need, then wait for all of them to finish.
+
+        Uses PathMaker.db_path(..., grid5000=True) so the paths are guaranteed
+        to match exactly what the primary and worker binaries will be given.
+
+        The rm+mkdir sequence also clears any stale RocksDB lock files left by
+        a previous crashed run — without this, RocksDB refuses to open a store
+        it thinks is already held by another process.
+        """
+        db_paths = []
+        for i in range(nodes):
+            db_paths.append(PathMaker.db_path(i, username=self.username, grid5000=True))
+            for wid in range(1, self.workers + 1):
+                db_paths.append(PathMaker.db_path(i, wid, username=self.username, grid5000=True))
+
+        mkdir_cmd = ("rm -rf " + " ".join(db_paths) +
+                     " && mkdir -p " + " ".join(db_paths))
+
+        Print.info(f"Preparing remote /tmp db directories on "
+                   f"{len(all_hostnames)} node(s) ...")
+        procs = []
+        for host in all_hostnames:
+            ssh = (f"ssh -o StrictHostKeyChecking=no {host} "
+                   f"'{mkdir_cmd}'")
+            procs.append(subprocess.Popen(ssh, shell=True))
+
+        for p in procs:
+            p.wait()
+
     # ── Main benchmark loop ─────────────────────────────────────────────
     def run(self, debug=False, console=False, build=True):
         assert isinstance(debug, bool)
@@ -305,6 +366,10 @@ class Grid5000Bench:
                 f"{len(by_cluster)} cluster(s): "
                 + ", ".join(f"{k}({len(v)})" for k, v in by_cluster.items())
             )
+
+            # Pre-create /tmp db directories on every node (clears stale state
+            # and avoids NFS permission issues with RocksDB)
+            self._prepare_remote_dirs(all_hostnames, nodes)
 
             # Shuffle within each cluster for randomness
             for hosts in by_cluster.values():
