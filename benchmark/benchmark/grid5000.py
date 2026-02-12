@@ -99,11 +99,25 @@ class Grid5000Bench:
 
     def _distribute_across_clusters(self, nodes):
         """
-        Distribute *nodes* primaries across the largest viable clusters.
+        Distribute *nodes* primaries across the largest viable **standard**
+        (non-exotic) clusters.
 
-        - Only considers clusters large enough to hold >= 1 primary+workers
-        - Picks at most 4 of the largest clusters
-        - Never requests more nodes than a cluster actually has
+        Key rules
+        ---------
+        * Exotic clusters (kinovis, vercors, etc.) require the OAR ``exotic``
+          job type AND have OAR property ``exotic=YES`` on their nodes.
+          OAR **cannot** satisfy a single multi-resource (``+``) job that
+          mixes standard and exotic resource segments — doing so always
+          produces a 400 "not enough resources" error even when individual
+          clusters have free nodes.  We therefore keep the two populations
+          strictly separated.
+        * If a single standard cluster has enough capacity for the full
+          experiment, prefer it: a single-cluster job is simpler to schedule,
+          starts faster, and avoids the exotic-mixing issue entirely.
+        * Only fall back to exotic clusters when *no* standard cluster has
+          sufficient capacity (rare on large sites like Grenoble/Nancy).
+        * Never request more nodes from a cluster than its reported capacity.
+        * Pick at most MAX_CLUSTERS clusters.
         """
         MAX_CLUSTERS = 4
 
@@ -117,19 +131,45 @@ class Grid5000Bench:
             machines_per_primary = 1 + self.workers
 
         client_machines = ceil(nodes * (self.workers - 1) / 4)
+        total_machines_needed = nodes * machines_per_primary + client_machines
 
-        # Only clusters big enough for at least 1 primary, sorted largest first
-        viable = [c for c in available
-                  if c["nodes_count"] >= machines_per_primary]
-        viable.sort(key=lambda c: c["nodes_count"], reverse=True)
+        # ── Separate standard (non-exotic) from exotic clusters ──────────
+        standard = [c for c in available if not c.get("exotic", False)]
+        exotic   = [c for c in available if     c.get("exotic", False)]
+        standard.sort(key=lambda c: c["nodes_count"], reverse=True)
+        exotic.sort(  key=lambda c: c["nodes_count"], reverse=True)
 
-        if not viable:
-            # Fallback: just use the single biggest cluster
-            viable = sorted(available,
-                            key=lambda c: c["nodes_count"], reverse=True)[:1]
+        viable_std = [c for c in standard if c["nodes_count"] >= machines_per_primary]
+        viable_ext = [c for c in exotic   if c["nodes_count"] >= machines_per_primary]
 
-        use_clusters = viable[:min(MAX_CLUSTERS, nodes, len(viable))]
-        cluster_names = [c["uid"] for c in use_clusters]
+        # ── Cluster selection ────────────────────────────────────────────
+        if viable_std and viable_std[0]["nodes_count"] >= total_machines_needed:
+            # Single standard cluster can satisfy the entire request → safest path
+            use_clusters = [viable_std[0]]
+            Print.info(
+                "Single-cluster mode: %s (cap=%d, need=%d)"
+                % (viable_std[0]["uid"], viable_std[0]["nodes_count"],
+                   total_machines_needed)
+            )
+        elif viable_std:
+            # Spread across standard clusters only (safe for OAR multi-resource)
+            use_clusters = viable_std[:min(MAX_CLUSTERS, nodes, len(viable_std))]
+        elif viable_ext:
+            # No viable standard cluster — fall back to exotic-only
+            # (all-exotic multi-resource jobs are valid with the exotic job type)
+            Print.info(
+                "[WARNING] No standard cluster available; "
+                "falling back to exotic clusters only."
+            )
+            use_clusters = viable_ext[:min(MAX_CLUSTERS, nodes, len(viable_ext))]
+        else:
+            # Last resort: biggest cluster regardless of type
+            use_clusters = sorted(
+                available, key=lambda c: c["nodes_count"], reverse=True
+            )[:1]
+
+        # ── Assignment ───────────────────────────────────────────────────
+        cluster_names    = [c["uid"] for c in use_clusters]
         cluster_capacity = {c["uid"]: c["nodes_count"] for c in use_clusters}
 
         Print.info(
@@ -168,7 +208,11 @@ class Grid5000Bench:
     def _preserve_machines(self, nodes: int):
         """Reserve machines, possibly across multiple clusters."""
         self._compute_machine_counts()
-        total_seconds = self.duration + 75 + 2 * nodes
+        # Give a generous overhead budget:
+        #   300 s  – binary sync + SSH key exchange + OAR startup latency
+        #   10 s   – per node (key gen, log rotation, teardown)
+        # The original 75+2*nodes was far too tight (≈85 s overhead for n=5).
+        total_seconds = self.duration + 300 + 10 * nodes
         walltime = str(datetime.timedelta(seconds=total_seconds))
 
         cluster_requests = self._distribute_across_clusters(nodes)
@@ -194,6 +238,14 @@ class Grid5000Bench:
     def _get_hostnames(self):
         if self._hostnames:
             return self._hostnames
+        # Always resolve against the specific job we reserved, not just any
+        # running job belonging to the user (avoids returning stale machines
+        # from a previous reservation that hasn't been killed yet).
+        if self._job_id is not None:
+            reservation = self.preserve_manager.fetch_reservation(self._job_id)
+            self._hostnames = reservation.assigned_machines
+            return self._hostnames
+        # Fallback: return machines from any running own reservation
         reservations = self.preserve_manager.get_own_reservations()
         for v in reservations.values():
             self._hostnames = v.assigned_machines

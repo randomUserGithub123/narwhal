@@ -131,23 +131,52 @@ def discover_sites():
 
 def discover_clusters(site: str):
     """
-    Return all clusters on *site* with node counts.
+    Return all clusters on *site* with node counts and exotic flag.
 
     Returns
     -------
     list of dict
-        ``[{"uid": "parasilo", "nodes_count": 24, "queues": [...]}, ...]``
+        ``[{"uid": "parasilo", "nodes_count": 24, "queues": [...],
+            "exotic": False}, ...]``
+
+    Notes
+    -----
+    Grid'5000 *exotic* clusters (motion-capture studios, specialised GPU
+    racks, etc.) require the OAR ``exotic`` job type AND cannot be mixed
+    with standard clusters inside a single multi-resource (``+``) OAR job.
+    The ``exotic`` flag is detected from three complementary API signals so
+    that the caller can separate the two populations before scheduling.
     """
     data = _api_get(f"sites/{site}/clusters")
     clusters = []
     for item in data.get("items", []):
         uid = item["uid"]
         nodes_data = _api_get(f"sites/{site}/clusters/{uid}/nodes")
-        node_count = len(nodes_data.get("items", []))
+        nodes_items = nodes_data.get("items", [])
+        node_count = len(nodes_items)
+
+        # ── Exotic detection (three complementary signals) ───────────────
+        # Signal 1: cluster-level "type" or "supported_job_types" field
+        cluster_types = (
+            item.get("supported_job_types", [])
+            + ([item["type"]] if "type" in item else [])
+        )
+        # Signal 2: first node's supported_job_types (same hardware class)
+        node_types = (
+            nodes_items[0].get("supported_job_types", [])
+            if nodes_items else []
+        )
+        is_exotic = (
+            "exotic" in cluster_types
+            or "exotic" in node_types
+            or item.get("type", "").lower() == "exotic"
+        )
+
         clusters.append({
             "uid": uid,
             "nodes_count": node_count,
             "queues": item.get("queues", ["default"]),
+            "exotic": is_exotic,
         })
     return clusters
 
@@ -192,20 +221,22 @@ class PreserveManager:
     # ── Listing ─────────────────────────────────────────────────────────
     def get_reservations(self):
         data = _api_get(f"{self._jobs_path}?state=waiting,launching,running")
-        return {
-            _reservation_from_job(j).reservation_id: _reservation_from_job(j)
-            for j in data.get("items", [])
-        }
+        result = {}
+        for j in data.get("items", []):
+            r = _reservation_from_job(j)
+            result[r.reservation_id] = r
+        return result
 
     def get_own_reservations(self):
         data = _api_get(
             f"{self._jobs_path}?state=waiting,launching,running"
             f"&user={self.__username}"
         )
-        return {
-            _reservation_from_job(j).reservation_id: _reservation_from_job(j)
-            for j in data.get("items", [])
-        }
+        result = {}
+        for j in data.get("items", []):
+            r = _reservation_from_job(j)
+            result[r.reservation_id] = r
+        return result
 
     # ── Single-cluster reservation ──────────────────────────────────────
     def create_reservation(self, num_machines: int, walltime: str,
