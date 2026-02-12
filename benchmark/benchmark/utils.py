@@ -33,12 +33,15 @@ class PathMaker:
         return f'.node-{i}.json'
 
     @staticmethod
-    def db_path(i, j=None, username=None):
+    def db_path(i, j=None, username=None, grid5000=False):
         assert isinstance(i, int) and i >= 0
         assert (isinstance(j, int) and i >= 0) or j is None
         worker_id = f'-{j}' if j is not None else ''
         if username:
-            return f"/var/scratch/{username}/narwhal/benchmark/.db-{i}{worker_id}"
+            if not grid5000:
+                return f"/var/scratch/{username}/narwhal/benchmark/.db-{i}{worker_id}"
+            else:
+                return f"/home/{username}/narwhal/benchmark/.db-{i}{worker_id}"
         else:
             return f".db-{i}{worker_id}"
 

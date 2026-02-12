@@ -72,7 +72,7 @@ class Grid5000Bench:
     def _kill_nodes(self):
         try:
             hosts = self._get_hostnames()
-            cmd = CommandMaker.cleanup(username=self.username)
+            cmd = CommandMaker.cleanup(username=self.username, grid5000=True)
             for host in hosts:
                 self._background_run(cmd, "/dev/null", host)
         except Exception:
@@ -267,7 +267,7 @@ class Grid5000Bench:
 
             # Clean local logs/state
             cmd = (f"{CommandMaker.clean_logs()} ; "
-                   f"{CommandMaker.cleanup(self.username)}")
+                   f"{CommandMaker.cleanup(self.username, grid5000=True)}")
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             sleep(0.5)
 
@@ -398,7 +398,7 @@ class Grid5000Bench:
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
-                    PathMaker.db_path(i, username=self.username),
+                    PathMaker.db_path(i, username=self.username, grid5000=True),
                     PathMaker.parameters_file(),
                     is_byzantine=int(i in faulty_node_ids),
                     debug=debug,
@@ -414,7 +414,7 @@ class Grid5000Bench:
                     cmd = CommandMaker.run_worker(
                         PathMaker.key_file(i),
                         PathMaker.committee_file(),
-                        PathMaker.db_path(i, wid, username=self.username),
+                        PathMaker.db_path(i, wid, username=self.username, grid5000=True),
                         PathMaker.parameters_file(),
                         wid,
                         is_byzantine=int(i in faulty_node_ids),
@@ -440,12 +440,12 @@ class Grid5000Bench:
                 faults=self.faults,
             )
 
-            cmd = f"{CommandMaker.cleanup(username=self.username)}"
+            cmd = f"{CommandMaker.cleanup(username=self.username, grid5000=True)}"
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             return log_values
 
         except subprocess.SubprocessError as e:
-            cmd = f"{CommandMaker.cleanup(username=self.username)}"
+            cmd = f"{CommandMaker.cleanup(username=self.username, grid5000=True)}"
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
             self._kill_nodes()
             raise BenchError("Failed to run benchmark", e)
