@@ -41,7 +41,8 @@ class PathMaker:
             if not grid5000:
                 return f"/var/scratch/{username}/narwhal/benchmark/.db-{i}{worker_id}"
             else:
-                return f"/home/{username}/narwhal/benchmark/.db-{i}{worker_id}"
+                # return f"/home/{username}/narwhal/benchmark/.db-{i}{worker_id}"
+                return f"/tmp/{username}/db-{i}{worker_id}"
         else:
             return f".db-{i}{worker_id}"
 

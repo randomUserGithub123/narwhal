@@ -12,7 +12,11 @@ class CommandMaker:
             if not grid5000:
                 return f'rm -rf /var/scratch/{username}/narwhal/benchmark/.db-* ; rm -f /var/scratch/{username}/narwhal/benchmark/*.json ; mkdir -p {PathMaker.results_path()}'
             else:
-                return f'rm -rf /home/{username}/narwhal/benchmark/.db-* ; rm -f /home/{username}/narwhal/benchmark/*.json ; mkdir -p {PathMaker.results_path()}'
+                (
+                    # f'rm -rf /home/{username}/narwhal/benchmark/.db-* ;'
+                    f'rm -f /home/{username}/narwhal/benchmark/.*.json ; '
+                    f'mkdir -p {PathMaker.results_path()}'
+                )
         else:
             return f"rm .db-* ; rm .*.json ; mkdir -p {PathMaker.results_path()}"
 
