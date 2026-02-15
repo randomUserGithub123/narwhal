@@ -85,6 +85,7 @@ pub struct Parameters {
     pub lo_max_delay: u64,
 
     pub gamma: f64,
+    pub scc_ordering: String,
     pub fault_threshold: u64
 
 }
@@ -102,6 +103,7 @@ impl Default for Parameters {
             lo_size: 500,
             lo_max_delay: 100,
             gamma: 1.0,
+            scc_ordering: String::from("alphabetical"),
             fault_threshold: 1
         }
     }
@@ -121,6 +123,7 @@ impl Parameters {
         info!("LocalOrder size set to {} B", self.lo_size);
         info!("Max LocalOrder delay set to {} ms", self.lo_max_delay);
         info!("Gamma set to {}", self.gamma);
+        info!("SCC ordering set to {}", self.scc_ordering);
         info!("Node fault_threshold set to {}", self.fault_threshold);
     }
 }

@@ -286,6 +286,8 @@ pub struct GlobalOrder {
     next_to_finalize: u64,
     already_finalized: HashSet<Digest>,
 
+    scc_ordering_mode: String,
+
     // UTIG PAPER
     use_utig_paper: bool,
     utig_paper_slot: Option<usize>,
@@ -348,6 +350,7 @@ impl GlobalOrder {
         n: u64,
         f: u64,
         gamma: f64,
+        scc_ordering: String,
         tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u16>, Vec<Digest>, Vec<u32>)>,
     ) -> Self {
         let non_blank_threshold =
@@ -381,6 +384,7 @@ impl GlobalOrder {
             pending_fair_updates: HashMap::new(),
             next_to_finalize: 0,
             already_finalized: HashSet::new(),
+            scc_ordering_mode: scc_ordering,
             use_utig_paper: false,
             utig_paper_slot: None,
             utig_paper_tx_map: HashMap::new(),
@@ -796,6 +800,7 @@ impl GlobalOrder {
 
             let non_blank = self.non_blank_threshold as u8;
             let solid = self.solid_threshold as u8;
+            let scc_order_mode = self.scc_ordering_mode.clone();
             let tx_utig_results = self.tx_utig_results.clone();
 
             let slot = slot_idx;  // usize is Send-safe
@@ -825,6 +830,7 @@ impl GlobalOrder {
                         recycled_this_batch,
                         non_blank,
                         solid,
+                        scc_order_mode.as_str(),
                         max_idx,
                         matrix,
                         tx_utig_results,
@@ -841,10 +847,19 @@ impl GlobalOrder {
             
             let non_blank = self.non_blank_threshold;
             let solid = self.solid_threshold;
+            let scc_order_mode = self.scc_ordering_mode.clone();
             let tx_utig_results = self.tx_utig_results.clone();
             
             let _handler = tokio_rayon::spawn(move || {
-                run_themis(sub_dag_id, indices_sets, k, non_blank as u8, solid as u8, tx_utig_results);
+                run_themis(
+                    sub_dag_id, 
+                    indices_sets, 
+                    k, 
+                    non_blank as u8, 
+                    solid as u8, 
+                    scc_order_mode.as_str(),
+                    tx_utig_results
+                );
             });
 
             log::info!(
@@ -928,6 +943,7 @@ impl GlobalOrder {
         let n = self.n;
         let f = self.f;
         let gamma = self.gamma;
+        let scc_order_mode = self.scc_ordering_mode.clone();
         
         log::info!(
             "sub_dag_id={}: spawning FairUpdate with {} author votes",
@@ -942,6 +958,7 @@ impl GlobalOrder {
                 n,
                 f,
                 gamma,
+                scc_order_mode.as_str(),
                 tx_utig_results,
             );
         });
@@ -1551,6 +1568,90 @@ impl GlobalOrder {
     }
 }
 
+fn find_hamiltonian_cycle_in_scc(
+    nodes: &[usize],
+    has_edge: &impl Fn(usize, usize) -> bool,
+) -> Vec<usize> {
+    if nodes.len() <= 1 {
+        return nodes.to_vec();
+    }
+    if nodes.len() == 2 {
+        return if has_edge(nodes[0], nodes[1]) {
+            vec![nodes[0], nodes[1]]
+        } else {
+            vec![nodes[1], nodes[0]]
+        };
+    }
+
+    // Build cycle directly by inserting nodes one at a time.
+    // For a strongly connected tournament, an insertion point
+    // cycle[j]→node→cycle[(j+1)%m] always exists.
+    let mut cycle: Vec<usize> = if has_edge(nodes[0], nodes[1]) {
+        vec![nodes[0], nodes[1]]
+    } else {
+        vec![nodes[1], nodes[0]]
+    };
+
+    for &node in &nodes[2..] {
+        let m = cycle.len();
+        let mut inserted = false;
+        for j in 0..m {
+            let next = (j + 1) % m;
+            if has_edge(cycle[j], node) && has_edge(node, cycle[next]) {
+                cycle.insert(j + 1, node);
+                inserted = true;
+                break;
+            }
+        }
+        if !inserted {
+            // Fallback — shouldn't happen for SC tournament
+            cycle.push(node);
+        }
+    }
+
+    cycle
+}
+
+fn order_scc(
+    comp: &[usize],
+    is_final_scc: bool,
+    mode: &str,
+    is_solid: &[bool],
+    has_edge: &impl Fn(usize, usize) -> bool,
+) -> Vec<usize> {
+    if comp.len() <= 1 {
+        return comp.to_vec();
+    }
+
+    match mode {
+        "hamiltonian_cycle" => {
+            let mut cycle = find_hamiltonian_cycle_in_scc(comp, has_edge);
+
+            if is_final_scc {
+                // Rotate so a solid tx is LAST
+                // Pick smallest-index solid tx (deterministic)
+                if let Some(solid_pos) = cycle.iter().enumerate()
+                    .filter(|(_, &tx)| is_solid[tx])
+                    .min_by_key(|(_, &tx)| tx)
+                    .map(|(pos, _)| pos)
+                {
+                    let start = (solid_pos + 1) % cycle.len();
+                    let mut rotated = Vec::with_capacity(cycle.len());
+                    rotated.extend_from_slice(&cycle[start..]);
+                    rotated.extend_from_slice(&cycle[..start]);
+                    cycle = rotated;
+                }
+            }
+            cycle
+        }
+        _ => {
+            let mut sorted = comp.to_vec();
+            sorted.sort_unstable();
+            sorted
+        }
+    }
+}
+
 fn apply_fair_update_and_finalize(
     compressed_combined_data: Vec<u8>,
     sub_dag_id: u64,
@@ -1558,6 +1659,7 @@ fn apply_fair_update_and_finalize(
     n: u64,
     f: u64,
     gamma: f64,
+    scc_ordering_mode: &str,
     // ENABLE IF THERE IS NEED TO SEE tx's SCC 
     // tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
     // OTHERWISE
@@ -1626,6 +1728,7 @@ fn apply_fair_update_and_finalize(
     }
     
     let mut new_edges_count = 0;
+    let mut involved_in_new_edge: Vec<bool> = vec![false; k];
     
     for &u in &region_b_v {
         for &v in &region_b_v {
@@ -1653,6 +1756,8 @@ fn apply_fair_update_and_finalize(
                     region_b_e.push((u, v));
                     existing_edges.insert((u, v));
                     new_edges_count += 1;
+                    involved_in_new_edge[u as usize] = true;
+                    involved_in_new_edge[v as usize] = true;
                 }
             } else {
                 // Direction would be v → u
@@ -1660,6 +1765,8 @@ fn apply_fair_update_and_finalize(
                     region_b_e.push((v, u));
                     existing_edges.insert((v, u));
                     new_edges_count += 1;
+                    involved_in_new_edge[v as usize] = true;
+                    involved_in_new_edge[u as usize] = true;
                 }
             } 
         }
@@ -1770,21 +1877,35 @@ fn apply_fair_update_and_finalize(
     // OTHERWISE
     let mut finalized_now: Vec<usize> = Vec::new();
 
-    for &scc_idx in &topo {
-        // ENABLE IF THERE IS NEED TO SEE tx's SCC 
-        // let mut group = sccs[scc_idx].clone();
-        // group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
-        // finalized_tx_count += group.len();
-        // finalized_now.push(group);
-        // OTHERWISE
+    let is_solid_approx: Vec<bool> = (0..k)
+        .map(|i| !involved_in_new_edge[i])
+        .collect();
+
+    let has_edge = |u: usize, v: usize| -> bool {
+        existing_edges.contains(&(u as u16, v as u16))
+    };
+
+    // for &scc_idx in &topo {
+    //     // ENABLE IF THERE IS NEED TO SEE tx's SCC 
+    //     // let mut group = sccs[scc_idx].clone();
+    //     // group.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+    //     // finalized_tx_count += group.len();
+    //     // finalized_now.push(group);
+    //     // OTHERWISE
+    //     let comp = &sccs[scc_idx];
+    //     if comp.len() == 1 {
+    //         finalized_now.push(comp[0]);
+    //     } else {
+    //         let mut sorted = comp.clone();
+    //         sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
+    //         finalized_now.extend(sorted);
+    //     }
+    // }
+    for (idx, &scc_idx) in topo.iter().enumerate() {
         let comp = &sccs[scc_idx];
-        if comp.len() == 1 {
-            finalized_now.push(comp[0]);
-        } else {
-            let mut sorted = comp.clone();
-            sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
-            finalized_now.extend(sorted);
-        }
+        let is_final = idx == topo.len() - 1;
+        let ordered = order_scc(comp, is_final, scc_ordering_mode, &is_solid_approx, &has_edge);
+        finalized_now.extend(ordered);
     }
 
     log::info!(
@@ -1802,6 +1923,7 @@ pub fn run_themis(
     k: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
+    scc_ordering_mode: &str,
     // ENABLE IF THERE IS NEED TO SEE tx's SCC 
     // tx_utig_results: tokio::sync::mpsc::Sender<(u64, Vec<Vec<usize>>, Vec<u16>, Vec<(u16,u16)>, Vec<u16>, Vec<u32>)>,
     // OTHERWISE
@@ -2165,6 +2287,17 @@ pub fn run_themis(
         }
     }
 
+    let has_edge = |u: usize, v: usize| -> bool {
+        let kuv = get_weight(weight, w_idx(u, v, k));
+        let kvu = get_weight(weight, w_idx(v, u, k));
+        // Edge exists u→v if kuv >= non_blank_threshold OR
+        // kuv >= kvu (when at least one direction meets threshold)
+        if kuv < non_blank_threshold && kvu < non_blank_threshold {
+            return false; // no edge at all
+        }
+        kuv >= kvu
+    };
+
     // ENABLE IF THERE IS NEED TO SEE tx's SCC 
     // let mut finalized_now: Vec<Vec<usize>> = Vec::new();
     // for topo_pos in 0..start_b {
@@ -2174,16 +2307,11 @@ pub fn run_themis(
     // }
     // OTHERWISE
     let mut finalized_now: Vec<usize> = Vec::new();
-     for topo_pos in 0..start_b {
+    for topo_pos in 0..start_b {
         let comp = &sccs[topo[topo_pos]];
-        if comp.len() == 1 {
-            finalized_now.push(comp[0]);
-        } else {
-            let mut sorted = comp.clone();
-            sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper
-            finalized_now.extend(sorted);
-        }
-     }
+        let ordered = order_scc(comp, false, scc_ordering_mode, is_solid, &has_edge);
+        finalized_now.extend(ordered);
+    }
 
     // ============================================================
     // (7) Remove txs that are part of SCCs after V in S
@@ -2206,13 +2334,9 @@ pub fn run_themis(
     if start_b <= anchor {
         for topo_pos in start_b..=anchor {
             let comp = &sccs[topo[topo_pos]];
-            if comp.len() == 1 {
-                region_b_local.push(comp[0]);
-            } else {
-                let mut sorted = comp.clone();
-                sorted.sort_unstable(); // TODO: Implement the Hamiltonian approach from paper  
-                region_b_local.extend(sorted);
-            }
+            let is_final = topo_pos == anchor;
+            let ordered = order_scc(comp, is_final, scc_ordering_mode, is_solid, &has_edge);
+            region_b_local.extend(ordered);
         }
     }
 
@@ -2340,6 +2464,7 @@ pub fn run_utig(
     recycled_indices: Vec<usize>,
     non_blank_threshold: u8,
     solid_threshold: u8,
+    scc_ordering_mode: &str,
     max_idx: usize,
     matrix: &mut UTIGMatrix,
     tx_utig_results: tokio::sync::mpsc::Sender<(
@@ -2894,16 +3019,21 @@ pub fn run_utig(
         return;
     };
 
+    let has_edge = |u: usize, v: usize| -> bool {
+        let kuv = get_weight(weight, w_idx(u, v));
+        let kvu = get_weight(weight, w_idx(v, u));
+        if kuv < t_edge && kvu < t_edge {
+            return false;
+        }
+        kuv >= kvu
+    };
+
     let mut finalized_now: Vec<usize> = Vec::new();
     for topo_pos in 0..=anchor {
         let comp = &sccs[topo[topo_pos]];
-        if comp.len() == 1 {
-            finalized_now.push(comp[0]);
-        } else {
-            let mut sorted = comp.clone();
-            sorted.sort_unstable();
-            finalized_now.extend(sorted);
-        }
+        let is_final = topo_pos == anchor;
+        let ordered = order_scc(comp, is_final, scc_ordering_mode, solid_ro, &has_edge);
+        finalized_now.extend(ordered);
     }
 
     {

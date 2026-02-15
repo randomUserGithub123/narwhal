@@ -10,17 +10,27 @@ import matplotlib.pyplot as plt
 #######################################
 
 LOG_FILES = {
-    'Tilikum': 'run_tilikum_BOF_21_01_2026-Attack-NONE-1-4-17-5-0-X-a7d859.txt',
-    'Haring': 'run_haring_21_01_2026.txt'
+    # 'Tilikum': 'run_tilikum_BOF_21_01_2026-Attack-NONE-1-4-17-5-0-X-a7d859.txt',
+    'DoD': 'dod_change_tps.txt',
+    'Haring': 'haring_change_tps_12_02_2026.txt',
 }
+
+# Full benchmark window duration (seconds).
+# TPS values are normalized to this duration:
+#   adjusted_tps = reported_tps * (exec_time / MAX_EXEC_TIME)
+# This corrects runs that finished early (small exec_time) whose raw TPS
+# would otherwise appear artificially high relative to the full window.
+MAX_EXEC_TIME = 57
 
 # Regex patterns - one per field (easier to edit)
 PATTERN_INPUT_RATE = r'Input rate: ([\d,]+) tx/s'
 PATTERN_EXEC_TIME  = r'Execution time: (-?\d+) s'
 PATTERN_CONSENSUS_TIME = r'Consensus time: (\d+) s'
 PATTERN_LATENCY_HARING = r'End-to-end latency \(finalization\): ([\d,]+) ms'
+PATTERN_LATENCY_DOD = r'End-to-end latency: ([\d,]+) ms'
 PATTERN_LATENCY_TILIKUM = r'End-to-end Execution Latency: ([\d,]+) ms'
 PATTERN_TPS_HARING = r'End-to-end TPS: ([\d,.]+) tx/s'
+PATTERN_TPS_DOD = r'End-to-end TPS: ([\d,.]+) tx/s'
 PATTERN_TPS_TILIKUM = r'Effective execution throughput: ([\d,.]+) tx/s'
 
 #######################################
@@ -49,38 +59,59 @@ for system_name, log_file in LOG_FILES.items():
             if m:
                 return m.group(1).replace(',', '')
             return None
-        
+
         input_rate = extract(PATTERN_INPUT_RATE)
         exec_time = extract(PATTERN_EXEC_TIME)
-        consensus_time = extract(PATTERN_CONSENSUS_TIME)
-        
+
         # Use system-specific patterns
         if system_name == 'Haring':
             latency = extract(PATTERN_LATENCY_HARING)
             tps = extract(PATTERN_TPS_HARING)
+            consensus_time = extract(PATTERN_CONSENSUS_TIME)
+        elif system_name == 'DoD':
+            latency = extract(PATTERN_LATENCY_DOD)
+            tps = extract(PATTERN_TPS_DOD)
+            consensus_time = 1
         else:  # Tilikum
             latency = extract(PATTERN_LATENCY_TILIKUM)
             tps = extract(PATTERN_TPS_TILIKUM)
-        
+            consensus_time = extract(PATTERN_CONSENSUS_TIME)
+
         if not all([input_rate, exec_time, latency, tps]):
             continue
-        
+
         input_rate = int(input_rate)
         exec_time = int(exec_time)
         consensus_time = int(consensus_time) if consensus_time else 0
         latency = int(latency)
         tps = float(tps)
-        
-        # Skip HARING runs with exec_time == -1 or consensus_time == 0
-        if system_name == 'Haring':
-            if exec_time == -1 or consensus_time == 0:
-                continue
-        
+
+        # Skip runs with exec_time == -1 or consensus_time == 0
+        if exec_time == -1 or consensus_time == 0:
+            continue
+
+        # -------------------------------------------------------
+        # TPS ADJUSTMENT FOR PARTIAL RUNS
+        # A run that lasted exec_time seconds only processed
+        # transactions for that fraction of the benchmark window.
+        # Normalise to MAX_EXEC_TIME so all TPS values are
+        # comparable on the same time base.
+        #   adjusted_tps = reported_tps * (exec_time / MAX_EXEC_TIME)
+        # Runs with exec_time == MAX_EXEC_TIME are unaffected (×1.0).
+        # Runs with exec_time == 0 collapse to 0 and are filtered below.
+        # -------------------------------------------------------
+        if exec_time != MAX_EXEC_TIME and tps > 0:
+            raw_tps = tps
+            tps = tps * (exec_time / MAX_EXEC_TIME)
+            print(f"  TPS adjusted: input={input_rate} tx/s, "
+                  f"exec={exec_time}s/{MAX_EXEC_TIME}s, "
+                  f"raw={raw_tps:.1f} -> adjusted={tps:.1f} tx/s  ({system_name})")
+
         if tps > 0:
             data.append({
-                'input_rate': input_rate, 
-                'exec_time': exec_time, 
-                'latency': latency, 
+                'input_rate': input_rate,
+                'exec_time': exec_time,
+                'latency': latency,
                 'tps': tps,
                 'system': system_name
             })
@@ -121,7 +152,7 @@ stats = df_valid.groupby(['system', 'nominal_rate']).agg(
     std_latency=('latency', 'std')
 ).fillna(0).reset_index()
 
-print("\n=== AVERAGE VALUES ===")
+print("\n=== AVERAGE VALUES (TPS adjusted to MAX_EXEC_TIME={} s) ===".format(MAX_EXEC_TIME))
 for system in stats['system'].unique():
     print(f"\n{system}:")
     print(stats[stats['system'] == system].to_string(index=False))
@@ -130,19 +161,19 @@ for system in stats['system'].unique():
 # PLOTTING
 #######################################
 
-colors = {'Tilikum': '#1f77b4', 'Haring': '#ff7f0e'}
-markers = {'Tilikum': 'o', 'Haring': 's'}
+colors = {'DoD': '#1f77b4', 'Haring': '#ff7f0e'}
+markers = {'DoD': 'o', 'Haring': 's'}
 
 # Plot 1: Input Rate vs End-to-end TPS
 plt.figure(figsize=(10, 6))
 for system in stats['system'].unique():
     data = stats[stats['system'] == system]
-    plt.plot(data['nominal_rate'], data['avg_tps'], 
+    plt.plot(data['nominal_rate'], data['avg_tps'],
              marker=markers[system], linewidth=2, markersize=6,
              label=system, color=colors[system])
     plt.fill_between(data['nominal_rate'],
                      data['avg_tps'] - data['std_tps'],
-                     data['avg_tps'] + data['std_tps'], 
+                     data['avg_tps'] + data['std_tps'],
                      alpha=0.3, color=colors[system])
 plt.xlabel('Input Rate (tx/s)')
 plt.ylabel('End-to-end TPS (tx/s)')
@@ -157,12 +188,12 @@ plt.close()
 plt.figure(figsize=(10, 6))
 for system in stats['system'].unique():
     data = stats[stats['system'] == system]
-    plt.plot(data['nominal_rate'], data['avg_latency'], 
+    plt.plot(data['nominal_rate'], data['avg_latency'],
              marker=markers[system], linewidth=2, markersize=6,
              label=system, color=colors[system])
     plt.fill_between(data['nominal_rate'],
                      data['avg_latency'] - data['std_latency'],
-                     data['avg_latency'] + data['std_latency'], 
+                     data['avg_latency'] + data['std_latency'],
                      alpha=0.3, color=colors[system])
 plt.xlabel('Input Rate (tx/s)')
 plt.ylabel('Latency (ms)')
@@ -177,12 +208,12 @@ plt.close()
 plt.figure(figsize=(10, 6))
 for system in stats['system'].unique():
     data = stats[stats['system'] == system]
-    plt.plot(data['avg_tps'], data['avg_latency'], 
+    plt.plot(data['avg_tps'], data['avg_latency'],
              marker=markers[system], linewidth=2, markersize=6,
              label=system, color=colors[system])
     plt.fill_between(data['avg_tps'],
                      data['avg_latency'] - data['std_latency'],
-                     data['avg_latency'] + data['std_latency'], 
+                     data['avg_latency'] + data['std_latency'],
                      alpha=0.3, color=colors[system])
 plt.xlabel('End-to-end TPS (tx/s)')
 plt.ylabel('Latency (ms)')

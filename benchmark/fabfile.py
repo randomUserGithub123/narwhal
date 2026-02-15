@@ -142,10 +142,21 @@ def local(ctx, debug=True):
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for attack_type, arbitragers, faults, workers_per_node, nodes, runs, input_rate in [
         # ###### N = 5 ######
-        # (1, 1, 0, 2, 5, 1, 5000),
-        # (2, 1, 0, 2, 5, 1, 5000),
-        # (3, 1, 0, 2, 5, 1, 5000),
-        # (10, 1, 0, 2, 5, 1, 5000),
+        # ###### N = 5 ######
+        # (0, 1, 1, 2, 5, 6, 500),
+        # (0, 1, 1, 2, 5, 6, 1000),
+        # (0, 1, 1, 2, 5, 6, 1500),
+        # (0, 1, 1, 2, 5, 6, 2000),
+        # (0, 1, 1, 2, 5, 6, 2500),
+        # (0, 1, 1, 2, 5, 6, 3000),
+        # (0, 1, 1, 2, 5, 6, 3500),
+        # (0, 1, 1, 2, 5, 6, 4000),
+        # (0, 1, 1, 2, 5, 6, 4500),
+        (0, 1, 1, 2, 5, 1, 5000),
+        # (0, 1, 1, 2, 5, 6, 5500),
+        # (0, 1, 1, 2, 5, 6, 6000),
+        # (0, 1, 1, 2, 5, 6, 6500),
+        # (0, 1, 1, 2, 5, 6, 7000),
         # ###### N = 9 ######
         # (1, 3, 0, 2, 9, 1, 5000),
         # (2, 3, 0, 2, 9, 1, 5000),
@@ -159,15 +170,15 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # ###### N = 17 ######
         # (1, 3, 0, 2, 17, 1, 5000),
         # (2, 3, 0, 2, 17, 1, 5000),
-        (0, 1, 4, 2, 17, 5, 500),
-        (0, 1, 4, 2, 17, 5, 1000),
-        (0, 1, 4, 2, 17, 5, 1500),
-        (0, 1, 4, 2, 17, 5, 2000),
-        (0, 1, 4, 2, 17, 5, 2500),
-        (0, 1, 4, 2, 17, 5, 3000),
-        (0, 1, 4, 2, 17, 5, 3500),
-        (0, 1, 4, 2, 17, 5, 4000),
-        (0, 1, 4, 2, 17, 5, 4500),
+        # (0, 1, 4, 2, 17, 5, 500),
+        # (0, 1, 4, 2, 17, 5, 1000),
+        # (0, 1, 4, 2, 17, 5, 1500),
+        # (0, 1, 4, 2, 17, 5, 2000),
+        # (0, 1, 4, 2, 17, 5, 2500),
+        # (0, 1, 4, 2, 17, 5, 3000),
+        # (0, 1, 4, 2, 17, 5, 3500),
+        # (0, 1, 4, 2, 17, 5, 4000),
+        # (0, 1, 4, 2, 17, 5, 4500),
         # (0, 1, 4, 2, 17, 3, 5000),
         # (3, 1, 4, 2, 17, 3, 6000),
         # (3, 1, 4, 2, 17, 3, 7000),
@@ -213,6 +224,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "lo_size": 200, # number of entries in LocalOrder queue
             "lo_max_delay": 1000, # ms
             "gamma": 1.0, # batch-OF parameter
+            "scc_ordering": "alphabetical", # batch-OF parameter
         }
 
         node_params.update(
@@ -231,6 +243,12 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             (4 * node_params['fault_threshold']) /
             (2 * node_params['gamma'] - 1)
         )
+
+        assert node_params["scc_ordering"] in [
+            "alphabetical",
+            "hamiltonian_cycle",
+            "ranked_pairs"
+        ]
 
         if console:
             os.system('export RUSTFLAGS="--cfg tokio_unstable"')
@@ -299,10 +317,20 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
 def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", site="luxembourg"):
     for attack_type, arbitragers, faults, workers_per_node, nodes, runs, input_rate in [
         # ###### N = 5 ######
-        # (1, 1, 0, 2, 5, 1, 5000),
-        # (2, 1, 0, 2, 5, 1, 5000),
-        # (3, 1, 0, 2, 5, 1, 5000),
-        # (10, 1, 0, 2, 5, 1, 5000),
+        # (0, 1, 1, 2, 5, 6, 500),
+        # (0, 1, 1, 2, 5, 6, 1000),
+        # (0, 1, 1, 2, 5, 6, 1500),
+        # (0, 1, 1, 2, 5, 6, 2000),
+        # (0, 1, 1, 2, 5, 6, 2500),
+        # (0, 1, 1, 2, 5, 6, 3000),
+        # (0, 1, 1, 2, 5, 6, 3500),
+        # (0, 1, 1, 2, 5, 6, 4000),
+        # (0, 1, 1, 2, 5, 6, 4500),
+        (0, 1, 1, 2, 5, 1, 5000),
+        # (0, 1, 1, 2, 5, 6, 5500),
+        # (0, 1, 1, 2, 5, 6, 6000),
+        # (0, 1, 1, 2, 5, 6, 6500),
+        # (0, 1, 1, 2, 5, 6, 7000),
         # ###### N = 9 ######
         # (1, 3, 0, 2, 9, 1, 5000),
         # (2, 3, 0, 2, 9, 1, 5000),
@@ -321,7 +349,7 @@ def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", si
         # (0, 1, 4, 2, 17, 5, 1500),
         # (0, 1, 4, 2, 17, 5, 2000),
         # (0, 1, 4, 2, 17, 5, 2500),
-        (0, 1, 4, 2, 17, 1, 3000),
+        #(0, 1, 4, 2, 17, 1, 3000),
         # (0, 1, 4, 2, 17, 5, 3500),
         # (0, 1, 4, 2, 17, 5, 4000),
         # (0, 1, 4, 2, 17, 5, 4500),
@@ -370,6 +398,7 @@ def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", si
             "lo_size": 200, # number of entries in LocalOrder queue
             "lo_max_delay": 1000, # ms
             "gamma": 1.0, # batch-OF parameter
+            "scc_ordering": "alphabetical", # batch-OF parameter
         }
 
         node_params.update(
@@ -388,6 +417,12 @@ def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", si
             (4 * node_params['fault_threshold']) /
             (2 * node_params['gamma'] - 1)
         )
+
+        assert node_params["scc_ordering"] in [
+            "alphabetical",
+            "hamiltonian_cycle",
+            "ranked_pairs"
+        ]
 
         if console:
             os.system('export RUSTFLAGS="--cfg tokio_unstable"')

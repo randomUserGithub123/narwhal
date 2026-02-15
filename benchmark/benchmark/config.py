@@ -330,6 +330,9 @@ class NodeParameters:
         
         if not isinstance(json['gamma'], float):
             raise ConfigError('Invalid parameters type: gamma')
+        
+        if not isinstance(json['scc_ordering'], str):
+            raise ConfigError('Invalid parameters type: scc_ordering')
 
         self.json = json
 

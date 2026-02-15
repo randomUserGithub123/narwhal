@@ -315,6 +315,7 @@ impl Worker {
                 self.committee.size() as u64,
                 self.parameters.fault_threshold,
                 self.parameters.gamma,
+                self.parameters.scc_ordering.clone(),
                 tx_fair_propose
             );
             go.start();
