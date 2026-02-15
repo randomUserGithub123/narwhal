@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 
 LOG_FILES = {
     # 'Tilikum': 'run_tilikum_BOF_21_01_2026-Attack-NONE-1-4-17-5-0-X-a7d859.txt',
-    'DoD': 'dod_change_tps.txt',
-    'Haring': 'haring_change_tps_12_02_2026.txt',
+    'DoD': 'dod_change_tps_14_02_2026_N=5.txt',
+    'Haring': 'haring_change_tps_14_02_2026_N=5.txt',
 }
 
 # Full benchmark window duration (seconds).
