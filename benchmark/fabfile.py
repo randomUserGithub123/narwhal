@@ -221,8 +221,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 4_000,  # bytes
             "max_batch_delay": 1000,  # ms
-            "lo_size": 200, # number of entries in LocalOrder queue
-            "lo_max_delay": 1000, # ms
+            "lo_size": int(input_rate / 8), # number of entries in LocalOrder queue
+            "lo_max_delay": 100, # ms
             "gamma": 1.0, # batch-OF parameter
             "scc_ordering": "alphabetical", # batch-OF parameter
         }
@@ -395,8 +395,8 @@ def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", si
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 4_000,  # bytes
             "max_batch_delay": 1000,  # ms
-            "lo_size": 200, # number of entries in LocalOrder queue
-            "lo_max_delay": 1000, # ms
+            "lo_size": int(input_rate / 8), # number of entries in LocalOrder queue
+            "lo_max_delay": 200, # ms
             "gamma": 1.0, # batch-OF parameter
             "scc_ordering": "alphabetical", # batch-OF parameter
         }
