@@ -161,11 +161,17 @@ pub struct Authority {
 #[derive(Clone, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
+    #[serde(skip)]
+    gamma: Option<f64>,
 }
 
 impl Import for Committee {}
 
 impl Committee {
+
+    pub fn set_gamma(&mut self, gamma: f64) {
+        self.gamma = Some(gamma);
+    }
 
     /// Return the attacking type.
     pub fn attack_type(&self, name: &PublicKey) -> AttackType {
@@ -191,13 +197,14 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the stake required to reach a quorum (2f+1).
+    /// Returns the stake required to reach a quorum (N-f).
     pub fn quorum_threshold(&self) -> Stake {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (2 N + 3) / 3 = 2f + 1 + (2k + 2)/3 = 2f + 1 + k = N - f
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        3 * total_votes / 4 + 1
-        // 3 * ((total_votes - 1) / 4) + 1
+        let gamma = self.gamma.unwrap_or(1.0);
+        let k = 4.0 / (2.0 * gamma - 1.0);
+        ((k - 1.0) * total_votes as f64 / k + 1.0) as u32
     }
 
     /// Returns the stake required to reach availability (f+1).
@@ -205,8 +212,9 @@ impl Committee {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        (total_votes + 3) / 4
-        // ((total_votes - 1) / 4) + 1
+        let gamma = self.gamma.unwrap_or(1.0);
+        let k = 4.0 / (2.0 * gamma - 1.0);
+        ((total_votes as f64 + (k - 1.0)) / k) as u32
     }
 
     /// Returns the primary addresses of the target primary.
