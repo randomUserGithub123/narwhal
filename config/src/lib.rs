@@ -203,7 +203,7 @@ impl Committee {
         // then (2 N + 3) / 3 = 2f + 1 + (2k + 2)/3 = 2f + 1 + k = N - f
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         let gamma = self.gamma.unwrap_or(1.0);
-        let k = 4.0 / (2.0 * gamma - 1.0);
+        let k = (2.0 * (gamma + 1.0)) / (2.0 * gamma - 1.0);
         ((k - 1.0) * total_votes as f64 / k + 1.0) as u32
     }
 
@@ -213,7 +213,7 @@ impl Committee {
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         let gamma = self.gamma.unwrap_or(1.0);
-        let k = 4.0 / (2.0 * gamma - 1.0);
+        let k = (2.0 * (gamma + 1.0)) / (2.0 * gamma - 1.0);
         ((total_votes as f64 + (k - 1.0)) / k) as u32
     }
 
