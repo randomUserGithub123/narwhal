@@ -313,7 +313,7 @@ impl Worker {
                 rx_header_update,
                 rx_consensus_update,
                 self.committee.size() as u64,
-                self.committee.validity_threshold() as u64,
+                self.parameters.fault_threshold,
                 self.parameters.gamma,
                 self.parameters.scc_ordering.clone(),
                 tx_fair_propose

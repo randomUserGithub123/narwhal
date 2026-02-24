@@ -60,25 +60,28 @@ def local(ctx, debug=True):
             "max_batch_delay": 200,  # ms
             "lo_size": 200, # number of entries in LocalOrder queue
             "lo_max_delay": 100, # ms
-            "gamma": 1.0, # batch-OF parameter
+            "gamma": 1.0, # batch-OF parameter,
+            "scc_ordering": "hamiltonian_cycle", # batch-OF parameter
         }
 
-        node_params.update(
-            {
-                "fault_threshold": int(math.floor(
-                    (bench_params["nodes"] - 1) / 4
-                ))
-            }
-        )
+        k = (2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1)
+        node_params.update({
+            "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
+        })
 
         assert bench_params['faults'] <= node_params['fault_threshold']
 
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
         assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
         assert bench_params['nodes'] > (
-            (4 * node_params['fault_threshold']) /
-            (2 * node_params['gamma'] - 1)
+            k * node_params['fault_threshold']
         )
+
+        assert node_params["scc_ordering"] in [
+            "alphabetical",
+            "hamiltonian_cycle",
+            "ranked_pairs"
+        ]
 
         try:
             filename = PathMaker.local_result_file(
@@ -224,21 +227,17 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "scc_ordering": "hamiltonian_cycle", # batch-OF parameter
         }
 
-        node_params.update(
-            {
-                "fault_threshold": int(math.floor(
-                    (bench_params["nodes"] - 1) / 4
-                ))
-            }
-        )
+        k = (2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1)
+        node_params.update({
+            "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
+        })
 
         assert bench_params['faults'] <= node_params['fault_threshold']
 
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
         assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
         assert bench_params['nodes'] > (
-            (4 * node_params['fault_threshold']) /
-            (2 * node_params['gamma'] - 1)
+            k * node_params['fault_threshold']
         )
 
         assert node_params["scc_ordering"] in [
@@ -398,21 +397,17 @@ def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", si
             "scc_ordering": "alphabetical", # batch-OF parameter
         }
 
-        node_params.update(
-            {
-                "fault_threshold": int(math.floor(
-                    (bench_params["nodes"] - 1) / 4
-                ))
-            }
-        )
+        k = (2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1)
+        node_params.update({
+            "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
+        })
 
         assert bench_params['faults'] <= node_params['fault_threshold']
 
         assert bench_params['workers'] > 1 # One worker has only the task of batch-OF
         assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
         assert bench_params['nodes'] > (
-            (4 * node_params['fault_threshold']) /
-            (2 * node_params['gamma'] - 1)
+            k * node_params['fault_threshold']
         )
 
         assert node_params["scc_ordering"] in [
