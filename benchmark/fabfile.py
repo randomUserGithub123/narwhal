@@ -281,12 +281,14 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
 
         try:
             filename = PathMaker.local_result_file(
+                0,
+                0,
                 faults, 
                 workers,
                 nodes,
             )
             for i in range(runs):
-                print(f"\nDAS run {i}\n")
+                print(f"\nDAS {flavor} run [{i}]\n")
                 ret = OFBench(bench_params, node_params, local, username).run(debug, local=local, flavor=flavor)
                 print(ret.result())
                 assert isinstance(filename, str)
