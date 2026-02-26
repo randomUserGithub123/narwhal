@@ -217,13 +217,13 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
 def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
     ''' Run benchmarks on localhost '''
 
-    for ff, lo_size, gamma, wks, nds, rs, rate in [ #faults, lo_size, gamma, workers, nodes, runs
-        (1, 25, 1.0, 1, 5, 1, 4000),
-        # (1, 50, 1.0, 1, 5, 5, 4000),
-        # (1, 100, 1.0, 1, 5, 5, 4000),
-        # (1, 200, 1.0, 1, 5, 5, 4000),
-        # (1, 400, 1.0, 1, 5, 5, 4000),
-        # (1, 800, 1.0, 1, 5, 5, 4000),
+    for attack_type, arbitragers, ff, lo_size, gamma, wks, nds, rs, rate in [ # attack_type, arbitragers, faults, lo_size, gamma, workers, nodes, runs
+        (0, 1, 1, 25, 1.0, 1, 5, 1, 4000),
+        # (0, 1, 1, 50, 1.0, 1, 5, 5, 4000),
+        # (0, 1, 1, 100, 1.0, 1, 5, 5, 4000),
+        # (0, 1, 1, 200, 1.0, 1, 5, 5, 4000),
+        # (0, 1, 1, 400, 1.0, 1, 5, 5, 4000),
+        # (0, 1, 1, 800, 1.0, 1, 5, 5, 4000),
     ]:
         
         assert gamma > 0.5 and gamma <= 1.0
@@ -235,6 +235,8 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
 
         bench_params = {
             'faults': faults,
+            "arbitragers": arbitragers,  # arbitragers: the number of frontrunning attackers f_a
+            "attack_type": attack_type,  # frontrunning strategies: 0: no attack; 1: fissure; 2: sluggish; 3: speculative; 10: baseline
             'nodes': nodes,
             'workers': workers,
             'rate': rate,
