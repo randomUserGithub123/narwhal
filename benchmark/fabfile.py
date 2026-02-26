@@ -64,7 +64,7 @@ def local(ctx, debug=True):
             "scc_ordering": "hamiltonian_cycle", # batch-OF parameter
         }
 
-        k = (2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1)
+        k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
         node_params.update({
             "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
         })
@@ -145,13 +145,19 @@ def local(ctx, debug=True):
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for attack_type, arbitragers, faults, lo_size, gamma, workers_per_node, nodes, runs, input_rate in [
         # ###### N = 5 - CHANGING lo_size ######
-        (0, 1, 1, 25, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 50, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 100, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 200, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 400, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 800, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, None, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 25, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 50, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 100, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 200, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 400, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 800, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, None, 1.0, 2, 5, 6, 1000),
+        # ###### CHANGING gamma ######
+        # (0, 1, 1, None, 1.0, 2, 5, 6, 4000),
+        # (0, 1, 1, None, 0.9, 2, 6, 6, 4000),
+        # (0, 1, 1, None, 0.8, 2, 7, 6, 4000),
+        # (0, 1, 1, None, 0.7, 2, 10, 6, 4000),
+        (0, 1, 1, None, 0.6, 2, 17, 1, 4000),
         # (0, 1, 1, 25, 1.0, 2, 5, 6, 2000),
         # (0, 1, 1, 50, 1.0, 2, 5, 6, 2000),
         # (0, 1, 1, 100, 1.0, 2, 5, 6, 2000),
@@ -252,7 +258,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "scc_ordering": "hamiltonian_cycle", # batch-OF parameter
         }
 
-        k = (2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1)
+        k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
         node_params.update({
             "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
         })
@@ -338,27 +344,19 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
 def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", site="luxembourg"):
     for attack_type, arbitragers, faults, lo_size, gamma, workers_per_node, nodes, runs, input_rate in [
         # ###### N = 5 - CHANGING lo_size ######
-        (0, 1, 1, 25, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 50, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 100, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 200, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 400, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, 800, 1.0, 2, 5, 6, 1000),
-        (0, 1, 1, None, 1.0, 2, 5, 6, 1000),
-        # (0, 1, 1, 25, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, 50, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, 100, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, 200, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, 400, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, 800, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, None, 1.0, 2, 5, 6, 2000),
-        # (0, 1, 1, 25, 1.0, 2, 5, 6, 4000),
-        # (0, 1, 1, 50, 1.0, 2, 5, 6, 4000),
-        # (0, 1, 1, 100, 1.0, 2, 5, 6, 4000),
-        # (0, 1, 1, 200, 1.0, 2, 5, 6, 4000),
-        # (0, 1, 1, 400, 1.0, 2, 5, 6, 4000),
-        # (0, 1, 1, 800, 1.0, 2, 5, 6, 4000),
-        # (0, 1, 1, None, 1.0, 2, 5, 6, 4000),
+        # (0, 1, 1, 25, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 50, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 100, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 200, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 400, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, 800, 1.0, 2, 5, 6, 1000),
+        # (0, 1, 1, None, 1.0, 2, 5, 6, 1000),
+        # ###### CHANGING gamma ######
+        (0, 1, 1, None, 1.0, 2, 5, 6, 4000),
+        (0, 1, 1, None, 0.9, 2, 6, 6, 4000),
+        (0, 1, 1, None, 0.8, 2, 7, 6, 4000),
+        (0, 1, 1, None, 0.7, 2, 10, 6, 4000),
+        (0, 1, 1, None, 0.6, 2, 17, 6, 4000),
         # ###### N = 5 - CHANGING TPS ######
         # (0, 1, 1, 100, 1.0, 2, 5, 6, 500),
         # (0, 1, 1, 100, 1.0, 2, 5, 6, 1000),
@@ -445,7 +443,7 @@ def grid5000(ctx, debug=True, console=False, build=True, username="jdecouch", si
             "scc_ordering": "hamiltonian_cycle", # batch-OF parameter
         }
 
-        k = (2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1)
+        k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
         node_params.update({
             "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
         })

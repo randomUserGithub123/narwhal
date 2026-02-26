@@ -353,9 +353,10 @@ impl GlobalOrder {
         scc_ordering: String,
         tx_fair_propose: tokio::sync::mpsc::Sender<(u64, Vec<u16>, Vec<Digest>, Vec<u32>)>,
     ) -> Self {
-        let non_blank_threshold =
-            ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u16;
+        
         let solid_threshold = (n - 2 * f) as u16;
+        let non_blank_threshold = (((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0) * 1e10).round() / 1e10;
+        let non_blank_threshold = non_blank_threshold.floor() as u16;
 
         let (tx_utig_results, rx_utig_results) = tokio::sync::mpsc::channel(1024);
         let (tx_auncel_results, rx_auncel_results) = tokio::sync::mpsc::channel(1024);
