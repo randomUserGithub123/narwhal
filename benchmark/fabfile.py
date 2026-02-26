@@ -214,32 +214,20 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             Print.error(e)
 
 @task
-def of(ctx, debug=True, local=False, username="jdecouch", flavor="hotstuff"):
+def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
     ''' Run benchmarks on localhost '''
 
-    for ff, wks, nds, rs, rate in [ #faults, workers, nodes, runs
-        (0,1,16,10,500),
-        (0,1,16,10,1_500),
-        (0,1,16,10,2_500),
-        (0,1,16,10,3_500),
-        (0,1,16,10,4_500),
-        (0,1,16,10,5_500),
-        (0,1,16,10,6_500),
-        (0,1,16,10,7_500),
-        (0,1,16,10,8_500),
-        (0,1,16,10,9_500),
-        (0,1,16,10,1_000),
-        (0,1,16,10,2_000),
-        (0,1,16,10,3_000),
-        (0,1,16,10,4_000),
-        (0,1,16,10,5_000),
-        (0,1,16,10,6_000),
-        (0,1,16,10,7_000),
-        (0,1,16,10,8_000),
-        (0,1,16,10,9_000),
-        (0,1,16,10,10_000),
-
+    for ff, lo_size, gamma, wks, nds, rs, rate in [ #faults, lo_size, gamma, workers, nodes, runs
+        (1, 25, 1.0, 1, 5, 1, 4000),
+        # (1, 50, 1.0, 1, 5, 5, 4000),
+        # (1, 100, 1.0, 1, 5, 5, 4000),
+        # (1, 200, 1.0, 1, 5, 5, 4000),
+        # (1, 400, 1.0, 1, 5, 5, 4000),
+        # (1, 800, 1.0, 1, 5, 5, 4000),
     ]:
+        
+        assert gamma > 0.5 and gamma <= 1.0
+
         runs = rs  
         faults = ff  
         workers = wks
@@ -261,9 +249,9 @@ def of(ctx, debug=True, local=False, username="jdecouch", flavor="hotstuff"):
             'sync_retry_nodes': 3,  # number of nodes
             'batch_size': 4_000,  # bytes
             'max_batch_delay': 1000,  # ms
-            "lo_size": 100, # number of entries in LocalOrder queue
+            "lo_size": lo_size, # number of entries in LocalOrder queue
             "lo_max_delay": 200, # ms
-            "gamma": 1.0, # batch-OF parameter
+            "gamma": gamma, # batch-OF parameter
         }
 
         node_params.update(
