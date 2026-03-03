@@ -119,12 +119,29 @@ def local(ctx, debug=True):
 @task
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for attack_type, arbitragers, batch_size, faults, workers_per_node, nodes, runs, input_rate in [
-        (0, 1, 25, 0, 1, 4, 5, 4000),
-        (0, 1, 50, 0, 1, 4, 5, 4000),
-        (0, 1, 100, 0, 1, 4, 5, 4000),
-        (0, 1, 200, 0, 1, 4, 5, 4000),
-        (0, 1, 400, 0, 1, 4, 5, 4000),
-        (0, 1, 800, 0, 1, 4, 5, 4000),
+        # (0, 1, 25, 0, 1, 4, 5, 4000),
+        # (0, 1, 50, 0, 1, 4, 5, 4000),
+        # (0, 1, 100, 0, 1, 4, 5, 4000),
+        # (0, 1, 200, 0, 1, 4, 5, 4000),
+        # (0, 1, 400, 0, 1, 4, 5, 4000),
+        # (0, 1, 800, 0, 1, 4, 5, 4000),
+        ### Chaning input_rate ###
+        (0, 1, 4_000, 1, 1, 4, 5, 500),
+        (0, 1, 4_000, 1, 1, 4, 5, 1000),
+        (0, 1, 4_000, 1, 1, 4, 5, 1500),
+        (0, 1, 4_000, 1, 1, 4, 5, 2000),
+        (0, 1, 4_000, 1, 1, 4, 5, 2500),
+        (0, 1, 4_000, 1, 1, 4, 5, 3000),
+        (0, 1, 4_000, 1, 1, 4, 5, 3500),
+        (0, 1, 4_000, 1, 1, 4, 5, 4000),
+        (0, 1, 4_000, 1, 1, 4, 5, 4500),
+        (0, 1, 4_000, 1, 1, 4, 5, 5000),
+        (0, 1, 4_000, 1, 1, 4, 5, 5500),
+        (0, 1, 4_000, 1, 1, 4, 5, 6000),
+        (0, 1, 4_000, 1, 1, 4, 5, 6500),
+        (0, 1, 4_000, 1, 1, 4, 5, 7000),
+        (0, 1, 4_000, 1, 1, 4, 5, 7500),
+        (0, 1, 4_000, 1, 1, 4, 5, 8000),
     ]:
         
         assert attack_type in [
@@ -149,9 +166,9 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         }
         node_params = {
             "header_size": 512,  # bytes
-            "max_header_delay": 200,  # ms
+            "max_header_delay": 2000,  # ms
             "gc_depth": 50,  # rounds
-            "sync_retry_delay": 10_000,  # ms
+            "sync_retry_delay": 5_000,  # ms
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": batch_size,  # bytes
             "max_batch_delay": 1000,  # ms
