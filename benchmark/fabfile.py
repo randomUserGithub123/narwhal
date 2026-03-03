@@ -118,15 +118,13 @@ def local(ctx, debug=True):
 
 @task
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
-    for attack_type, arbitragers, faults, workers_per_node, nodes, runs in [
-        (1, 1, 0, 1, 4, 1),
-        (2, 1, 0, 1, 4, 1),
-        (3, 1, 0, 1, 4, 1),
-        (10, 1, 0, 1, 4, 1),
-        (1, 3, 0, 1, 10, 1),
-        (2, 3, 0, 1, 10, 1),
-        (3, 3, 0, 1, 10, 1),
-        (10, 3, 0, 1, 10, 1),
+    for attack_type, arbitragers, batch_size, faults, workers_per_node, nodes, runs, input_rate in [
+        (0, 1, 25, 0, 1, 4, 5, 4000),
+        (0, 1, 50, 0, 1, 4, 5, 4000),
+        (0, 1, 100, 0, 1, 4, 5, 4000),
+        (0, 1, 200, 0, 1, 4, 5, 4000),
+        (0, 1, 400, 0, 1, 4, 5, 4000),
+        (0, 1, 800, 0, 1, 4, 5, 4000),
     ]:
         
         assert attack_type in [
@@ -144,19 +142,19 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "attack_type": attack_type,  # frontrunning strategies: 0: no attack; 1: fissure; 2: sluggish; 3: speculative; 10: baseline
             'nodes': nodes,
             'workers': workers_per_node,
-            'rate': 10_000,
-            'tx_size': 512,
+            'rate': input_rate,
+            'tx_size': 128,
             'duration': 60,
-            "collocate": False,
+            "collocate": True,
         }
         node_params = {
-            "header_size": 1_000,  # bytes
+            "header_size": 512,  # bytes
             "max_header_delay": 200,  # ms
             "gc_depth": 50,  # rounds
             "sync_retry_delay": 10_000,  # ms
             "sync_retry_nodes": 3,  # number of nodes
-            "batch_size": 500_000,  # bytes
-            "max_batch_delay": 200,  # ms
+            "batch_size": batch_size,  # bytes
+            "max_batch_delay": 1000,  # ms
         }
         if console:
             os.system('export RUSTFLAGS="--cfg tokio_unstable"')
