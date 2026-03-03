@@ -226,6 +226,9 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
         
         assert gamma > 0.5 and gamma <= 1.0
 
+        if lo_size is None:
+            lo_size = int(rate / 8)
+
         runs = rs  
         faults = ff  
         workers = wks
