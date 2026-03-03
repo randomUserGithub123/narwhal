@@ -216,12 +216,26 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
     ''' Run benchmarks on localhost '''
 
     for attack_type, arbitragers, ff, lo_size, gamma, wks, nds, rs, rate in [ # attack_type, arbitragers, faults, lo_size, gamma, workers, nodes, runs
-        (0, 1, 1, 25, 1.0, 1, 5, 1, 4000),
+        #### Change lo_size ######
+        # (0, 1, 1, 25, 1.0, 1, 5, 1, 4000),
         # (0, 1, 1, 50, 1.0, 1, 5, 5, 4000),
         # (0, 1, 1, 100, 1.0, 1, 5, 5, 4000),
         # (0, 1, 1, 200, 1.0, 1, 5, 5, 4000),
         # (0, 1, 1, 400, 1.0, 1, 5, 5, 4000),
         # (0, 1, 1, 800, 1.0, 1, 5, 5, 4000),
+        #### Change input_rate #####
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 500),
+        (0, 1, 1, None, 1.0, 1, 5, 1, 1000),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 1500),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 2000),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 2500),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 3000),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 3500),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 4000),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 4500),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 5000),
+        # (0, 1, 1, None, 1.0, 1, 5, 1, 5500),
+        #### Change N #####
     ]:
         
         assert gamma > 0.5 and gamma <= 1.0
