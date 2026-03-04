@@ -370,6 +370,11 @@ class BenchParameters:
             else:
                 self.collocate = True
 
+            if 'tx_redundancy' in json:
+                self.tx_redundancy = int(json['tx_redundancy'])
+            else:
+                self.tx_redundancy = None
+
             self.tx_size = int(json['tx_size'])
            
             self.duration = int(json['duration'])
