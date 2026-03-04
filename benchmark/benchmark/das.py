@@ -18,7 +18,7 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
-BANNED_NODES = ["node009", "node018", "node021", "node034", "node056"]
+BANNED_NODES = ["node009", "node014", "node018", "node021", "node034", "node056"]
 
 class DASBench:
     BASE_PORT = 4000
@@ -207,6 +207,7 @@ class DASBench:
                     self.tx_size,
                     rate_share,
                     worker_list,
+                    self.tx_redundancy
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 print(f"Launching client on {clients_hostnames[i // 4]}")

@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
+        .args_from_usage("--redundancy=<INT> 'Number of nodes to send each tx to (subset of targets)'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
 
@@ -56,6 +57,12 @@ async fn main() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()
         .context("Invalid socket address format")?;
 
+    let tx_redundancy = matches
+        .value_of("redundancy")
+        .unwrap()
+        .parse::<usize>()
+        .context("The redundancy must be a non-negative integer")?;
+
     info!("Node addresses: {:?}", targets);
 
     // NOTE: This log entry is used to compute performance.
@@ -64,11 +71,14 @@ async fn main() -> Result<()> {
     // NOTE: This log entry is used to compute performance.
     info!("Transactions rate: {} tx/s", rate);
 
+    info!("tx_redundancy: {}", tx_redundancy);
+
     let client = Client {
         targets,
         size,
         rate,
         nodes,
+        tx_redundancy,
     };
 
     // Wait for all nodes to be online and synchronized.
@@ -83,6 +93,7 @@ struct Client {
     size: usize,
     rate: u64,
     nodes: Vec<SocketAddr>,
+    tx_redundancy: usize,
 }
 
 impl Client {
@@ -144,7 +155,7 @@ impl Client {
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
                 transports.shuffle(&mut rng);
-                for transport in &mut transports {
+                for transport in &mut transports[..self.tx_redundancy] {
                     let dst_addr = {
                         if let Ok(a) = transport.get_ref().peer_addr() {
                             a
