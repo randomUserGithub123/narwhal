@@ -371,7 +371,7 @@ class BenchParameters:
                 self.collocate = True
 
             if 'tx_redundancy' in json:
-                self.tx_redundancy = int(json['tx_redundancy'])
+                self.tx_redundancy = int(json['tx_redundancy']) if json['tx_redundancy'] is not None else None
             else:
                 self.tx_redundancy = None
 
