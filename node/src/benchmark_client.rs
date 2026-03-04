@@ -129,6 +129,9 @@ impl Client {
             let now = Instant::now();
 
             for x in 0..burst {
+
+                info!("Sending tx");
+
                 if x == (counter - starting_counter) % burst {
                     // NOTE: This log entry is used to compute performance.
                     info!("Sending sample transaction {}", counter);
