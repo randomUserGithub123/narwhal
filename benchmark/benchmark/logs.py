@@ -10,6 +10,11 @@ from collections import defaultdict
 from benchmark.utils import Print
 
 
+def _to_posix(string):
+    x = datetime.fromisoformat(string.replace('Z', '+00:00'))
+    return datetime.timestamp(x)
+
+
 class ParseError(Exception):
     pass
 
@@ -108,14 +113,16 @@ class LogParser:
     # Merge helpers
     # ------------------------------------------------------------------
 
-    def _merge_dicts(self, input):
+    @staticmethod
+    def _merge_dicts(input):
         merged_dict = defaultdict(list)
         for d in input:
             for k, v in d.items():
                 merged_dict[k].append(v)
         return dict(merged_dict)
 
-    def _merge_results(self, input):
+    @staticmethod
+    def _merge_results(input):
         # Keep the earliest timestamp.
         merged = {}
         for x in input:
@@ -124,7 +131,8 @@ class LogParser:
                     merged[k] = v
         return merged
 
-    def _merge_blocks_to_heights(self, input):
+    @staticmethod
+    def _merge_blocks_to_heights(input):
         merged = {}
         for x in input:
             for block, height in x:
@@ -132,7 +140,8 @@ class LogParser:
                     merged[block] = int(height)
         return merged
 
-    def _merge_monitor(self, input):
+    @staticmethod
+    def _merge_monitor(input):
         merged = {}
         for x in input:
             for victim_header, attack_header in x:
@@ -140,7 +149,8 @@ class LogParser:
                     merged[victim_header] = attack_header
         return merged
 
-    def _merge_frontrun_attack(self, input):
+    @staticmethod
+    def _merge_frontrun_attack(input):
         merged = {}
         for x in input:
             for victim_header, attack_header in x:
@@ -157,35 +167,22 @@ class LogParser:
         rate = int(search(r"Transactions rate: (\d+)", log).group(1))
 
         tmp = search(r"\[(.*Z) .* Start ", log).group(1)
-        start = self._to_posix(tmp)
+        start = _to_posix(tmp)
 
         misses = len(findall(r"rate too high", log))
 
-        # Changed: match ALL transactions, not just samples
         tmp = findall(r"\[(.*Z) .* Sending transaction (\d+)", log)
-        samples = {int(s): self._to_posix(t) for t, s in tmp}
+        samples = {int(s): _to_posix(t) for t, s in tmp}
 
         return size, rate, start, misses, samples
 
-    def _parse_workers(self, log):
-        tmp = findall(r"Batch ([^ ]+) contains (\d+) B", log)
-        sizes = {d: int(s) for d, s in tmp}
-
-        # Changed: match "contains tx" instead of "contains sample tx"
-        tmp = findall(r"Batch ([^ ]+) contains tx (\d+)", log)
-        samples = {int(s): d for d, s in tmp}
-
-        ip = search(r"booted on (\d+.\d+.\d+.\d+)", log).group(1)
-
-        return sizes, samples, ip
-
     def _parse_primaries(self, log):
         tmp = findall(r"\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)", log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        tmp = [(d, _to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
         tmp = findall(r"\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)", log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        tmp = [(d, _to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
         tmp = findall(r"\[(.*Z) .* FairDag Committed ([^ ]+) in height (\d+)", log)
@@ -256,6 +253,17 @@ class LogParser:
             speculative_attacks,
         )
 
+    def _parse_workers(self, log):
+        tmp = findall(r"Batch ([^ ]+) contains (\d+) B", log)
+        sizes = {d: int(s) for d, s in tmp}
+
+        tmp = findall(r"Batch ([^ ]+) contains tx (\d+)", log)
+        samples = {int(s): d for d, s in tmp}
+
+        ip = search(r"booted on (\d+.\d+.\d+.\d+)", log).group(1)
+
+        return sizes, samples, ip
+
     # ------------------------------------------------------------------
     # Attack results
     # ------------------------------------------------------------------
@@ -290,68 +298,45 @@ class LogParser:
         return self._attack_results(self.speculative_attacks)
 
     # ------------------------------------------------------------------
-    # Throughput & latency — based on unique committed transactions
+    # Throughput & latency — direct counting of all transactions
     # ------------------------------------------------------------------
     #
-    # Strategy:
-    #   We use the *sample transactions* as ground truth.  For every
-    #   sample tx we know:
-    #     • when the client sent it           (all_sent_samples)
-    #     • which batch(es) it landed in      (all_received_samples)
-    #     • when each batch was committed      (commits)
+    # Since we now log every transaction, we know for each tx:
+    #   • when the client sent it              (all_sent_samples)
+    #   • which batch(es) it landed in         (all_received_samples)
+    #   • when each batch was committed        (commits)
     #
-    #   A sample tx counts as "uniquely committed" when at least one of
-    #   its batches appears in self.commits.
-    #
-    #   Throughput  =  unique_committed_samples / duration
-    #                  (scaled up to the full tx population)
-    #
-    #   Latency     =  mean over committed samples of
-    #                     (earliest_commit_of_any_batch − send_time)
-    #
+    # A tx is "committed" when at least one of its batches is committed.
+    # We count each tx only once (unique).
     # ------------------------------------------------------------------
 
-    def _committed_sample_stats(self):
+    def _committed_tx_stats(self):
         """
-        Walk every sample transaction and compute:
-          • committed_count   – number of unique sample txs that were committed
-          • total_count       – total sample txs tracked
-          • per-tx latencies  – list of (earliest_commit − send_time) values
+        Walk every transaction and return:
+          • committed_count  – unique txs that were committed
+          • latencies        – list of (earliest_commit − send_time) per committed tx
         """
         committed_count = 0
-        total_count = 0
         latencies = []
 
         for tx_id, batch_ids in self.all_received_samples.items():
             if tx_id not in self.all_sent_samples:
                 continue
-            total_count += 1
             send_time = self.all_sent_samples[tx_id]
 
-            # Collect commit times of every batch that holds this tx
             commit_times = [
                 self.commits[b] for b in batch_ids if b in self.commits
             ]
             if commit_times:
                 committed_count += 1
-                earliest = min(commit_times)
-                latencies.append(earliest - send_time)
+                latencies.append(min(commit_times) - send_time)
 
-        return committed_count, total_count, latencies
+        return committed_count, latencies
 
     # ---- Consensus (proposal → commit) ----
 
     def _consensus_throughput(self):
-        """
-        Unique committed transactions per second measured over the
-        consensus window (first proposal → last commit).
-
-        We derive unique tx count from committed sample ratio:
-            total_committed_txs ≈ (committed_samples / total_samples)
-                                   × total_txs_in_committed_batches
-        where total_txs_in_committed_batches = sum(sizes) / tx_size.
-        """
-        if not self.commits or not self.sizes:
+        if not self.commits:
             return 0, 0, 0
 
         start = min(self.proposals.values())
@@ -360,23 +345,12 @@ class LogParser:
         if duration <= 0:
             return 0, 0, 0
 
-        committed_samples, total_samples, _ = self._committed_sample_stats()
-        if total_samples == 0:
-            return 0, 0, 0
-
-        commit_ratio = committed_samples / total_samples
-        total_txs_in_batches = sum(self.sizes.values()) / self.size[0]
-        unique_txs = total_txs_in_batches * commit_ratio
-
-        tps = unique_txs / duration
+        committed_count, _ = self._committed_tx_stats()
+        tps = committed_count / duration
         bps = tps * self.size[0]
         return tps, bps, duration
 
     def _consensus_latency(self):
-        """
-        Per-batch latency: proposal time → earliest commit time.
-        Average over all committed batches.
-        """
         latency = []
         for batch_digest, commit_time in self.commits.items():
             if batch_digest in self.proposals:
@@ -386,13 +360,7 @@ class LogParser:
     # ---- End-to-end (client send → commit) ----
 
     def _end_to_end_throughput(self):
-        """
-        Unique committed transactions per second measured over the
-        end-to-end window (earliest client start → last commit).
-
-        Same unique-tx derivation as consensus throughput.
-        """
-        if not self.commits or not self.sizes:
+        if not self.commits:
             return 0, 0, 0
 
         start = min(self.start)
@@ -401,28 +369,13 @@ class LogParser:
         if duration <= 0:
             return 0, 0, 0
 
-        committed_samples, total_samples, _ = self._committed_sample_stats()
-        if total_samples == 0:
-            return 0, 0, 0
-
-        commit_ratio = committed_samples / total_samples
-        total_txs_in_batches = sum(self.sizes.values()) / self.size[0]
-        unique_txs = total_txs_in_batches * commit_ratio
-
-        tps = unique_txs / duration
+        committed_count, _ = self._committed_tx_stats()
+        tps = committed_count / duration
         bps = tps * self.size[0]
         return tps, bps, duration
 
     def _end_to_end_latency(self):
-        """
-        For every sample transaction:
-          • start   = timestamp the client sent it
-          • end     = EARLIEST commit time among all batches containing it
-          • latency = end − start
-
-        Return the average over all committed sample transactions.
-        """
-        _, _, latencies = self._committed_sample_stats()
+        _, latencies = self._committed_tx_stats()
         return mean(latencies) if latencies else 0
 
     # ------------------------------------------------------------------
