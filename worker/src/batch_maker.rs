@@ -103,16 +103,15 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
 
-        // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
+        // Gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]
         let tx_ids: Vec<_> = self
             .current_batch
             .iter()
-            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
+            .filter(|tx| tx.len() > 8)
             .filter_map(|tx| tx[1..9].try_into().ok())
             .collect();
 
-        // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
@@ -120,23 +119,18 @@ impl BatchMaker {
 
         #[cfg(feature = "benchmark")]
         {
-            // NOTE: This is one extra hash that is only needed to print the following log entries.
             let digest = Digest(
                 Sha512::digest(&serialized)[..32]
                     .try_into()
                     .unwrap(),
             );
-
             for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
                 info!(
-                    "Batch {:?} contains sample tx {}",
+                    "Batch {:?} contains tx {}",
                     digest,
                     u64::from_be_bytes(id)
                 );
             }
-
-            // NOTE: This log entry is used to compute performance.
             info!("Batch {:?} contains {} B", digest, size);
         }
 

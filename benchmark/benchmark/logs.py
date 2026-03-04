@@ -26,7 +26,7 @@ class LogParser:
         self.faults = faults
         if isinstance(faults, int):
             self.committee_size = len(primaries) + int(faults)
-            self.workers =  len(workers) // len(primaries)
+            self.workers = len(workers) // len(primaries)
         else:
             self.committee_size = '?'
             self.workers = '?'
@@ -43,7 +43,6 @@ class LogParser:
 
         # self.sent_samples is a tuple of dictionaries. each element is for one client
         # each dictionary has sample_tx id -> timestamp, used for throughput/latencies
-
         self.all_sent_samples = {}
         for d in self.sent_samples:
             self.all_sent_samples.update(d)
@@ -81,9 +80,6 @@ class LogParser:
             [x.items() for x in speculative_attacks]
         )
 
-        # self.proposals stores for each batch the creation time of the block containing it
-        # self.commits has the earliest commit time for each batch
-
         # Parse the workers logs.
         try:
             with Pool() as p:
@@ -95,12 +91,9 @@ class LogParser:
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
-        # self.received_samples is a tuple, for each worker it contains the batch in which it placed a specific sample transaction
-        # transactions maybe duplicated and may not be in every worker
-
+        # self.received_samples: for each worker, maps sample_tx_id -> batch_digest
+        # transactions may be duplicated across workers
         self.all_received_samples = self._merge_dicts(self.received_samples)
-
-        self._avg_redundancy() # this saves it into self.avg_redundancy
 
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
@@ -111,12 +104,15 @@ class LogParser:
                 f'Clients missed their target rate {self.misses:,} time(s)'
             )
 
+    # ------------------------------------------------------------------
+    # Merge helpers
+    # ------------------------------------------------------------------
+
     def _merge_dicts(self, input):
         merged_dict = defaultdict(list)
         for d in input:
             for k, v in d.items():
                 merged_dict[k].append(v)
-        
         return dict(merged_dict)
 
     def _merge_results(self, input):
@@ -124,41 +120,39 @@ class LogParser:
         merged = {}
         for x in input:
             for k, v in x:
-                if not k in merged or merged[k] > v:
+                if k not in merged or merged[k] > v:
                     merged[k] = v
         return merged
-    
-    # merged[block] = committing_height
+
     def _merge_blocks_to_heights(self, input):
         merged = {}
         for x in input:
             for block, height in x:
-                if not height in merged:
+                if block not in merged:
                     merged[block] = int(height)
         return merged
 
-    # merged[victim_header] = attacking_header
     def _merge_monitor(self, input):
         merged = {}
         for x in input:
             for victim_header, attack_header in x:
-                if not victim_header in merged:
+                if victim_header not in merged:
                     merged[victim_header] = attack_header
         return merged
 
-    # merged[victim_header] = attacking_header
     def _merge_frontrun_attack(self, input):
         merged = {}
         for x in input:
             for victim_header, attack_header in x:
-                if not victim_header in merged:
+                if victim_header not in merged:
                     merged[victim_header] = attack_header
         return merged
 
-    def _parse_clients(self, log):
-        # if search(r"Error", log) is not None:
-        #     raise ParseError("Client(s) panicked")
+    # ------------------------------------------------------------------
+    # Log parsers
+    # ------------------------------------------------------------------
 
+    def _parse_clients(self, log):
         size = int(search(r"Transactions size: (\d+)", log).group(1))
         rate = int(search(r"Transactions rate: (\d+)", log).group(1))
 
@@ -167,15 +161,25 @@ class LogParser:
 
         misses = len(findall(r"rate too high", log))
 
-        tmp = findall(r"\[(.*Z) .* sample transaction (\d+)", log)
+        # Changed: match ALL transactions, not just samples
+        tmp = findall(r"\[(.*Z) .* Sending transaction (\d+)", log)
         samples = {int(s): self._to_posix(t) for t, s in tmp}
 
         return size, rate, start, misses, samples
 
-    def _parse_primaries(self, log):
-        # if search(r"(?:panicked|Error)", log) is not None:
-        #     raise ParseError("Primary(s) panicked")
+    def _parse_workers(self, log):
+        tmp = findall(r"Batch ([^ ]+) contains (\d+) B", log)
+        sizes = {d: int(s) for d, s in tmp}
 
+        # Changed: match "contains tx" instead of "contains sample tx"
+        tmp = findall(r"Batch ([^ ]+) contains tx (\d+)", log)
+        samples = {int(s): d for d, s in tmp}
+
+        ip = search(r"booted on (\d+.\d+.\d+.\d+)", log).group(1)
+
+        return sizes, samples, ip
+
+    def _parse_primaries(self, log):
         tmp = findall(r"\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)", log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
@@ -184,12 +188,10 @@ class LogParser:
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
-        # record the committing heights of certificates (blocks)
         tmp = findall(r"\[(.*Z) .* FairDag Committed ([^ ]+) in height (\d+)", log)
         tmp = [(header, height) for t, header, height in tmp]
         blocks_to_heights = self._merge_blocks_to_heights([tmp])
 
-        # (for comparison) test the successful rate of front-running without attacking strategies
         tmp = findall(
             r"\[(.*Z) .* FairDag Monitor attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
             log,
@@ -220,7 +222,6 @@ class LogParser:
         ]
         sluggish_attacks = self._merge_frontrun_attack([tmp])
 
-        # test the effectiveness of speculative front-running attack
         tmp = findall(
             r"\[(.*Z) .* FairDag Created a speculative attacking header ([^ ]+), victim header ([^ ]+), in round (\d+)",
             log,
@@ -230,7 +231,6 @@ class LogParser:
             for t, attack_header, victim_header, round in tmp
         ]
         speculative_attacks = self._merge_frontrun_attack([tmp])
-        # print("speculative_attacks is ", speculative_attacks)
 
         configs = {
             "header_size": int(search(r"Header size .* (\d+)", log).group(1)),
@@ -256,149 +256,178 @@ class LogParser:
             speculative_attacks,
         )
 
-    def _parse_workers(self, log):
-        # if search(r"(?:panic|Error)", log) is not None:
-        #     raise ParseError("Worker(s) panicked")
+    # ------------------------------------------------------------------
+    # Attack results
+    # ------------------------------------------------------------------
 
-        tmp = findall(r"Batch ([^ ]+) contains (\d+) B", log)
-        sizes = {d: int(s) for d, s in tmp}
-
-        tmp = findall(r"Batch ([^ ]+) contains sample tx (\d+)", log)
-        samples = {int(s): d for d, s in tmp}
-
-        ip = search(r"booted on (\d+.\d+.\d+.\d+)", log).group(1)
-
-        return sizes, samples, ip
-
-    def _to_posix(self, string):
-        x = datetime.fromisoformat(string.replace('Z', '+00:00'))
-        return datetime.timestamp(x)
-    
-    def _attack_monitor_results(self):
-        # attack_num = len(self.monitor_attacks)
+    def _attack_results(self, attack_dict):
+        """Generic helper: count committed attacks and successes."""
         attack_num = 0
         succ_num = 0
-        for victim_header, attacking_header in self.monitor_attacks.items():
+        for victim_header, attacking_header in attack_dict.items():
             if (
                 victim_header in self.blocks_to_heights
                 and attacking_header in self.blocks_to_heights
             ):
-                # only consider both the victim and attacking blocks are committed
                 attack_num += 1
                 if (
                     self.blocks_to_heights[victim_header]
                     > self.blocks_to_heights[attacking_header]
                 ):
-                    # attacking successfully
                     succ_num += 1
         return succ_num, attack_num
+
+    def _attack_monitor_results(self):
+        return self._attack_results(self.monitor_attacks)
 
     def _fissure_attack_results(self):
-        # attack_num = len(self.fissure_attacks)
-        attack_num = 0
-        succ_num = 0
-        for victim_header, attacking_header in self.fissure_attacks.items():
-            if (
-                victim_header in self.blocks_to_heights
-                and attacking_header in self.blocks_to_heights
-            ):
-                attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
-                    succ_num += 1
-        return succ_num, attack_num
+        return self._attack_results(self.fissure_attacks)
 
     def _sluggish_attack_results(self):
-        # attack_num = len(self.sluggish_attacks)
-        attack_num = 0
-        succ_num = 0
-        for victim_header, attacking_header in self.sluggish_attacks.items():
-            if (
-                victim_header in self.blocks_to_heights
-                and attacking_header in self.blocks_to_heights
-            ):
-                attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
-                    succ_num += 1
-        return succ_num, attack_num
+        return self._attack_results(self.sluggish_attacks)
 
     def _speculative_attack_results(self):
-        # attack_num = len(self.speculative_attacks)
-        attack_num = 0
-        succ_num = 0
-        for victim_header, attacking_header in self.speculative_attacks.items():
-            if (
-                victim_header in self.blocks_to_heights
-                and attacking_header in self.blocks_to_heights
-            ):
-                attack_num += 1
-                if (
-                    self.blocks_to_heights[victim_header]
-                    > self.blocks_to_heights[attacking_header]
-                ):
-                    # attacking successfully
-                    succ_num += 1
-        return succ_num, attack_num
+        return self._attack_results(self.speculative_attacks)
+
+    # ------------------------------------------------------------------
+    # Throughput & latency — based on unique committed transactions
+    # ------------------------------------------------------------------
+    #
+    # Strategy:
+    #   We use the *sample transactions* as ground truth.  For every
+    #   sample tx we know:
+    #     • when the client sent it           (all_sent_samples)
+    #     • which batch(es) it landed in      (all_received_samples)
+    #     • when each batch was committed      (commits)
+    #
+    #   A sample tx counts as "uniquely committed" when at least one of
+    #   its batches appears in self.commits.
+    #
+    #   Throughput  =  unique_committed_samples / duration
+    #                  (scaled up to the full tx population)
+    #
+    #   Latency     =  mean over committed samples of
+    #                     (earliest_commit_of_any_batch − send_time)
+    #
+    # ------------------------------------------------------------------
+
+    def _committed_sample_stats(self):
+        """
+        Walk every sample transaction and compute:
+          • committed_count   – number of unique sample txs that were committed
+          • total_count       – total sample txs tracked
+          • per-tx latencies  – list of (earliest_commit − send_time) values
+        """
+        committed_count = 0
+        total_count = 0
+        latencies = []
+
+        for tx_id, batch_ids in self.all_received_samples.items():
+            if tx_id not in self.all_sent_samples:
+                continue
+            total_count += 1
+            send_time = self.all_sent_samples[tx_id]
+
+            # Collect commit times of every batch that holds this tx
+            commit_times = [
+                self.commits[b] for b in batch_ids if b in self.commits
+            ]
+            if commit_times:
+                committed_count += 1
+                earliest = min(commit_times)
+                latencies.append(earliest - send_time)
+
+        return committed_count, total_count, latencies
+
+    # ---- Consensus (proposal → commit) ----
 
     def _consensus_throughput(self):
-        if not self.commits:
-            return 0, 0, 0
-        start, end = min(self.proposals.values()), max(self.commits.values())
-        duration = end - start
-        # this is all bytes, but does not consider redundancy. we compute on average how many times is each sample transaction repeated and divide by that
-        bytes = sum(self.sizes.values()) / self.avg_redundancy
+        """
+        Unique committed transactions per second measured over the
+        consensus window (first proposal → last commit).
 
-        bps = bytes / duration
-        tps = bps / self.size[0]
+        We derive unique tx count from committed sample ratio:
+            total_committed_txs ≈ (committed_samples / total_samples)
+                                   × total_txs_in_committed_batches
+        where total_txs_in_committed_batches = sum(sizes) / tx_size.
+        """
+        if not self.commits or not self.sizes:
+            return 0, 0, 0
+
+        start = min(self.proposals.values())
+        end = max(self.commits.values())
+        duration = end - start
+        if duration <= 0:
+            return 0, 0, 0
+
+        committed_samples, total_samples, _ = self._committed_sample_stats()
+        if total_samples == 0:
+            return 0, 0, 0
+
+        commit_ratio = committed_samples / total_samples
+        total_txs_in_batches = sum(self.sizes.values()) / self.size[0]
+        unique_txs = total_txs_in_batches * commit_ratio
+
+        tps = unique_txs / duration
+        bps = tps * self.size[0]
         return tps, bps, duration
 
     def _consensus_latency(self):
-        latency = [c - self.proposals[d] for d, c in self.commits.items()]
+        """
+        Per-batch latency: proposal time → earliest commit time.
+        Average over all committed batches.
+        """
+        latency = []
+        for batch_digest, commit_time in self.commits.items():
+            if batch_digest in self.proposals:
+                latency.append(commit_time - self.proposals[batch_digest])
         return mean(latency) if latency else 0
 
-    def _end_to_end_throughput(self):
-        if not self.commits:
-            return 0, 0, 0
-        start, end = min(self.start), max(self.commits.values())
-        duration = end - start
-        # this is all bytes, but does not consider redundancy. we compute on average how many times is each sample transaction repeated and divide by that
-        bytes = sum(self.sizes.values()) / self.avg_redundancy
+    # ---- End-to-end (client send → commit) ----
 
-        bps = bytes / duration
-        tps = bps / self.size[0]
+    def _end_to_end_throughput(self):
+        """
+        Unique committed transactions per second measured over the
+        end-to-end window (earliest client start → last commit).
+
+        Same unique-tx derivation as consensus throughput.
+        """
+        if not self.commits or not self.sizes:
+            return 0, 0, 0
+
+        start = min(self.start)
+        end = max(self.commits.values())
+        duration = end - start
+        if duration <= 0:
+            return 0, 0, 0
+
+        committed_samples, total_samples, _ = self._committed_sample_stats()
+        if total_samples == 0:
+            return 0, 0, 0
+
+        commit_ratio = committed_samples / total_samples
+        total_txs_in_batches = sum(self.sizes.values()) / self.size[0]
+        unique_txs = total_txs_in_batches * commit_ratio
+
+        tps = unique_txs / duration
+        bps = tps * self.size[0]
         return tps, bps, duration
 
     def _end_to_end_latency(self):
-        latency = []
-        for tx_id, batches_ids in self.all_received_samples.items():
-            min_time = None
-            assert tx_id in self.all_sent_samples
-            start = self.all_sent_samples[tx_id]
+        """
+        For every sample transaction:
+          • start   = timestamp the client sent it
+          • end     = EARLIEST commit time among all batches containing it
+          • latency = end − start
 
-            for batch_id in batches_ids:
-                if batch_id in self.commits:
-                    end = self.commits[batch_id]
-                    min_time = min(min_time, end-start) if min_time else end-start # get first committed batch
+        Return the average over all committed sample transactions.
+        """
+        _, _, latencies = self._committed_sample_stats()
+        return mean(latencies) if latencies else 0
 
-            if min_time:
-                latency.append(min_time)
-
-        return mean(latency) if latency else 0
-    
-    def _avg_redundancy(self):
-        # basically each transaction is in one batch per primary, as we send transactions to one worker per primary
-        # compute mean of lens of self.all_received_samples
-        
-        lengths = [len(batches) for batches in self.all_received_samples.values()]
-        
-        self.avg_redundancy = mean(lengths)
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
 
     def result(self):
         header_size = self.configs[0]['header_size']
@@ -414,19 +443,19 @@ class LogParser:
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
 
-        # attacking caculation
-        attack_print = f""
+        # Attack calculation
+        attack_print = ""
         monitor_succ_num, monitor_total = self._attack_monitor_results()
         fissure_succ_num, fissure_total = self._fissure_attack_results()
         sluggish_succ_num, sluggish_total = self._sluggish_attack_results()
         speculative_succ_num, speculative_total = self._speculative_attack_results()
-        if monitor_total != 0:  # no front-running attack
+        if monitor_total != 0:
             attack_print = f"Baseline front-running rate: {round(monitor_succ_num/monitor_total*100, 2):,}% ({monitor_succ_num:,}/{monitor_total:,})"
-        elif fissure_total != 0:  # fissure front-running attack
+        elif fissure_total != 0:
             attack_print = f"Fissure front-running rate: {round(fissure_succ_num/fissure_total*100, 2):,}% ({fissure_succ_num:,}/{fissure_total:,})"
-        elif sluggish_total != 0:  # sluggish front-running attack
+        elif sluggish_total != 0:
             attack_print = f"Sluggish front-running rate: {round(sluggish_succ_num/sluggish_total*100, 2):,}% ({sluggish_succ_num:,}/{sluggish_total:,})"
-        elif speculative_total != 0:  # speculative front-running attack
+        elif speculative_total != 0:
             attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
 
         return (
@@ -452,7 +481,6 @@ class LogParser:
             f' Max batch delay: {max_batch_delay:,} ms\n'
             '\n'
             ' + RESULTS:\n'
-            f' Average Redundancy: Transactions are in {round(self.avg_redundancy, 2)} batches\n'
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
             f' Consensus latency: {round(consensus_latency):,} ms\n'
@@ -460,9 +488,9 @@ class LogParser:
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
-            "\n"
-            " + ATTACK:\n"
-            f" {attack_print} \n"
+            '\n'
+            ' + ATTACK:\n'
+            f' {attack_print} \n'
             '-----------------------------------------\n'
         )
 

@@ -134,7 +134,7 @@ impl Client {
 
                 if x == (counter - starting_counter) % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
+                    info!("Sending transaction {}", counter);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64(counter); // This counter identifies the tx.
@@ -142,6 +142,8 @@ impl Client {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
                     tx.put_u64(r); // Ensures all clients send different txs.
+
+                    info!("Sending transaction {}", r);
                 };
 
                 tx.resize(self.size, 0u8);
