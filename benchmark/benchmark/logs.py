@@ -387,6 +387,8 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def get_execution_time(self):
+        if not self.digest_to_finalized_time:
+            return 0
         start = min(self.start)
         end = max(self.digest_to_finalized_time.values())
         duration = end - start

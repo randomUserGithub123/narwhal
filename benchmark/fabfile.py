@@ -256,7 +256,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "lo_size": lo_size,
             "lo_max_delay": 100, # ms
             "gamma": gamma, # batch-OF parameter
-            "scc_ordering": "hamiltonian_cycle", # batch-OF parameter
+            "scc_ordering": "alphabetical", # batch-OF parameter
         }
 
         k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
@@ -291,11 +291,18 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             run = 0
             while run < runs:
                 print(f"\n=============================\nDAS experiment[{attack_type, arbitragers, faults, workers_per_node, nodes, input_rate}] run[{run}]\n=============================\n")
-                ret = DASBench(
+
+                try:
+                    ret = DASBench(
                     bench_params, 
                     node_params, 
                     username
                 ).run(debug, console, build)
+                except BenchError as e:
+                    if "Worker(s) panicked" in str(e):
+                        print(f"Workers panicked, retrying run {run}...")
+                        continue # Skip until DAS nodes work
+                    raise
 
                 consensus_tps_raw, _, _ = ret._consensus_throughput()
                 if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 50:
