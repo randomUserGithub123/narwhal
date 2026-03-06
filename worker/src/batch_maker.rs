@@ -95,12 +95,12 @@ impl BatchMaker {
                             .expect("Sha512 output must be at least 32 bytes"),
                     );
 
-                    if transaction.len() >= 9 {
-                        let tx_id = u64::from_be_bytes(
-                            transaction[1..9].try_into().unwrap()
-                        );
-                        log::info!("Received tx {} with digest {:?}", tx_id, tx_digest);
-                    }
+                    // if transaction.len() >= 9 {
+                    //     let tx_id = u64::from_be_bytes(
+                    //         transaction[1..9].try_into().unwrap()
+                    //     );
+                    //     log::info!("Received tx {} with digest {:?}", tx_id, tx_digest);
+                    // }
 
                     self.current_tx_digests.push(tx_digest.clone());
                     let message = WorkerMessage::TxDigest(tx_digest);
@@ -170,9 +170,9 @@ impl BatchMaker {
                 );
             }
 
-            for tx_digest in batch_tx_digests {
-                info!("Batch {:?} contains tx {:?}", digest, tx_digest);
-            }
+            // for tx_digest in batch_tx_digests {
+            //     info!("Batch {:?} contains tx {:?}", digest, tx_digest);
+            // }
 
             // NOTE: This log entry is used to compute performance.
             info!("Batch {:?} contains {} B", digest, size);

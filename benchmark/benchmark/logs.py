@@ -33,15 +33,12 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_txs = zip(*results)
+        self.size, self.rate, self.start, misses, self.sent_samples = zip(*results)
         self.misses = sum(misses)
 
-        # Merge all sent txs: tx_id -> earliest send_time across clients
-        self.all_sent_txs = {}
-        for d in self.sent_txs:
-            for tx_id, t in d.items():
-                if tx_id not in self.all_sent_txs or t < self.all_sent_txs[tx_id]:
-                    self.all_sent_txs[tx_id] = t
+        self.all_sent_samples = {}
+        for d in self.sent_samples:
+            self.all_sent_samples.update(d)
 
         # Parse the primaries logs.
         try:
@@ -54,11 +51,13 @@ class LogParser:
             commits,
             self.configs,
             primary_ips,
+            batch_to_header,
             blocks_to_heights,
             monitor_attacks,
             fissure_attacks,
             sluggish_attacks,
             speculative_attacks,
+            header_to_batches_list,
         ) = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
@@ -76,6 +75,14 @@ class LogParser:
             [x.items() for x in speculative_attacks]
         )
 
+        # Merge header_to_batches from all primaries
+        self.header_to_batches = self._merge_header_to_batches(header_to_batches_list)
+
+        # batch_digest -> (round, short_author) from Committed logs
+        self.batch_to_header = {}
+        for d in batch_to_header:
+            self.batch_to_header.update(d)
+
         # Parse the workers logs.
         try:
             with Pool() as p:
@@ -87,40 +94,22 @@ class LogParser:
             self.received_samples,
             workers_ips,
             finalization_events,
-            tx_id_to_digest_list,
-            digest_to_finalized_time_list,
-            finalized_digest_sets,
+            subdag_to_headers,
         ) = zip(*results)
 
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
-        # Merge tx_id -> digest from all workers.
-        # "Received tx" is logged in both batch_maker and processor,
-        # so duplicates are expected.  The digest is deterministic so
-        # we just keep the first occurrence per tx_id.
-        self.tx_id_to_digest = {}
-        for d in tx_id_to_digest_list:
-            for tx_id, digest in d.items():
-                if tx_id not in self.tx_id_to_digest:
-                    self.tx_id_to_digest[tx_id] = digest
-
-        # Merge digest -> min finalized time across all workers.
-        self.digest_to_finalized_time = {}
-        for d in digest_to_finalized_time_list:
-            for digest, t in d.items():
-                if digest not in self.digest_to_finalized_time or t < self.digest_to_finalized_time[digest]:
-                    self.digest_to_finalized_time[digest] = t
-
-        # Take the largest unique finalized set across workers.
-        largest_set = set()
-        for s in finalized_digest_sets:
-            if len(s) > len(largest_set):
-                largest_set = s
-        self.finalized_digests = largest_set
-
         self.finalization_events = self._merge_results([x.items() for x in finalization_events])
+
+        # sub_dag_id -> set of (round, full_author)
+        self.subdag_to_headers = {}
+        for d in subdag_to_headers:
+            for sub_dag_id, headers_set in d.items():
+                if sub_dag_id not in self.subdag_to_headers:
+                    self.subdag_to_headers[sub_dag_id] = set()
+                self.subdag_to_headers[sub_dag_id].update(headers_set)
 
         self.all_received_samples = self._merge_dicts(self.received_samples)
 
@@ -156,6 +145,14 @@ class LogParser:
                     merged[block] = int(height)
         return merged
 
+    def _merge_header_to_batches(self, dicts):
+        """Merge header_to_batches from multiple primaries."""
+        merged = defaultdict(set)
+        for d in dicts:
+            for h, batches in d.items():
+                merged[h].update(batches)
+        return {h: list(bs) for h, bs in merged.items()}
+
     def _merge_monitor(self, input):
         merged = {}
         for x in input:
@@ -184,12 +181,11 @@ class LogParser:
 
         misses = len(findall(r'rate too high', log))
 
-        # Parse ALL sent txs: "Sending tx: {id}" with timestamps.
-        # Every tx (sample and standard) is logged by the client.
-        tmp = findall(r'\[(.*Z) .* Sending tx: (\d+)', log)
-        sent_txs = {int(tx_id): self._to_posix(t) for t, tx_id in tmp}
+        # Only sample txs are logged: "Sending sample transaction {counter}"
+        tmp = findall(r'\[(.*Z) .* sample transaction (\d+)', log)
+        samples = {int(s): self._to_posix(t) for t, s in tmp}
 
-        return size, rate, start, misses, sent_txs
+        return size, rate, start, misses, samples
 
     def _parse_primaries(self, log):
         if search(r'(?:panicked|Error)', log) is not None:
@@ -203,10 +199,38 @@ class LogParser:
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
+        # Parse batch_digest -> (round, short_author) from Committed logs.
+        # Log line: "Committed B{round}({short_author}) -> {batch_digest}"
+        # These are per-header logs, NOT per-tx. Lightweight.
+        batch_to_header = {}
+        tmp_full = findall(r'Committed B(\d+)\(([^\)]+)\) -> ([^ \n]+)', log)
+        for round_str, short_author, batch_digest in tmp_full:
+            round_num = int(round_str)
+            batch_to_header[batch_digest] = (round_num, short_author.strip())
+
         # Record committing heights of certificates (blocks)
         tmp = findall(r"\[(.*Z) .* FairDag Committed ([^ ]+) in height (\d+)", log)
         tmp = [(header, height) for t, header, height in tmp]
         blocks_to_heights = self._merge_blocks_to_heights([tmp])
+
+        # Build header_to_batches by correlating "Committed B..." with "FairDag Committed..."
+        # These are per-header logs, NOT per-tx. Lightweight.
+        header_to_batches = defaultdict(list)
+        lines = log.splitlines()
+
+        for i, line in enumerate(lines):
+            m = search(r'Committed B\d+\([^\)]+\) -> ([^ \n]+)', line)
+            if not m:
+                continue
+            batch_digest = m.group(1).strip()
+
+            # Look ahead 1-3 lines for the FairDag Committed line
+            for j in range(i + 1, min(i + 4, len(lines))):
+                m2 = search(r'FairDag Committed ([^ ]+) in height (\d+)', lines[j])
+                if m2:
+                    header_id = m2.group(1).strip()
+                    header_to_batches[header_id].append(batch_digest)
+                    break
 
         # Parse attack data
         tmp = findall(
@@ -254,11 +278,13 @@ class LogParser:
             commits,
             configs,
             ip,
+            batch_to_header,
             blocks_to_heights,
             monitor_attacks,
             fissure_attacks,
             sluggish_attacks,
             speculative_attacks,
+            dict(header_to_batches),
         )
 
     def _parse_workers(self, log):
@@ -273,46 +299,52 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
-        # Parse finalization summary events (for throughput calculation).
-        # Format: "sub_dag_id=5: FINALIZED! 42 transactions (3 duplicates skipped)"
+        # Parse finalization summary events (for TPS).
+        # Log format: "sub_dag_id=5: FINALIZED! 42 transactions (3 duplicates skipped)"
+        # One line per sub-dag. Lightweight.
         tmp = findall(r'\[(.*Z) .* sub_dag_id=(\d+): FINALIZED! (\d+) transactions', log)
         finalization_events = {
             int(sub_dag_id): (self._to_posix(t), int(count))
             for t, sub_dag_id, count in tmp
         }
 
-        # === Parse "Received tx {id} with digest {digest}" ===
-        # Logged in both batch_maker and processor, so duplicates expected.
-        # Digest is base64: [A-Za-z0-9+/=]+
-        # We keep first occurrence per tx_id (digest is deterministic).
-        tx_id_to_digest = {}
-        tmp = findall(r'Received tx (\d+) with digest ([A-Za-z0-9+/=]+)', log)
-        for tx_id_str, digest in tmp:
-            tx_id = int(tx_id_str)
-            if tx_id not in tx_id_to_digest:
-                tx_id_to_digest[tx_id] = digest
+        # Parse sub_dag_id -> (round, full_author) from "Received sub-dag" logs.
+        # These are per-subdag logs, NOT per-tx. Lightweight.
+        subdag_to_headers = {}
+        all_lines = log.split('\n')
+        current_subdag_content = None
 
-        # === Parse "FINALIZED! digest {digest}" with timestamps ===
-        # Format: "sub_dag_id=5: FINALIZED! digest 5TDEZx4GgR/re1Ml6Z+o...="
-        # Take the MIN timestamp per digest across all sub_dag_ids.
-        digest_to_finalized_time = {}
-        tmp = findall(r'\[(.*Z) .* FINALIZED! digest ([A-Za-z0-9+/=]+)', log)
-        for t, digest in tmp:
-            ts = self._to_posix(t)
-            if digest not in digest_to_finalized_time or ts < digest_to_finalized_time[digest]:
-                digest_to_finalized_time[digest] = ts
+        for i, line in enumerate(all_lines):
+            if 'Received sub-dag : [' in line:
+                start_idx = line.find('Received sub-dag : [') + len('Received sub-dag : [')
+                content = line[start_idx:]
+                if content.endswith(']'):
+                    content = content[:-1]
+                current_subdag_content = content
 
-        # The set of all unique finalized digests on this worker.
-        finalized_digest_set = set(digest_to_finalized_time.keys())
+            elif 'SUBDAG STRUCTURE: sub_dag_id=' in line and current_subdag_content:
+                match = search(r'sub_dag_id=(\d+)', line)
+                if match:
+                    sub_dag_id = int(match.group(1))
+                    headers_set = set()
+
+                    round_matches = findall(r'\((\d+), \[([^\]]*)\]\)', current_subdag_content)
+                    for round_str, authors_str in round_matches:
+                        round_num = int(round_str)
+                        if authors_str.strip():
+                            authors = [a.strip() for a in authors_str.split(', ') if a.strip()]
+                            for full_author in authors:
+                                headers_set.add((round_num, full_author))
+
+                    subdag_to_headers[sub_dag_id] = headers_set
+                    current_subdag_content = None
 
         return (
             sizes,
             samples,
             ip,
             finalization_events,
-            tx_id_to_digest,
-            digest_to_finalized_time,
-            finalized_digest_set,
+            subdag_to_headers,
         )
 
     def _to_posix(self, string):
@@ -387,27 +419,33 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def get_execution_time(self):
-        if not self.digest_to_finalized_time:
+        """Duration from first client send to last finalization.
+        Returns 0 if no finalization events were recorded."""
+        if not self.finalization_events:
             return 0
         start = min(self.start)
-        end = max(self.digest_to_finalized_time.values())
+        end = max(t for t, _ in self.finalization_events.values())
         duration = end - start
-        return duration
+        return duration if duration > 0 else 0
 
     def _end_to_end_throughput(self):
+        """TPS from finalization summary counts.
+
+        Uses the lightweight 'FINALIZED! N transactions' summary line
+        (one per sub-dag, no per-tx logging needed).
+        Duration: first client send -> last finalization event.
         """
-        Use the largest unique finalized digest set across workers.
-        If only one node is ahead (finalized more), we take its set.
-        Duration runs from earliest client send to latest finalization.
-        """
-        if not self.finalized_digests or not self.digest_to_finalized_time:
+        if not self.finalization_events:
             return 0, 0, -1
 
         start = min(self.start)
-        end = max(self.digest_to_finalized_time.values())
+        end = max(t for t, _ in self.finalization_events.values())
         duration = end - start
 
-        total_finalized_txs = len(self.finalized_digests)
+        if duration <= 0:
+            return 0, 0, -1
+
+        total_finalized_txs = sum(count for _, count in self.finalization_events.values())
 
         tps = total_finalized_txs / duration
         bps = tps * self.size[0]
@@ -415,52 +453,98 @@ class LogParser:
         return tps, bps, duration
 
     def _end_to_end_latency(self):
-        """
-        Simplified end-to-end latency via direct chain:
+        """End-to-end FINALIZATION latency using sample transactions.
 
-          1. Client logs  "Sending tx: {tx_id}"                       -> tx_id : send_time
-          2. Worker logs  "Received tx {tx_id} with digest {digest}"  -> tx_id : digest
-          3. Worker logs  "FINALIZED! digest {digest}"                -> digest : finalize_time
+        Chain (all per-header or per-subdag logs, NOT per-tx):
+          1. Client:   "Sending sample transaction {id}"              -> sample_id : send_time
+          2. Worker:   "Batch X contains sample tx {id}"              -> sample_id : batch_digest
+          3. Primary:  "Committed B{round}({author}) -> X"            -> batch_digest : (round, author)
+          4. Worker:   "SUBDAG STRUCTURE: sub_dag_id={id}"            -> (round, author) : sub_dag_id
+          5. Worker:   "sub_dag_id={id}: FINALIZED! N transactions"   -> sub_dag_id : finalization_time
 
-          latency = min(finalize_time) - send_time
+        Latency = finalization_time - send_time
 
-        Duplicates in step 2 (batch_maker + processor both log it)
-        are harmless because the digest is deterministic -- we just
-        keep the first occurrence per tx_id.
-
-        For step 3 we take the MIN finalized timestamp per digest
-        across all workers and sub_dag_ids.
+        Zero per-tx logging required. All log lines are either:
+        - benchmark-gated sample logs (~1/sec/client)
+        - per-header/per-subdag structural logs (already emitted)
         """
         latency = []
-        matched = 0
-        no_digest = 0
-        not_finalized = 0
 
-        for tx_id, send_time in self.all_sent_txs.items():
-            # Step 1: tx_id -> digest
-            digest = self.tx_id_to_digest.get(tx_id)
-            if digest is None:
-                no_digest += 1
+        # Build reverse index: (round, full_author) -> sub_dag_id
+        header_to_subdag = {}
+        for sub_dag_id in sorted(self.subdag_to_headers.keys()):
+            for (round_num, full_author) in self.subdag_to_headers[sub_dag_id]:
+                header_to_subdag[(round_num, full_author)] = sub_dag_id
+
+        def find_subdag_for_header(round_num, short_author):
+            for (r, full_author), sid in header_to_subdag.items():
+                if r == round_num and full_author.startswith(short_author):
+                    return sid
+            return None
+
+        for sample_tx_id, send_time in self.all_sent_samples.items():
+            batch_digests = self.all_received_samples.get(sample_tx_id)
+            if not batch_digests:
                 continue
 
-            # Step 2: digest -> min finalization time
-            finalize_time = self.digest_to_finalized_time.get(digest)
-            if finalize_time is None:
-                not_finalized += 1
-                continue
+            min_latency = None
 
-            # Step 3: compute latency
-            lat = finalize_time - send_time
-            if lat > 0:
-                latency.append(lat)
-                matched += 1
+            for batch_digest in batch_digests:
+                # Step 3: batch -> (round, short_author)
+                header = self.batch_to_header.get(batch_digest)
+                if header is None:
+                    continue
+
+                round_num, short_author = header
+
+                # Step 4: (round, author) -> sub_dag_id
+                sub_dag_id = find_subdag_for_header(round_num, short_author)
+                if sub_dag_id is None:
+                    continue
+
+                # Step 5: sub_dag_id -> finalization_time
+                finalization_data = self.finalization_events.get(sub_dag_id)
+                if finalization_data is None:
+                    continue
+
+                finalization_time, _ = finalization_data
+
+                lat = finalization_time - send_time
+                if lat > 0:
+                    min_latency = min(min_latency, lat) if min_latency else lat
+
+            if min_latency is not None:
+                latency.append(min_latency)
 
         return (
             mean(latency) if latency else 0,
-            matched,
-            no_digest,
-            not_finalized,
+            len(latency),
         )
+
+    def _end_to_end_latency_commit_based(self):
+        """Commit-based latency (for comparison / sanity check).
+
+        Simpler chain: sample_tx -> batch -> commit_time.
+        Understates true e2e latency since it stops at commit, not finalization.
+        """
+        latency = []
+        for tx_id, batches_ids in self.all_received_samples.items():
+            if tx_id not in self.all_sent_samples:
+                continue
+            start = self.all_sent_samples[tx_id]
+
+            min_time = None
+            for batch_id in batches_ids:
+                if batch_id in self.commits:
+                    end = self.commits[batch_id]
+                    lat = end - start
+                    if lat > 0:
+                        min_time = min(min_time, lat) if min_time else lat
+
+            if min_time:
+                latency.append(min_time)
+
+        return mean(latency) if latency else 0
 
     def _avg_redundancy(self):
         lengths = [len(batches) for batches in self.all_received_samples.values()]
@@ -478,8 +562,9 @@ class LogParser:
         consensus_latency = self._consensus_latency() * 1_000
         consensus_tps, consensus_bps, consensus_duration = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        end_to_end_latency, num_matched, num_no_digest, num_not_finalized = self._end_to_end_latency()
+        end_to_end_latency, num_samples_latency = self._end_to_end_latency()
         end_to_end_latency *= 1000
+        end_to_end_latency_commit = self._end_to_end_latency_commit_based() * 1_000
 
         # Attack calculation (header-level)
         attack_print = ""
@@ -498,11 +583,14 @@ class LogParser:
             attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
 
         # Debug stats
+        total_finalized = sum(count for _, count in self.finalization_events.values()) if self.finalization_events else 0
         debug_stats = (
-            f" Debug: sent_txs={len(self.all_sent_txs)}, "
-            f"tx_id_to_digest={len(self.tx_id_to_digest)}, "
-            f"finalized_digests={len(self.finalized_digests)} (largest worker set), "
-            f"digest_timestamps={len(self.digest_to_finalized_time)}"
+            f" Debug: samples_sent={len(self.all_sent_samples)}, "
+            f"samples_received={len(self.all_received_samples)}, "
+            f"finalization_subdags={len(self.finalization_events)}, "
+            f"total_finalized_txs={total_finalized}, "
+            f"batch_to_header={len(self.batch_to_header)}, "
+            f"subdag_to_headers={len(self.subdag_to_headers)}"
         )
 
         return (
@@ -536,9 +624,9 @@ class LogParser:
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' End-to-end finalized txs: {len(self.finalized_digests):,} (largest unique set)\n'
-            f' End-to-end latency: {round(end_to_end_latency):,} ms '
-            f'(matched={num_matched}, no_digest={num_no_digest}, not_finalized={num_not_finalized})\n'
+            f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms '
+            f'(from {num_samples_latency} sample txs)\n'
+            f' End-to-end latency (commit-based): {round(end_to_end_latency_commit):,} ms\n'
             '\n'
             ' + ATTACK:\n'
             f' {attack_print}\n'
