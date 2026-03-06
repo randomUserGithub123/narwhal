@@ -298,7 +298,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                 ).run(debug, console, build)
 
                 consensus_tps_raw, _, _ = ret._consensus_throughput()
-                if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 40:
+                if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 50:
                     continue # Skip until DAS nodes work
 
                 print(ret.result())
