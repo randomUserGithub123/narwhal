@@ -386,6 +386,12 @@ class LogParser:
         latency = [c - self.proposals[d] for d, c in self.commits.items()]
         return mean(latency) if latency else 0
 
+    def get_execution_time(self):
+        start = min(self.start)
+        end = max(self.digest_to_finalized_time.values())
+        duration = end - start
+        return duration
+
     def _end_to_end_throughput(self):
         """
         Use the largest unique finalized digest set across workers.
