@@ -74,6 +74,14 @@ impl Processor {
                                 .try_into()
                                 .expect("Sha512 output must be at least 32 bytes"),
                         );
+
+                        if transaction.len() >= 9 {
+                            let tx_id = u64::from_be_bytes(
+                                transaction[1..9].try_into().unwrap()
+                            );
+                            log::info!("Received tx {} with digest {:?}", tx_id, tx_digest);
+                        }
+
                         let message = WorkerMessage::TxDigest(tx_digest);
                         let serialized = bincode::serialize(&message)
                             .expect("Failed to serialize our own tx digest");

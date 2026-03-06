@@ -1178,6 +1178,13 @@ impl GlobalOrder {
                 }
             }
 
+            for digest in &output_digests {
+                log::info!(
+                    "sub_dag_id={}: FINALIZED! digest {:?}",
+                    sub_dag_id, digest
+                );
+            }
+
             log::info!(
                 "sub_dag_id={}: FINALIZED! {} transactions ({} duplicates skipped)",
                 sub_dag_id,
