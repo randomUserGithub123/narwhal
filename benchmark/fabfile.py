@@ -198,23 +198,23 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # (3, 3, 0, None, 100, 1.0, 2, 13, 1, 5000),
         # (10, 3, 0, None, 100, 1.0, 2, 13, 1, 5000),
         # ###### CHANGING N ######
-        (0, 1, 1, None, None, 1.0, 2, 5, 5, 6000),
-        (0, 1, 1, None, None, 1.0, 2, 6, 5, 6000),
-        (0, 1, 1, None, None, 1.0, 2, 7, 5, 6000),
-        (0, 1, 1, None, None, 1.0, 2, 8, 5, 6000),
-        (0, 1, 2, None, None, 1.0, 2, 9, 5, 6000),
-        (0, 1, 2, None, None, 1.0, 2, 10, 5, 6000),
-        (0, 1, 2, None, None, 1.0, 2, 11, 5, 6000),
-        (0, 1, 2, None, None, 1.0, 2, 12, 5, 6000),
-        (0, 1, 3, None, None, 1.0, 2, 13, 5, 6000),
-        (0, 1, 3, None, None, 1.0, 2, 14, 5, 6000),
-        (0, 1, 3, None, None, 1.0, 2, 15, 5, 6000),
-        (0, 1, 3, None, None, 1.0, 2, 16, 5, 6000),
-        (0, 1, 4, None, None, 1.0, 2, 17, 5, 6000),
-        (0, 1, 4, None, None, 1.0, 2, 18, 5, 6000),
-        (0, 1, 4, None, None, 1.0, 2, 19, 5, 6000),
-        (0, 1, 4, None, None, 1.0, 2, 20, 5, 6000),
-        # (0, 1, 5, None, None, 1.0, 2, 21, 5, 6000),
+        # (0, 1, 1, None, None, 1.0, 2, 5, 5, 6000),
+        # (0, 1, 1, None, None, 1.0, 2, 6, 5, 6000),
+        # (0, 1, 1, None, None, 1.0, 2, 7, 5, 6000),
+        # (0, 1, 1, None, None, 1.0, 2, 8, 5, 6000),
+        # (0, 1, 2, None, None, 1.0, 2, 9, 5, 6000),
+        # (0, 1, 2, None, None, 1.0, 2, 10, 5, 6000),
+        # (0, 1, 2, None, None, 1.0, 2, 11, 5, 6000),
+        # (0, 1, 2, None, None, 1.0, 2, 12, 5, 6000),
+        # (0, 1, 3, None, None, 1.0, 2, 13, 5, 6000),
+        # (0, 1, 3, None, None, 1.0, 2, 14, 5, 6000),
+        # (0, 1, 3, None, None, 1.0, 2, 15, 5, 6000),
+        # (0, 1, 3, None, None, 1.0, 2, 16, 5, 6000),
+        # (0, 1, 4, None, None, 1.0, 2, 17, 5, 6000),
+        # (0, 1, 4, None, None, 1.0, 2, 18, 5, 6000),
+        # (0, 1, 4, None, None, 1.0, 2, 19, 5, 6000),
+        # (0, 1, 4, None, None, 1.0, 2, 20, 5, 6000),
+        (0, 1, 5, None, None, 1.0, 2, 21, 5, 6000),
         # (0, 1, 5, None, None, 1.0, 2, 22, 5, 6000),
         # (0, 1, 5, None, None, 1.0, 2, 23, 5, 6000),
         # (0, 1, 5, None, None, 1.0, 2, 24, 5, 6000),
@@ -300,7 +300,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                     ).run(debug, console, build)
 
                     consensus_tps_raw, _, _ = ret._consensus_throughput()
-                    if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 0:
+                    if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 40:
                         continue # Skip until DAS nodes work
 
                     print(ret.result())
