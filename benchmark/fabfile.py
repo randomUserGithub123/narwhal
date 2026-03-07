@@ -306,10 +306,15 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                     print(ret.result())
                     ret.print(filename)
 
-                except ParseError as e:
-                    if "Worker(s) panicked" in str(e):
+                except BenchError as e:
+                    current_cause = e.cause
+                    while isinstance(current_cause, BenchError):
+                        current_cause = current_cause.cause
+                    
+                    if isinstance(current_cause, ParseError) and "Worker(s) panicked" in str(current_cause):
                         print(f"Workers panicked, retrying run {run}...")
-                        continue # Skip until DAS nodes work
+                        continue
+
                     raise
 
                 run += 1
