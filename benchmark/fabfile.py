@@ -298,14 +298,14 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                     node_params, 
                     username
                 ).run(debug, console, build)
-                except BenchError as e:
+                except ParseError as e:
                     if "Worker(s) panicked" in str(e):
                         print(f"Workers panicked, retrying run {run}...")
                         continue # Skip until DAS nodes work
                     raise
 
                 consensus_tps_raw, _, _ = ret._consensus_throughput()
-                if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 50:
+                if int(consensus_tps_raw) <= 1e-9 or int(ret.get_execution_time()) <= 0:
                     continue # Skip until DAS nodes work
 
                 print(ret.result())

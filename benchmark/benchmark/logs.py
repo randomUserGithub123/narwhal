@@ -95,13 +95,43 @@ class LogParser:
             workers_ips,
             finalization_events,
             subdag_to_headers,
+            batch_to_txs_list,
+            tx_exec_rank_list,
         ) = zip(*results)
-
+        
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
+        # Merge batch_to_txs from all workers
+        # (only populated when per-tx logging is enabled for attack analysis)
+        self.batch_to_txs = self._merge_dict_of_lists(batch_to_txs_list)
+        
+        # Merge tx_exec_rank from all workers (only worker_id=0 has these)
+        # (only populated when per-tx logging is enabled for attack analysis)
+        self.tx_exec_rank = self._merge_tx_exec_rank(tx_exec_rank_list)
+
+        # Merged finalization_events: sub_dag_id -> (min_timestamp, count)
+        # Used for latency lookups (need per-subdag timestamps).
         self.finalization_events = self._merge_results([x.items() for x in finalization_events])
+
+        # Per-worker finalization totals for TPS.
+        # Each worker's sum(FINALIZED counts) = total unique txs it finalized
+        # (Rust code already deduplicates via already_finalized set).
+        # Take the MAX across workers: the most advanced worker's total.
+        self._per_worker_finalized = []
+        for w_events in finalization_events:
+            if not w_events:
+                self._per_worker_finalized.append((0, 0.0))  # (total_txs, last_time)
+                continue
+            total = sum(count for _, count in w_events.values())
+            last_t = max(t for t, _ in w_events.values())
+            self._per_worker_finalized.append((total, last_t))
+
+        # The worker that finalized the most txs
+        best_worker = max(self._per_worker_finalized, key=lambda x: x[0])
+        self.total_finalized_txs = best_worker[0]
+        self.last_finalization_time = best_worker[1]
 
         # sub_dag_id -> set of (round, full_author)
         self.subdag_to_headers = {}
@@ -169,6 +199,50 @@ class LogParser:
                     merged[victim_header] = attack_header
         return merged
 
+    def _merge_dict_of_lists(self, dicts):
+        """Merge dictionaries where values are lists."""
+        merged = defaultdict(set)
+        for d in dicts:
+            for k, vals in d.items():
+                merged[k].update(vals)
+        return {k: list(v) for k, v in merged.items()}
+
+    def _merge_tx_exec_rank(self, dicts):
+        """
+        Merge tx execution ranks from multiple workers.
+        Only worker_id=0 on each node runs GlobalOrder.
+        Validates that all non-empty workers agree on ordering (up to prefix).
+        """
+        non_empty = [d for d in dicts if len(d) > 0]
+        self._workers_with_exec_data = len(non_empty)
+        
+        self.exec_order_consistent = True
+        self.exec_order_violations = 0
+        
+        if len(non_empty) < 2:
+            if non_empty:
+                return dict(non_empty[0])
+            return {}
+        
+        sorted_by_len = sorted(non_empty, key=len)
+        
+        orderings = []
+        for d in sorted_by_len:
+            ordered = sorted(d.keys(), key=lambda tx: d[tx])
+            orderings.append(ordered)
+        
+        for i in range(len(orderings) - 1):
+            shorter = orderings[i]
+            longer = orderings[i + 1]
+            if shorter != longer[:len(shorter)]:
+                self.exec_order_consistent = False
+                self.exec_order_violations += 1
+        
+        if not self.exec_order_consistent:
+            Print.warn(f"EXECUTION ORDER INCONSISTENT: {self.exec_order_violations} workers have non-prefix orderings!")
+        
+        return dict(sorted_by_len[-1])
+
     def _parse_clients(self, log):
         if search(r"(?:panicked|Error)", log) is not None:
             raise ParseError('Client(s) panicked')
@@ -181,7 +255,6 @@ class LogParser:
 
         misses = len(findall(r'rate too high', log))
 
-        # Only sample txs are logged: "Sending sample transaction {counter}"
         tmp = findall(r'\[(.*Z) .* sample transaction (\d+)', log)
         samples = {int(s): self._to_posix(t) for t, s in tmp}
 
@@ -199,9 +272,7 @@ class LogParser:
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
-        # Parse batch_digest -> (round, short_author) from Committed logs.
-        # Log line: "Committed B{round}({short_author}) -> {batch_digest}"
-        # These are per-header logs, NOT per-tx. Lightweight.
+        # Parse batch_digest -> (round, short_author) from Committed logs
         batch_to_header = {}
         tmp_full = findall(r'Committed B(\d+)\(([^\)]+)\) -> ([^ \n]+)', log)
         for round_str, short_author, batch_digest in tmp_full:
@@ -214,7 +285,6 @@ class LogParser:
         blocks_to_heights = self._merge_blocks_to_heights([tmp])
 
         # Build header_to_batches by correlating "Committed B..." with "FairDag Committed..."
-        # These are per-header logs, NOT per-tx. Lightweight.
         header_to_batches = defaultdict(list)
         lines = log.splitlines()
 
@@ -224,7 +294,6 @@ class LogParser:
                 continue
             batch_digest = m.group(1).strip()
 
-            # Look ahead 1-3 lines for the FairDag Committed line
             for j in range(i + 1, min(i + 4, len(lines))):
                 m2 = search(r'FairDag Committed ([^ ]+) in height (\d+)', lines[j])
                 if m2:
@@ -297,19 +366,34 @@ class LogParser:
         tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
         samples = {int(s): d for d, s in tmp}
 
+        # Parse batch -> tx_digests mapping (from batch_maker.rs)
+        # Only populated when per-tx logging is enabled (attack experiments)
+        batch_to_txs = defaultdict(list)
+        tmp = findall(r'Batch ([^ ]+) contains tx ([^ \n]+)', log)
+        for batch, tx in tmp:
+            batch_to_txs[batch.strip()].append(tx.strip())
+
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
-        # Parse finalization summary events (for TPS).
-        # Log format: "sub_dag_id=5: FINALIZED! 42 transactions (3 duplicates skipped)"
-        # One line per sub-dag. Lightweight.
         tmp = findall(r'\[(.*Z) .* sub_dag_id=(\d+): FINALIZED! (\d+) transactions', log)
         finalization_events = {
             int(sub_dag_id): (self._to_posix(t), int(count))
             for t, sub_dag_id, count in tmp
         }
 
-        # Parse sub_dag_id -> (round, full_author) from "Received sub-dag" logs.
-        # These are per-subdag logs, NOT per-tx. Lightweight.
+        # Parse tx execution order (from global_order.rs)
+        # Only populated when per-tx logging is enabled (attack experiments)
+        tx_exec_rank = {}
+        rank = 0
+        for line in log.splitlines():
+            m = search(r'Executed ([^ \n]+)', line)
+            if m:
+                tx = m.group(1).strip()
+                if tx not in tx_exec_rank:
+                    tx_exec_rank[tx] = rank
+                rank += 1
+
+        # Parse sub_dag_id -> (round, full_author) from "Received sub-dag" logs
         subdag_to_headers = {}
         all_lines = log.split('\n')
         current_subdag_content = None
@@ -345,6 +429,8 @@ class LogParser:
             ip,
             finalization_events,
             subdag_to_headers,
+            dict(batch_to_txs),
+            tx_exec_rank,
         )
 
     def _to_posix(self, string):
@@ -403,6 +489,56 @@ class LogParser:
                     succ_num += 1
         return succ_num, attack_num
 
+    def _is_frontrun_successful(self, victim_txs, attacker_txs):
+        """Was ANY attacker tx executed before ANY victim tx?"""
+        for a in attacker_txs:
+            ra = self.tx_exec_rank.get(a)
+            if ra is None:
+                continue
+            for v in victim_txs:
+                rv = self.tx_exec_rank.get(v)
+                if rv is None:
+                    return True
+                if ra < rv:
+                    return True
+        return False
+
+    def _transaction_frontrun_results(self):
+        """
+        Calculate transaction-level front-running success rate.
+        Only meaningful when per-tx logging is enabled (attack experiments).
+        """
+        attacks = (
+            self.monitor_attacks
+            or self.fissure_attacks
+            or self.sluggish_attacks
+            or self.speculative_attacks
+            or {}
+        )
+
+        successes = 0
+        total = 0
+
+        for victim_h, attacker_h in attacks.items():
+            vb = self.header_to_batches.get(victim_h)
+            ab = self.header_to_batches.get(attacker_h)
+            
+            if not vb or not ab:
+                continue
+
+            victim_txs = [tx for b in vb for tx in self.batch_to_txs.get(b, [])]
+            attacker_txs = [tx for b in ab for tx in self.batch_to_txs.get(b, [])]
+
+            if not victim_txs or not attacker_txs:
+                continue
+
+            total += 1
+            if self._is_frontrun_successful(victim_txs, attacker_txs):
+                successes += 1
+
+        rate = round(successes / total * 100, 2) if total > 0 else 0.0
+        return rate, successes, total
+
     def _consensus_throughput(self):
         if not self.commits:
             return 0, 0, 0
@@ -419,35 +555,40 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def get_execution_time(self):
-        """Duration from first client send to last finalization.
-        Returns 0 if no finalization events were recorded."""
-        if not self.finalization_events:
+        """Duration from first client send to last finalization on the most
+        advanced worker.  Returns 0 if nothing was finalized."""
+        if self.total_finalized_txs == 0:
             return 0
         start = min(self.start)
-        end = max(t for t, _ in self.finalization_events.values())
-        duration = end - start
+        duration = self.last_finalization_time - start
         return duration if duration > 0 else 0
 
     def _end_to_end_throughput(self):
-        """TPS from finalization summary counts.
+        """TPS using the most advanced worker's finalized tx total.
 
-        Uses the lightweight 'FINALIZED! N transactions' summary line
-        (one per sub-dag, no per-tx logging needed).
-        Duration: first client send -> last finalization event.
+        Why the most advanced worker = the union:
+          - Finalization is sequential (next_to_finalize increments by 1).
+          - A worker cannot skip sub_dags or finalize out of order.
+          - Each worker deduplicates via already_finalized set.
+          - Therefore the worker with the most sub_dags has a SUPERSET
+            of every other worker's finalized txs.
+          - Its total = |union(all workers' finalized txs)|.
+
+        Duration: first client send -> that worker's last finalization.
+
+        FIX vs original: uses finalization time, not commit time.
         """
-        if not self.finalization_events:
+        if self.total_finalized_txs == 0:
             return 0, 0, -1
 
         start = min(self.start)
-        end = max(t for t, _ in self.finalization_events.values())
+        end = self.last_finalization_time
         duration = end - start
 
         if duration <= 0:
             return 0, 0, -1
 
-        total_finalized_txs = sum(count for _, count in self.finalization_events.values())
-
-        tps = total_finalized_txs / duration
+        tps = self.total_finalized_txs / duration
         bps = tps * self.size[0]
 
         return tps, bps, duration
@@ -464,9 +605,7 @@ class LogParser:
 
         Latency = finalization_time - send_time
 
-        Zero per-tx logging required. All log lines are either:
-        - benchmark-gated sample logs (~1/sec/client)
-        - per-header/per-subdag structural logs (already emitted)
+        Includes sanity guard: finalization_time must be >= commit_time.
         """
         latency = []
 
@@ -490,6 +629,11 @@ class LogParser:
             min_latency = None
 
             for batch_digest in batch_digests:
+                # Sanity: batch must have been committed
+                commit_time = self.commits.get(batch_digest)
+                if commit_time is None:
+                    continue
+
                 # Step 3: batch -> (round, short_author)
                 header = self.batch_to_header.get(batch_digest)
                 if header is None:
@@ -508,6 +652,10 @@ class LogParser:
                     continue
 
                 finalization_time, _ = finalization_data
+
+                # Sanity: finalization must come after commit
+                if finalization_time < commit_time:
+                    continue
 
                 lat = finalization_time - send_time
                 if lat > 0:
@@ -562,7 +710,7 @@ class LogParser:
         consensus_latency = self._consensus_latency() * 1_000
         consensus_tps, consensus_bps, consensus_duration = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        end_to_end_latency, num_samples_latency = self._end_to_end_latency()
+        end_to_end_latency, num_txs_end_to_end_latency = self._end_to_end_latency()
         end_to_end_latency *= 1000
         end_to_end_latency_commit = self._end_to_end_latency_commit_based() * 1_000
 
@@ -572,7 +720,7 @@ class LogParser:
         fissure_succ_num, fissure_total = self._fissure_attack_results()
         sluggish_succ_num, sluggish_total = self._sluggish_attack_results()
         speculative_succ_num, speculative_total = self._speculative_attack_results()
-
+        
         if monitor_total != 0:
             attack_print = f"Baseline front-running rate: {round(monitor_succ_num/monitor_total*100, 2):,}% ({monitor_succ_num:,}/{monitor_total:,})"
         elif fissure_total != 0:
@@ -582,15 +730,27 @@ class LogParser:
         elif speculative_total != 0:
             attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
 
+        # Transaction-level front-running calculation
+        tx_rate, tx_succ, tx_total = self._transaction_frontrun_results()
+
         # Debug stats
-        total_finalized = sum(count for _, count in self.finalization_events.values()) if self.finalization_events else 0
+        per_worker_txs = [t for t, _ in self._per_worker_finalized]
         debug_stats = (
-            f" Debug: samples_sent={len(self.all_sent_samples)}, "
-            f"samples_received={len(self.all_received_samples)}, "
+            f" Debug: header_to_batches={len(self.header_to_batches)} headers, "
+            f"batch_to_txs={len(self.batch_to_txs)} batches, "
+            f"tx_exec_rank={len(self.tx_exec_rank)} txs, "
             f"finalization_subdags={len(self.finalization_events)}, "
-            f"total_finalized_txs={total_finalized}, "
-            f"batch_to_header={len(self.batch_to_header)}, "
-            f"subdag_to_headers={len(self.subdag_to_headers)}"
+            f"total_finalized_txs={self.total_finalized_txs} (best worker), "
+            f"per_worker_totals={per_worker_txs}"
+        )
+        
+        # Execution order consistency report
+        exec_order_status = "CONSISTENT" if self.exec_order_consistent else f"{self.exec_order_violations} VIOLATIONS"
+        
+        exec_order_report = (
+            f" Execution order validation:\n"
+            f"   Workers with data: {self._workers_with_exec_data}\n"
+            f"   Order consistency: {exec_order_status}"
         )
 
         return (
@@ -624,13 +784,15 @@ class LogParser:
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms '
-            f'(from {num_samples_latency} sample txs)\n'
+            f' End-to-end finalized txs: {self.total_finalized_txs:,} (best worker = union)\n'
+            f' End-to-end latency (finalization): {round(end_to_end_latency):,} ms, (num sample txs: {num_txs_end_to_end_latency})\n'
             f' End-to-end latency (commit-based): {round(end_to_end_latency_commit):,} ms\n'
             '\n'
             ' + ATTACK:\n'
             f' {attack_print}\n'
+            f' Transaction front-running rate: {tx_rate}% ({tx_succ}/{tx_total})\n'
             '\n'
+            f'{exec_order_report}\n'
             f'{debug_stats}\n'
             '-----------------------------------------\n'
         )
