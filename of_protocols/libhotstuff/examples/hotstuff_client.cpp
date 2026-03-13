@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
     // OLD:
     // while (try_send());
     // NEW:
-    const uint64_t PRECISION = 1;
+    const uint64_t PRECISION = 20;
     const double BURST_DURATION_SEC = 1.0 / PRECISION;
     const double BURST_DURATION_MS  = BURST_DURATION_SEC * 1000.0;
     const uint64_t burst = static_cast<uint64_t>(max_async_num) / PRECISION;
