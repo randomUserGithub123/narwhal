@@ -145,12 +145,12 @@ def local(ctx, debug=True):
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
     for attack_type, arbitragers, faults, tx_redundancy, lo_size, gamma, workers_per_node, nodes, runs, input_rate in [
         # ###### N = 5 - CHANGING lo_size ######
-        # (0, 1, 1, None, 25, 1.0, 2, 5, 6, 1000),
-        # (0, 1, 1, None, 50, 1.0, 2, 5, 6, 1000),
-        # (0, 1, 1, None, 100, 1.0, 2, 5, 6, 1000),
-        # (0, 1, 1, None, 200, 1.0, 2, 5, 6, 1000),
-        # (0, 1, 1, None, 400, 1.0, 2, 5, 6, 1000),
-        # (0, 1, 1, None, 800, 1.0, 2, 5, 6, 1000),
+        (0, 1, 3, None, 25, 1.0, 2, 13, 5, 7000),
+        (0, 1, 3, None, 50, 1.0, 2, 13, 5, 7000),
+        (0, 1, 3, None, 100, 1.0, 2, 13, 5, 7000),
+        (0, 1, 3, None, 200, 1.0, 2, 13, 5, 7000),
+        (0, 1, 3, None, 400, 1.0, 2, 13, 5, 7000),
+        (0, 1, 3, None, 800, 1.0, 2, 13, 5, 7000),
         # (0, 1, 1, None, None, 1.0, 2, 5, 6, 1000),
         # ###### CHANGING gamma ######
         # (0, 1, 1, None, None, 1.0, 2, 5, 6, 4000),
@@ -214,7 +214,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # (0, 1, 4, None, None, 1.0, 2, 18, 5, 6000),
         # (0, 1, 4, None, None, 1.0, 2, 19, 5, 6000),
         # (0, 1, 4, None, None, 1.0, 2, 20, 5, 6000),
-        (0, 1, 5, None, None, 1.0, 2, 21, 5, 6000),
+        #(0, 1, 5, None, None, 1.0, 2, 21, 5, 6000),
         # (0, 1, 5, None, None, 1.0, 2, 22, 5, 6000),
         # (0, 1, 5, None, None, 1.0, 2, 23, 5, 6000),
         # (0, 1, 5, None, None, 1.0, 2, 24, 5, 6000),
@@ -305,6 +305,10 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
 
                     print(ret.result())
                     ret.print(filename)
+
+                except KeyError as e:
+                    print(f"KeyError: {e}, retrying run {run}...")
+                    continue
 
                 except BenchError as e:
                     current_cause = e.cause
