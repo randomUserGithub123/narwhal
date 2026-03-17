@@ -315,9 +315,16 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                     while isinstance(current_cause, BenchError):
                         current_cause = current_cause.cause
                     
-                    if isinstance(current_cause, ParseError) and "Worker(s) panicked" in str(current_cause):
-                        print(f"Workers panicked, retrying run {run}...")
-                        continue
+                    if isinstance(current_cause, ParseError):
+                        error_str = str(current_cause)
+                        
+                        if "Invalid isoformat string" in error_str:
+                            print(f"Invalid isoformat string error detected, retrying run {run}...")
+                            continue
+                            
+                        elif "Worker(s) panicked" in error_str:
+                            print(f"Workers panicked, retrying run {run}...")
+                            continue
 
                     raise
 
