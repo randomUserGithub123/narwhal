@@ -10,6 +10,7 @@ use crypto::PublicKey;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 // =============================================================================
 // Types
@@ -106,7 +107,10 @@ impl TransactionNode {
 #[derive(Clone, Debug)]
 pub struct DependencyGraph {
     pub round: Round,
+    /// Node membership as HashSet for O(1) contains checks.
     pub nodes: HashSet<TxDigest>,
+    /// Node list as Vec for cache-friendly iteration (mirrors nodes).
+    pub node_vec: Vec<TxDigest>,
     pub weights: HashMap<(TxDigest, TxDigest), usize>,
     pub edges: HashSet<(TxDigest, TxDigest)>,
     pub finalized: bool,
@@ -125,12 +129,27 @@ impl DependencyGraph {
         DependencyGraph {
             round,
             nodes: HashSet::new(),
+            node_vec: Vec::new(),
             weights: HashMap::new(),
             edges: HashSet::new(),
             finalized: false,
             final_order: Vec::new(),
             counted_replicas: HashMap::new(),
         }
+    }
+
+    /// Insert a node (maintains both set and vec).
+    #[inline]
+    fn insert_node(&mut self, d: TxDigest) {
+        if self.nodes.insert(d) {
+            self.node_vec.push(d);
+        }
+    }
+
+    /// Check if an edge exists between d1 and d2 in either direction.
+    #[inline]
+    fn has_edge(&self, d1: TxDigest, d2: TxDigest) -> bool {
+        self.edges.contains(&(d1, d2)) || self.edges.contains(&(d2, d1))
     }
 
     /// A tournament on n nodes has exactly n*(n-1)/2 directed edges
@@ -223,6 +242,7 @@ impl FairnessLayer {
     // =========================================================================
 
     pub fn process_subdag(&mut self, subdag: &CommittedSubdag) -> Vec<TxDigest> {
+        let t_total = Instant::now();
         let r = subdag.leader_round;
 
         let total_entries: usize = subdag
@@ -230,40 +250,36 @@ impl FairnessLayer {
             .iter()
             .map(|v| v.ordering_entries.len())
             .sum();
-        info!(
-            "FairnessLayer: processing subdag leader_round={} vertices={} total_entries={}",
-            r,
-            subdag.vertices.len(),
-            total_entries
-        );
 
         // Figure 8, Line 2: Gr := NewGraph(), graphs.push(Gr)
         let graph_idx = self.graphs.len();
         self.graphs.push(DependencyGraph::new(r));
         self.round_to_graph.insert(r, graph_idx);
 
-        // Process any pending re-add nodes from a prior finalization
-        // (these were leftover shaded nodes that had no next graph at the time).
+        // Process pending re-adds from prior finalization.
+        let t0 = Instant::now();
         self.process_pending_readd(graph_idx);
+        let t0_ns = t0.elapsed().as_nanos();
 
         // Figure 8, Lines 3-10: Update nodes from subdag.
+        let t1 = Instant::now();
         let updated_nodes = self.update_nodes_from_subdag(subdag);
+        let t1_ns = t1.elapsed().as_nanos();
 
         // Figure 8, Lines 11-18: Classify and add nodes to Gr.
+        let t2 = Instant::now();
         let newly_classified = self.classify_and_add_nodes(r, graph_idx, &updated_nodes);
+        let t2_ns = t2.elapsed().as_nanos();
 
-        // LIVENESS FIX: Compute full pairwise weights for newly classified
-        // nodes using ALL accumulated committed_ois — not just the current
-        // subdag's vertices. This closes the gap where a replica committed
-        // both members of a pair in a previous subdag (when one or both were
-        // still blank), and the incremental weight update will never revisit
-        // that pair from that replica's perspective.
+        // LIVENESS FIX: Catch-up weights for newly classified nodes.
+        let t3 = Instant::now();
         self.compute_catchup_weights_for_new_nodes(graph_idx, &newly_classified);
+        let t3_ns = t3.elapsed().as_nanos();
 
-        // Figure 8, Lines 19-39: Incremental weight update from current
-        // subdag's vertices. This handles edges between nodes that were
-        // ALREADY in older graphs and receive new weight data now.
+        // Figure 8, Lines 19-39: Incremental weight update from subdag.
+        let t4 = Instant::now();
         self.update_weights_and_edges(subdag);
+        let t4_ns = t4.elapsed().as_nanos();
 
         // Log graph states.
         for (gi, g) in self.graphs.iter().enumerate() {
@@ -275,18 +291,27 @@ impl FairnessLayer {
                 };
                 info!(
                     "DIAG graph_state: G[{}] round={} nodes={} edges={}/{} is_tournament={}",
-                    gi,
-                    g.round,
-                    g.nodes.len(),
-                    g.edges.len(),
-                    expected,
-                    g.is_tournament()
+                    gi, g.round, g.nodes.len(), g.edges.len(), expected, g.is_tournament()
                 );
             }
         }
 
-        // Figure 11, Line 41: OrderFinalization()
-        self.try_finalize_all_graphs()
+        // Figure 11: OrderFinalization()
+        let t5 = Instant::now();
+        let result = self.try_finalize_all_graphs();
+        let t5_ns = t5.elapsed().as_nanos();
+
+        let total_ns = t_total.elapsed().as_nanos();
+
+        info!(
+            "FAIRNESS_TIMING: round={} entries={} updated={} new_classified={} \
+             readd_ns={} update_ns={} classify_ns={} catchup_ns={} \
+             incr_wt_ns={} finalize_ns={} total_ns={} ordered={}",
+            r, total_entries, updated_nodes.len(), newly_classified.len(),
+            t0_ns, t1_ns, t2_ns, t3_ns, t4_ns, t5_ns, total_ns, result.len()
+        );
+
+        result
     }
 
     // =========================================================================
@@ -372,14 +397,14 @@ impl FairnessLayer {
                 // Line 16: node(d).type := solid; Gr.nodes.add(node(d))
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Solid;
                 self.nodes.get_mut(&d).unwrap().graph_index = Some(graph_idx);
-                self.graphs[graph_idx].nodes.insert(d);
+                self.graphs[graph_idx].insert_node(d);
                 newly_classified.push(d);
                 solid_count += 1;
             } else if ap >= self.half_threshold {
                 // Line 18: node(d).type := shaded; Gr.nodes.add(node(d))
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Shaded;
                 self.nodes.get_mut(&d).unwrap().graph_index = Some(graph_idx);
-                self.graphs[graph_idx].nodes.insert(d);
+                self.graphs[graph_idx].insert_node(d);
                 newly_classified.push(d);
                 shaded_count += 1;
             } else {
@@ -401,21 +426,8 @@ impl FairnessLayer {
     }
 
     // =========================================================================
-    // LIVENESS FIX: Catch-up weight computation for newly classified nodes
-    //
-    // When a node d transitions from blank → solid/shaded and is added to Gr,
-    // its committed_ois may contain OIs from PREVIOUS subdags whose vertices
-    // have already been processed and will never appear in future subdags.
-    //
-    // The protocol's incremental weight update (Figure 8 Lines 21-32) only
-    // processes the CURRENT subdag's vertices, so pairs where both nodes had
-    // their OI from a given replica committed in a previous subdag will never
-    // receive that replica's weight contribution — causing permanent edge
-    // deficits and liveness failure.
-    //
-    // Fix: for each newly classified node, compute full pairwise weights
-    // against all existing nodes in the graph using ALL accumulated
-    // committed_ois. This is the same approach used by readd_nodes_to_graph.
+    // LIVENESS FIX: Catch-up weight computation for newly classified nodes.
+    // Pre-collects OI vectors to avoid repeated HashMap lookups in hot loop.
     // =========================================================================
 
     fn compute_catchup_weights_for_new_nodes(
@@ -431,74 +443,78 @@ impl FairnessLayer {
         let mut edges_added = 0usize;
         let mut weights_computed = 0usize;
 
+        // OPTIMIZATION: snapshot node_vec once for iteration.
+        let existing_snapshot: Vec<TxDigest> = self.graphs[graph_idx].node_vec.clone();
+
         for &d in newly_classified {
-            // Compare d against all OTHER nodes already in the graph.
-            let existing_nodes: Vec<TxDigest> = self.graphs[graph_idx]
+            // OPTIMIZATION: Pre-collect OI data to avoid repeated HashMap lookups.
+            let d_ois: Vec<(ReplicaIndex, u64)> = self
                 .nodes
+                .get(&d)
+                .unwrap()
+                .committed_ois
                 .iter()
-                .filter(|&&d2| d2 != d)
-                .cloned()
+                .map(|(&i, &oi)| (i, oi))
                 .collect();
 
-            for d2 in existing_nodes {
-                // For pairs between two newly classified nodes, only compute
-                // once: when d < d2 (avoid duplicate computation).
+            for &d2 in &existing_snapshot {
+                if d2 == d {
+                    continue;
+                }
                 if newly_set.contains(&d2) && d > d2 {
                     continue;
                 }
 
-                // Compute full weights from ALL committed_ois.
-                let (w_d_d2, w_d2_d) = self.calculate_pairwise_weight(d, d2);
+                // Inline pairwise weight to avoid fn call overhead.
+                let node2 = self.nodes.get(&d2).unwrap();
+                let mut w12: usize = 0;
+                let mut w21: usize = 0;
+                for &(i, oi1) in &d_ois {
+                    if let Some(&oi2) = node2.committed_ois.get(&i) {
+                        if oi1 < oi2 {
+                            w12 += 1;
+                        } else {
+                            w21 += 1;
+                        }
+                    }
+                }
                 weights_computed += 1;
 
-                // Store the computed weights (overwrite any partial values from
-                // incremental updates — the full computation is authoritative).
-                self.graphs[graph_idx].weights.insert((d, d2), w_d_d2);
-                self.graphs[graph_idx].weights.insert((d2, d), w_d2_d);
+                self.graphs[graph_idx].weights.insert((d, d2), w12);
+                self.graphs[graph_idx].weights.insert((d2, d), w21);
 
-                // Mark all replicas that contributed as counted (so the
-                // incremental update doesn't double-count).
+                // Mark replicas as counted.
                 let pair = (d.min(d2), d.max(d2));
-                let node1 = self.nodes.get(&d).unwrap();
-                let node2 = self.nodes.get(&d2).unwrap();
                 let replica_set = self.graphs[graph_idx]
                     .counted_replicas
                     .entry(pair)
                     .or_default();
-                for (&i, _) in &node1.committed_ois {
+                for &(i, _) in &d_ois {
                     if node2.committed_ois.contains_key(&i) {
                         replica_set.insert(i);
                     }
                 }
 
-                // Add edge if threshold met and no edge exists yet.
-                if w_d_d2 >= self.half_threshold || w_d2_d >= self.half_threshold {
-                    if self.graphs[graph_idx].edges.contains(&(d, d2))
-                        || self.graphs[graph_idx].edges.contains(&(d2, d))
-                    {
-                        continue;
+                // Add edge if threshold met.
+                if w12 >= self.half_threshold || w21 >= self.half_threshold {
+                    if !self.graphs[graph_idx].has_edge(d, d2) {
+                        if w12 >= w21 {
+                            self.graphs[graph_idx].edges.insert((d, d2));
+                        } else {
+                            self.graphs[graph_idx].edges.insert((d2, d));
+                        }
+                        edges_added += 1;
                     }
-
-                    if w_d_d2 >= w_d2_d {
-                        self.graphs[graph_idx].edges.insert((d, d2));
-                    } else {
-                        self.graphs[graph_idx].edges.insert((d2, d));
-                    }
-                    edges_added += 1;
                 }
             }
         }
 
         info!(
-            "FairnessLayer: catchup weights for {} new nodes in G[{}]: \
-             pairs_computed={} edges_added={}",
-            newly_classified.len(),
-            graph_idx,
-            weights_computed,
-            edges_added
+            "FAIRNESS_TIMING: catchup G[{}] new_nodes={} pairs={} edges_added={}",
+            graph_idx, newly_classified.len(), weights_computed, edges_added
         );
     }
-
+        
     // =========================================================================
     // Figure 8, Lines 19-39: Update weights and add edges
     //
@@ -558,9 +574,9 @@ impl FairnessLayer {
                     None => continue, // replica i has no OI for d
                 };
 
-                // Collect (d2, d2_oi) pairs from the graph to avoid borrow issues.
+                // OPTIMIZATION: Iterate node_vec (cache-friendly) instead of node_set.
                 let graph_nodes: Vec<TxDigest> =
-                    self.graphs[g_idx].nodes.iter().cloned().collect();
+                    self.graphs[g_idx].node_vec.clone();
 
                 // Figure 8, Line 26: for node(d2) ∈ G'.nodes do
                 for d2 in graph_nodes {
@@ -584,8 +600,7 @@ impl FairnessLayer {
                     let pair = (d.min(d2), d.max(d2));
 
                     // Skip if this pair already has an edge.
-                    if self.graphs[g_idx].edges.contains(&(d, d2))
-                        || self.graphs[g_idx].edges.contains(&(d2, d))
+                    if self.graphs[g_idx].has_edge(d, d2)
                     {
                         stat_pairs_skipped_edge += 1;
                         continue;
@@ -655,8 +670,7 @@ impl FairnessLayer {
             };
 
             // Skip if edge already exists (from a previous subdag or re-add).
-            if self.graphs[g_idx].edges.contains(&(d1, d2))
-                || self.graphs[g_idx].edges.contains(&(d2, d1))
+            if self.graphs[g_idx].has_edge(d1, d2)
             {
                 continue;
             }
@@ -750,15 +764,20 @@ impl FairnessLayer {
 
     /// Figure 11, Lines 4-29: Finalize ordering for a tournament graph.
     fn finalize_ordering(&mut self, graph_idx: usize) -> Vec<TxDigest> {
+        let t_start = Instant::now();
         let graph = &self.graphs[graph_idx];
-        let nodes: Vec<TxDigest> = graph.nodes.iter().cloned().collect();
+        let nodes: Vec<TxDigest> = graph.node_vec.clone();
         let edges: Vec<(TxDigest, TxDigest)> = graph.edges.iter().cloned().collect();
 
         // Figure 11, Line 5: Gc := Tarjan_SCC(Gr)
+        let t_scc = Instant::now();
         let sccs = tarjan_scc(&nodes, &edges);
+        let scc_ns = t_scc.elapsed().as_nanos();
 
         // Figure 11, Line 6: [S1, S2, ..., Ss] := Topologically_Sorted(Gc)
+        let t_topo = Instant::now();
         let topo_order = topological_sort_sccs(&sccs, &edges);
+        let topo_ns = t_topo.elapsed().as_nanos();
 
         // Figure 11, Line 7: last := max{j | ∃node ∈ Sj, node.type = solid}
         let mut last_solid_scc_pos: Option<usize> = None;
@@ -846,6 +865,8 @@ impl FairnessLayer {
         //         Calculate weights and add edges if threshold met
         // =====================================================================
 
+        let to_readd_len = to_readd.len();
+
         if !to_readd.is_empty() {
             // Figure 11, Line 13: Gr' := graphs.Front() — the next non-finalized graph.
             let next_graph_idx = self.find_next_unfinalized_graph(graph_idx);
@@ -880,11 +901,10 @@ impl FairnessLayer {
         }
 
         info!(
-            "FairnessLayer: finalized {} transactions from graph {} (round {}). Total ordered: {}",
-            ordered.len(),
-            graph_idx,
-            self.graphs[graph_idx].round,
-            self.output_sequence.len()
+            "FAIRNESS_TIMING: finalize_detail G[{}] nodes={} sccs={} scc_ns={} topo_ns={} \
+             ordered={} readd={} total_ns={}",
+            graph_idx, nodes.len(), sccs.len(), scc_ns, topo_ns,
+            ordered.len(), to_readd_len, t_start.elapsed().as_nanos()
         );
 
         ordered
@@ -922,45 +942,55 @@ impl FairnessLayer {
     fn readd_nodes_to_graph(&mut self, to_readd: Vec<TxDigest>, target_graph_idx: usize) {
         let r_prime = self.graphs[target_graph_idx].round;
 
-        // Figure 11, Lines 15-16: For each node(d) to re-add
         for d in &to_readd {
             let d = *d;
 
-            // Figure 11, Line 16: ap(d, r')
             let ap = self.nodes.get(&d).unwrap().appearance_count(r_prime);
 
-            // Figure 11, Lines 17-20: Classify
             if ap >= self.solid_threshold {
-                // Line 18: node(d).type = solid
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Solid;
             } else if ap >= self.half_threshold {
-                // Line 20: node(d).type = shaded
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Shaded;
             } else {
-                // Still below threshold — classify as shaded anyway for re-add
-                // (the protocol re-adds all leftover nodes from finalized SCCs).
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Shaded;
             }
 
-            // Figure 11, Line 21: Gr'.nodes.add(node(d))
             self.nodes.get_mut(&d).unwrap().graph_index = Some(target_graph_idx);
-            self.graphs[target_graph_idx].nodes.insert(d);
+            self.graphs[target_graph_idx].insert_node(d);
 
-            // Figure 11, Lines 22-29: Calculate weights and edges with all
-            // existing nodes in Gr'.
-            // Collect existing nodes first to avoid borrow conflict.
-            let existing_nodes: Vec<TxDigest> = self.graphs[target_graph_idx]
+            // OPTIMIZATION: Pre-collect OIs for d once.
+            let d_ois: Vec<(ReplicaIndex, u64)> = self
                 .nodes
+                .get(&d)
+                .unwrap()
+                .committed_ois
+                .iter()
+                .map(|(&i, &oi)| (i, oi))
+                .collect();
+
+            // OPTIMIZATION: Use node_vec for iteration.
+            let existing_nodes: Vec<TxDigest> = self.graphs[target_graph_idx]
+                .node_vec
                 .iter()
                 .filter(|&&d2| d2 != d)
                 .cloned()
                 .collect();
 
             for d2 in existing_nodes {
-                // Figure 11, Lines 23-24: Calculate weights from ALL committed OIs.
-                let (w_d_d2, w_d2_d) = self.calculate_pairwise_weight(d, d2);
+                // Inline pairwise weight computation.
+                let node2 = self.nodes.get(&d2).unwrap();
+                let mut w_d_d2: usize = 0;
+                let mut w_d2_d: usize = 0;
+                for &(i, oi1) in &d_ois {
+                    if let Some(&oi2) = node2.committed_ois.get(&i) {
+                        if oi1 < oi2 {
+                            w_d_d2 += 1;
+                        } else {
+                            w_d2_d += 1;
+                        }
+                    }
+                }
 
-                // Store the computed weights.
                 self.graphs[target_graph_idx]
                     .weights
                     .insert((d, d2), w_d_d2);
@@ -968,22 +998,13 @@ impl FairnessLayer {
                     .weights
                     .insert((d2, d), w_d2_d);
 
-                // Figure 11, Lines 25-29: Add edge if threshold met.
                 if w_d_d2 >= self.half_threshold || w_d2_d >= self.half_threshold {
-                    // Skip if edge already exists.
-                    if self.graphs[target_graph_idx].edges.contains(&(d, d2))
-                        || self.graphs[target_graph_idx].edges.contains(&(d2, d))
-                    {
-                        continue;
-                    }
-
-                    // Figure 11, Lines 26-29
-                    if w_d_d2 >= w_d2_d {
-                        // Line 27: Gr'.edges.add(e(d, d2))
-                        self.graphs[target_graph_idx].edges.insert((d, d2));
-                    } else {
-                        // Line 29: Gr'.edges.add(e(d2, d))
-                        self.graphs[target_graph_idx].edges.insert((d2, d));
+                    if !self.graphs[target_graph_idx].has_edge(d, d2) {
+                        if w_d_d2 >= w_d2_d {
+                            self.graphs[target_graph_idx].edges.insert((d, d2));
+                        } else {
+                            self.graphs[target_graph_idx].edges.insert((d2, d));
+                        }
                     }
                 }
             }
