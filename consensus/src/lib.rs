@@ -25,9 +25,9 @@ use primary::{Certificate, Round};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
-use std::convert::TryInto;
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
@@ -166,6 +166,11 @@ impl Consensus {
     ) -> CommittedSubdag {
         let mut vertices: Vec<CommittedVertex> = Vec::new();
 
+        info!(
+            "DIAG extract_subdag: leader_round={} certs={}",
+            leader_round, committed_sequence.len()
+        );
+
         for cert in committed_sequence {
             let author = cert.origin();
             let replica_index = self
@@ -174,37 +179,42 @@ impl Consensus {
                 .position(|k| *k == author)
                 .expect("Certificate author not in committee");
 
-            // Collect ordering entries from ALL batches referenced by this certificate.
             let mut ordering_entries: Vec<(TxDigest, u64)> = Vec::new();
+            let num_batches = cert.header.payload.len();
+            let mut batches_found = 0usize;
+            let mut batches_missing = 0usize;
+            let mut batches_deser_fail = 0usize;
 
             for batch_digest in cert.header.payload.keys() {
-                // Read the serialized batch from the store.
                 match self.store.clone().read(batch_digest.to_vec()).await {
                     Ok(Some(serialized_batch)) => {
-                        // Deserialize: this is a WorkerMessage::Batch(Vec<(tx_bytes, oi)>)
+                        batches_found += 1;
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
                             Ok(WorkerMessage::Batch(batch_entries)) => {
                                 for (tx_bytes, oi) in batch_entries {
-                                    // Extract tx digest: first 8 bytes as u64
                                     let tx_id = Self::extract_tx_digest(&tx_bytes);
                                     ordering_entries.push((tx_id, oi));
                                 }
                             }
                             Ok(_) => {
+                                batches_deser_fail += 1;
                                 warn!(
                                     "Unexpected message type in store for batch {:?}",
                                     batch_digest
                                 );
                             }
                             Err(e) => {
+                                batches_deser_fail += 1;
                                 error!(
-                                    "Failed to deserialize batch {:?}: {}",
-                                    batch_digest, e
+                                    "DIAG deser_fail batch {:?}: {} (first 32 bytes: {:?})",
+                                    batch_digest, e,
+                                    &serialized_batch[..std::cmp::min(32, serialized_batch.len())]
                                 );
                             }
                         }
                     }
                     Ok(None) => {
+                        batches_missing += 1;
                         warn!(
                             "Batch {:?} not found in store (may have been GC'd)",
                             batch_digest
@@ -216,12 +226,16 @@ impl Consensus {
                 }
             }
 
-            if !ordering_entries.is_empty() {
-                debug!(
-                    "FairDAG: cert round={} author={:?} has {} ordering entries",
-                    cert.round(),
-                    author,
-                    ordering_entries.len()
+            info!(
+                "DIAG extract_subdag: cert round={} replica_idx={} payload_batches={} found={} missing={} deser_fail={} ordering_entries={}",
+                cert.round(), replica_index, num_batches, batches_found, batches_missing, batches_deser_fail, ordering_entries.len()
+            );
+
+            // Log first few entries
+            for (ei, (tx_id, oi)) in ordering_entries.iter().take(3).enumerate() {
+                info!(
+                    "DIAG extract_subdag: cert round={} replica={} entry[{}] tx_id={} oi={}",
+                    cert.round(), replica_index, ei, tx_id, oi
                 );
             }
 
@@ -233,7 +247,6 @@ impl Consensus {
             });
         }
 
-        // Sort vertices by round (ascending)
         vertices.sort_by_key(|v| v.round);
 
         CommittedSubdag {

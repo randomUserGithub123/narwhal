@@ -245,11 +245,21 @@ impl FairnessLayer {
     /// Implements Figure 8 of the paper.
     pub fn process_subdag(&mut self, subdag: &CommittedSubdag) -> Vec<TxDigest> {
         let r = subdag.leader_round;
-        info!(
-            "FairnessLayer: processing subdag for leader round {} with {} vertices",
-            r,
-            subdag.vertices.len()
-        );
+
+        // Log every vertex's contents
+        for (vi, vertex) in subdag.vertices.iter().enumerate() {
+            info!(
+                "DIAG subdag r={}: vertex[{}] replica_idx={} round={} entries={}",
+                r, vi, vertex.replica_index, vertex.round, vertex.ordering_entries.len()
+            );
+            // Log first few entries for inspection
+            for (ei, (d, oi)) in vertex.ordering_entries.iter().take(5).enumerate() {
+                info!(
+                    "DIAG subdag r={}: vertex[{}] entry[{}] tx_digest={} oi={}",
+                    r, vi, ei, d, oi
+                );
+            }
+        }
 
         // Line 2: G_r := NewGraph(), graphs.push(G_r)
         let graph_idx = self.graphs.len();
@@ -265,6 +275,27 @@ impl FairnessLayer {
         // Lines 19-39: Update weights and add edges
         self.update_weights_and_edges(subdag, graph_idx);
 
+        // Log graph state after processing
+        for (gi, g) in self.graphs.iter().enumerate() {
+            if !g.finalized && !g.nodes.is_empty() {
+                let total_edges_possible = if g.nodes.len() > 1 {
+                    g.nodes.len() * (g.nodes.len() - 1) / 2
+                } else {
+                    0
+                };
+                info!(
+                    "DIAG graph_state: G[{}] round={} nodes={} edges={}/{} weights={} is_tournament={}",
+                    gi, g.round, g.nodes.len(), g.edges.len(),
+                    total_edges_possible, g.weights.len(), g.is_tournament()
+                );
+            }
+        }
+
+        info!(
+            "DIAG totals: total_nodes_tracked={} total_graphs={} ordered_so_far={}",
+            self.nodes.len(), self.graphs.len(), self.output_sequence.len()
+        );
+
         // Line 40-41: Check all graphs for tournament completion and finalize
         self.try_finalize_all_graphs()
     }
@@ -277,34 +308,53 @@ impl FairnessLayer {
         let mut updated_nodes: HashSet<TxDigest> = HashSet::new();
         let r = subdag.leader_round;
 
+        let mut total_entries = 0usize;
+        let mut new_ois = 0usize;
+        let mut skipped_ordered = 0usize;
+        let mut skipped_dup = 0usize;
+
         for vertex in &subdag.vertices {
             let i = vertex.replica_index;
 
             for &(d, oi) in &vertex.ordering_entries {
-                // Skip already-ordered transactions
+                total_entries += 1;
+
                 if self.ordered_digests.contains(&d) {
+                    skipped_ordered += 1;
                     continue;
                 }
 
                 let node = self.nodes.entry(d).or_insert_with(|| TransactionNode::new(d));
 
-                // Line 8: node(d).committed_ois[i] := oi
-                // Only set if not already set (first commit wins for this replica)
                 if !node.committed_ois.contains_key(&i) {
                     node.committed_ois.insert(i, oi);
-                    // Line 9: node(d).committed_rounds[i] := r
                     node.committed_rounds.insert(i, r);
-                    // Line 10: updated_nodes.insert(d)
                     updated_nodes.insert(d);
+                    new_ois += 1;
+                } else {
+                    skipped_dup += 1;
                 }
             }
         }
 
-        debug!(
-            "FairnessLayer: updated {} transaction nodes from subdag round {}",
-            updated_nodes.len(),
-            r
+        info!(
+            "DIAG update_nodes r={}: total_entries={} new_ois={} skipped_ordered={} skipped_dup={} updated_nodes={}",
+            r, total_entries, new_ois, skipped_ordered, skipped_dup, updated_nodes.len()
         );
+
+        // Log a few sample nodes with their OI counts
+        let mut sample_count = 0;
+        for &d in updated_nodes.iter() {
+            if sample_count >= 5 { break; }
+            if let Some(node) = self.nodes.get(&d) {
+                info!(
+                    "DIAG sample_node tx={} committed_ois_count={} ois={:?}",
+                    d, node.committed_ois.len(), node.committed_ois
+                );
+                sample_count += 1;
+            }
+        }
+
         updated_nodes
     }
 
@@ -319,46 +369,59 @@ impl FairnessLayer {
         updated_nodes: &HashSet<TxDigest>,
     ) {
         let mut newly_added: Vec<TxDigest> = Vec::new();
+        let mut solid_count = 0usize;
+        let mut shaded_count = 0usize;
+        let mut blank_count = 0usize;
+        let mut already_classified = 0usize;
 
         for &d in updated_nodes {
-            // Line 13: only process blank nodes
             let node = self.nodes.get(&d).unwrap();
             if node.node_type != NodeType::Blank {
+                already_classified += 1;
                 continue;
             }
 
-            // Line 14: ap(d, r)
             let ap = node.appearance_count(r);
 
-            // Lines 15-18: classify
             if ap >= self.solid_threshold {
-                // Line 16: solid
                 newly_added.push(d);
-                // We need to mutate, so re-borrow
                 let node = self.nodes.get_mut(&d).unwrap();
                 node.node_type = NodeType::Solid;
                 node.graph_index = Some(graph_idx);
+                solid_count += 1;
             } else if ap >= self.half_threshold {
-                // Line 18: shaded
                 newly_added.push(d);
                 let node = self.nodes.get_mut(&d).unwrap();
                 node.node_type = NodeType::Shaded;
                 node.graph_index = Some(graph_idx);
+                shaded_count += 1;
+            } else {
+                blank_count += 1;
             }
-            // else: remains blank
         }
 
-        // Add newly classified nodes to the graph
         for &d in &newly_added {
             self.graphs[graph_idx].nodes.insert(d);
         }
 
-        debug!(
-            "FairnessLayer: added {} new nodes to graph {} (round {})",
-            newly_added.len(),
-            graph_idx,
-            r
+        info!(
+            "DIAG classify r={} G[{}]: solid={} shaded={} blank={} already_classified={} total_in_graph={}",
+            r, graph_idx, solid_count, shaded_count, blank_count, already_classified,
+            self.graphs[graph_idx].nodes.len()
         );
+
+        // Log a few classified nodes with their ap counts
+        let mut sample_count = 0;
+        for &d in newly_added.iter() {
+            if sample_count >= 3 { break; }
+            if let Some(node) = self.nodes.get(&d) {
+                info!(
+                    "DIAG classified tx={} type={:?} ap={} committed_ois={:?}",
+                    d, node.node_type, node.appearance_count(r), node.committed_ois
+                );
+                sample_count += 1;
+            }
+        }
     }
 
     // =========================================================================
@@ -372,30 +435,46 @@ impl FairnessLayer {
     ) {
         let mut addable_edges: HashSet<(TxDigest, TxDigest)> = HashSet::new();
 
-        // Lines 21-32: Iterate through vertices in A_r
+        let mut stat_vertices = 0usize;
+        let mut stat_entries = 0usize;
+        let mut stat_skip_ordered = 0usize;
+        let mut stat_skip_no_graph = 0usize;
+        let mut stat_skip_no_d_oi = 0usize;
+        let mut stat_d2_checked = 0usize;
+        let mut stat_skip_no_d2_oi = 0usize;
+        let mut stat_weight_incremented = 0usize;
+        let mut stat_max_weight: usize = 0;
+
         for vertex in &subdag.vertices {
             let i = vertex.replica_index;
+            stat_vertices += 1;
 
             for &(d, _oi) in &vertex.ordering_entries {
-                // Skip already-ordered transactions
+                stat_entries += 1;
+
                 if self.ordered_digests.contains(&d) {
+                    stat_skip_ordered += 1;
                     continue;
                 }
 
                 // Line 24: G' := node(d).G
                 let g_idx = match self.nodes.get(&d).and_then(|n| n.graph_index) {
                     Some(idx) => idx,
-                    None => continue, // blank node, not in any graph
+                    None => {
+                        stat_skip_no_graph += 1;
+                        continue;
+                    }
                 };
 
                 // Line 25: d_oi := node(d).committed_ois[i]
                 let d_oi = match self.nodes.get(&d).and_then(|n| n.committed_ois.get(&i)) {
                     Some(&oi) => oi,
-                    None => continue, // replica i hasn't committed an OI for d
+                    None => {
+                        stat_skip_no_d_oi += 1;
+                        continue;
+                    }
                 };
 
-                // Line 26: for node(d2) in G'.nodes
-                // Collect graph nodes to avoid borrow issues
                 let graph_nodes: Vec<TxDigest> =
                     self.graphs[g_idx].nodes.iter().cloned().collect();
 
@@ -403,34 +482,37 @@ impl FairnessLayer {
                     if d2 == d {
                         continue;
                     }
+                    stat_d2_checked += 1;
 
-                    // Get d2's committed_ois[i]
                     let d2_oi = match self.nodes.get(&d2).and_then(|n| n.committed_ois.get(&i)) {
                         Some(&oi) => oi,
-                        None => continue, // replica i hasn't committed an OI for d2
+                        None => {
+                            stat_skip_no_d2_oi += 1;
+                            continue;
+                        }
                     };
 
-                    // Lines 27-30: compare and increment weights
                     if d_oi < d2_oi {
-                        // Line 28: increment G'.weight[(d, d2)]
                         *self.graphs[g_idx]
                             .weights
                             .entry((d, d2))
                             .or_insert(0) += 1;
                     } else {
-                        // Line 30: increment G'.weight[(d2, d)]
                         *self.graphs[g_idx]
                             .weights
                             .entry((d2, d))
                             .or_insert(0) += 1;
                     }
+                    stat_weight_incremented += 1;
 
-                    // Lines 31-32: check if either weight reaches threshold
                     let w_d_d2 = *self.graphs[g_idx].weights.get(&(d, d2)).unwrap_or(&0);
                     let w_d2_d = *self.graphs[g_idx].weights.get(&(d2, d)).unwrap_or(&0);
+                    let max_w = w_d_d2.max(w_d2_d);
+                    if max_w > stat_max_weight {
+                        stat_max_weight = max_w;
+                    }
 
                     if w_d_d2 >= self.half_threshold || w_d2_d >= self.half_threshold {
-                        // Only add if no edge exists yet between this pair
                         if !self.graphs[g_idx].edges.contains(&(d, d2))
                             && !self.graphs[g_idx].edges.contains(&(d2, d))
                         {
@@ -441,15 +523,22 @@ impl FairnessLayer {
             }
         }
 
-        // Lines 33-39: Add edges based on majority preference
+        info!(
+            "DIAG weights: vertices={} entries={} skip_ordered={} skip_no_graph={} skip_no_d_oi={} \
+             d2_checked={} skip_no_d2_oi={} weight_incremented={} max_weight={} half_threshold={} addable_edges={}",
+            stat_vertices, stat_entries, stat_skip_ordered, stat_skip_no_graph,
+            stat_skip_no_d_oi, stat_d2_checked, stat_skip_no_d2_oi,
+            stat_weight_incremented, stat_max_weight, self.half_threshold, addable_edges.len()
+        );
+
+        // Lines 33-39: Add edges
+        let mut edges_added = 0usize;
         for (d, d2) in addable_edges {
-            // Line 35: G := node(d).G
             let g_idx = match self.nodes.get(&d).and_then(|n| n.graph_index) {
                 Some(idx) => idx,
                 None => continue,
             };
 
-            // Skip if edge already exists
             if self.graphs[g_idx].edges.contains(&(d, d2))
                 || self.graphs[g_idx].edges.contains(&(d2, d))
             {
@@ -459,14 +548,16 @@ impl FairnessLayer {
             let w_d_d2 = *self.graphs[g_idx].weights.get(&(d, d2)).unwrap_or(&0);
             let w_d2_d = *self.graphs[g_idx].weights.get(&(d2, d)).unwrap_or(&0);
 
-            // Lines 36-39
             if w_d_d2 >= w_d2_d {
                 self.graphs[g_idx].edges.insert((d, d2));
-                debug!("FairnessLayer: added edge {} -> {} (weight {} vs {})", d, d2, w_d_d2, w_d2_d);
             } else {
                 self.graphs[g_idx].edges.insert((d2, d));
-                debug!("FairnessLayer: added edge {} -> {} (weight {} vs {})", d2, d, w_d2_d, w_d_d2);
             }
+            edges_added += 1;
+        }
+
+        if edges_added > 0 {
+            info!("DIAG: added {} edges this round", edges_added);
         }
     }
 
