@@ -1,14 +1,3 @@
-// FairDAG-RL: FairDagProcessor
-//
-// Runs in the worker process where batch data is stored locally.
-// Receives entire committed subdags from the primary (via GarbageCollector).
-// For each subdag:
-//   1. Reads batch bytes from local store for each cert's payload digests
-//   2. Deserializes to extract (tx_bytes, ordering_indicator) pairs
-//   3. Builds a CommittedSubdag with ordering entries
-//   4. Feeds to FairnessLayer for dependency graph construction + ordering
-//   5. Logs fair-ordered transactions for performance measurement
-
 use crate::local_order_tracker::extract_tx_digest;
 use crate::worker::WorkerMessage;
 use config::Committee;
@@ -16,19 +5,16 @@ use crypto::PublicKey;
 use fairdag_fairness::{
     CommittedSubdag, CommittedVertex, FairnessLayer, Round, TxDigest,
 };
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use primary::Certificate;
+use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
 pub struct FairDagProcessor {
-    /// The persistent storage (worker-local, contains batch data).
     store: Store,
-    /// The FairDAG-RL fairness layer.
     fairness_layer: FairnessLayer,
-    /// Sorted committee keys for replica index lookup.
     sorted_keys: Vec<PublicKey>,
-    /// Receives committed subdags: (leader_round, certificates).
     rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
 }
 
@@ -59,25 +45,48 @@ impl FairDagProcessor {
     }
 
     async fn run(&mut self) {
+        let mut subdag_count: u64 = 0;
+
         while let Some((leader_round, certificates)) = self.rx_committed_subdags.recv().await {
+            subdag_count += 1;
+            let total_start = Instant::now();
+
             info!(
-                "FairDagProcessor: received subdag for leader round {} with {} certs",
-                leader_round,
-                certificates.len()
+                "FAIRDAG_TIMING: subdag #{} received: leader_round={} certs={}",
+                subdag_count, leader_round, certificates.len()
             );
 
-            // Build the CommittedSubdag by reading batches from local store.
+            // Step 1: Extract subdag (reads from store)
+            let extract_start = Instant::now();
             let subdag = self.extract_subdag(leader_round, &certificates).await;
+            let extract_ms = extract_start.elapsed().as_millis();
 
-            // Feed to fairness layer.
+            let total_entries: usize = subdag.vertices.iter()
+                .map(|v| v.ordering_entries.len())
+                .sum();
+
+            info!(
+                "FAIRDAG_TIMING: subdag #{} extract done: {}ms, vertices={} total_entries={}",
+                subdag_count, extract_ms, subdag.vertices.len(), total_entries
+            );
+
+            // Step 2: Process through fairness layer
+            let process_start = Instant::now();
             let fair_ordered = self.fairness_layer.process_subdag(&subdag);
+            let process_ms = process_start.elapsed().as_millis();
 
-            // Log each fair-ordered transaction for the log parser to pick up.
+            let total_ms = total_start.elapsed().as_millis();
+
+            info!(
+                "FAIRDAG_TIMING: subdag #{} process done: {}ms, fair_ordered={} total_time={}ms",
+                subdag_count, process_ms, fair_ordered.len(), total_ms
+            );
+
+            // Log each fair-ordered transaction.
             if !fair_ordered.is_empty() {
                 info!(
                     "FairDAG: outputting {} fair-ordered transactions from leader round {}",
-                    fair_ordered.len(),
-                    leader_round
+                    fair_ordered.len(), leader_round
                 );
                 for tx_id in &fair_ordered {
                     info!("FairDAG-RL ordered transaction: {}", tx_id);
@@ -86,7 +95,6 @@ impl FairDagProcessor {
         }
     }
 
-    /// Read batch data from the local store and extract ordering entries.
     async fn extract_subdag(
         &self,
         leader_round: Round,
@@ -103,10 +111,8 @@ impl FairDagProcessor {
                 .expect("Certificate author not in committee");
 
             let mut ordering_entries: Vec<(TxDigest, u64)> = Vec::new();
-            let num_batches = cert.header.payload.len();
             let mut batches_found = 0usize;
             let mut batches_missing = 0usize;
-            let mut batches_deser_fail = 0usize;
 
             for batch_digest in cert.header.payload.keys() {
                 match self.store.clone().read(batch_digest.to_vec()).await {
@@ -120,19 +126,10 @@ impl FairDagProcessor {
                                 }
                             }
                             Ok(_) => {
-                                batches_deser_fail += 1;
-                                warn!(
-                                    "Unexpected message type in store for batch {:?}",
-                                    batch_digest
-                                );
+                                warn!("Unexpected message type for batch {:?}", batch_digest);
                             }
                             Err(e) => {
-                                batches_deser_fail += 1;
-                                error!(
-                                    "FairDagProcessor: deser_fail batch {:?}: {} (first 32 bytes: {:?})",
-                                    batch_digest, e,
-                                    &serialized_batch[..std::cmp::min(32, serialized_batch.len())]
-                                );
+                                error!("Deser fail batch {:?}: {}", batch_digest, e);
                             }
                         }
                     }
@@ -140,15 +137,14 @@ impl FairDagProcessor {
                         batches_missing += 1;
                     }
                     Err(e) => {
-                        error!("Store read error for batch {:?}: {}", batch_digest, e);
+                        error!("Store read error batch {:?}: {}", batch_digest, e);
                     }
                 }
             }
 
-            debug!(
-                "FairDagProcessor: cert round={} replica={} batches={} found={} missing={} fail={} entries={}",
-                cert.round(), replica_index, num_batches, batches_found,
-                batches_missing, batches_deser_fail, ordering_entries.len()
+            info!(
+                "FAIRDAG_TIMING: extract cert round={} replica={} batches found={} missing={} entries={}",
+                cert.round(), replica_index, batches_found, batches_missing, ordering_entries.len()
             );
 
             vertices.push(CommittedVertex {
@@ -159,7 +155,6 @@ impl FairDagProcessor {
             });
         }
 
-        // Sort vertices by round (ascending) as required by the protocol.
         vertices.sort_by_key(|v| v.round);
 
         CommittedSubdag {
