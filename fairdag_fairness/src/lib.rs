@@ -250,9 +250,19 @@ impl FairnessLayer {
         let updated_nodes = self.update_nodes_from_subdag(subdag);
 
         // Figure 8, Lines 11-18: Classify and add nodes to Gr.
-        self.classify_and_add_nodes(r, graph_idx, &updated_nodes);
+        let newly_classified = self.classify_and_add_nodes(r, graph_idx, &updated_nodes);
 
-        // Figure 8, Lines 19-39: Update weights and add edges.
+        // LIVENESS FIX: Compute full pairwise weights for newly classified
+        // nodes using ALL accumulated committed_ois — not just the current
+        // subdag's vertices. This closes the gap where a replica committed
+        // both members of a pair in a previous subdag (when one or both were
+        // still blank), and the incremental weight update will never revisit
+        // that pair from that replica's perspective.
+        self.compute_catchup_weights_for_new_nodes(graph_idx, &newly_classified);
+
+        // Figure 8, Lines 19-39: Incremental weight update from current
+        // subdag's vertices. This handles edges between nodes that were
+        // ALREADY in older graphs and receive new weight data now.
         self.update_weights_and_edges(subdag);
 
         // Log graph states.
@@ -341,10 +351,11 @@ impl FairnessLayer {
         r: Round,
         graph_idx: usize,
         updated_nodes: &HashSet<TxDigest>,
-    ) {
+    ) -> Vec<TxDigest> {
         let mut solid_count = 0usize;
         let mut shaded_count = 0usize;
         let mut blank_count = 0usize;
+        let mut newly_classified: Vec<TxDigest> = Vec::new();
 
         // Figure 8, Line 12: for d ∈ updated_nodes do
         for &d in updated_nodes {
@@ -362,37 +373,15 @@ impl FairnessLayer {
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Solid;
                 self.nodes.get_mut(&d).unwrap().graph_index = Some(graph_idx);
                 self.graphs[graph_idx].nodes.insert(d);
+                newly_classified.push(d);
                 solid_count += 1;
-
-                // DEBUG: Log how many OIs this node already had from previous subdags
-                let node_debug = self.nodes.get(&d).unwrap();
-                let prior_ois = node_debug.committed_ois.len();
-                if prior_ois > 1 {
-                    info!(
-                        "DEBUG_CLASSIFY G[{}] node {} classified as {:?} with {} prior OIs: {:?}",
-                        graph_idx, d, node_debug.node_type, prior_ois,
-                        node_debug.committed_ois
-                    );
-                }
-
             } else if ap >= self.half_threshold {
                 // Line 18: node(d).type := shaded; Gr.nodes.add(node(d))
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Shaded;
                 self.nodes.get_mut(&d).unwrap().graph_index = Some(graph_idx);
                 self.graphs[graph_idx].nodes.insert(d);
+                newly_classified.push(d);
                 shaded_count += 1;
-
-                // DEBUG: Log how many OIs this node already had from previous subdags
-                let node_debug = self.nodes.get(&d).unwrap();
-                let prior_ois = node_debug.committed_ois.len();
-                if prior_ois > 1 {
-                    info!(
-                        "DEBUG_CLASSIFY G[{}] node {} classified as {:?} with {} prior OIs: {:?}",
-                        graph_idx, d, node_debug.node_type, prior_ois,
-                        node_debug.committed_ois
-                    );
-                }
-
             } else {
                 blank_count += 1;
             }
@@ -406,6 +395,107 @@ impl FairnessLayer {
             shaded_count,
             blank_count,
             self.graphs[graph_idx].nodes.len()
+        );
+
+        newly_classified
+    }
+
+    // =========================================================================
+    // LIVENESS FIX: Catch-up weight computation for newly classified nodes
+    //
+    // When a node d transitions from blank → solid/shaded and is added to Gr,
+    // its committed_ois may contain OIs from PREVIOUS subdags whose vertices
+    // have already been processed and will never appear in future subdags.
+    //
+    // The protocol's incremental weight update (Figure 8 Lines 21-32) only
+    // processes the CURRENT subdag's vertices, so pairs where both nodes had
+    // their OI from a given replica committed in a previous subdag will never
+    // receive that replica's weight contribution — causing permanent edge
+    // deficits and liveness failure.
+    //
+    // Fix: for each newly classified node, compute full pairwise weights
+    // against all existing nodes in the graph using ALL accumulated
+    // committed_ois. This is the same approach used by readd_nodes_to_graph.
+    // =========================================================================
+
+    fn compute_catchup_weights_for_new_nodes(
+        &mut self,
+        graph_idx: usize,
+        newly_classified: &[TxDigest],
+    ) {
+        if newly_classified.is_empty() {
+            return;
+        }
+
+        let newly_set: HashSet<TxDigest> = newly_classified.iter().cloned().collect();
+        let mut edges_added = 0usize;
+        let mut weights_computed = 0usize;
+
+        for &d in newly_classified {
+            // Compare d against all OTHER nodes already in the graph.
+            let existing_nodes: Vec<TxDigest> = self.graphs[graph_idx]
+                .nodes
+                .iter()
+                .filter(|&&d2| d2 != d)
+                .cloned()
+                .collect();
+
+            for d2 in existing_nodes {
+                // For pairs between two newly classified nodes, only compute
+                // once: when d < d2 (avoid duplicate computation).
+                if newly_set.contains(&d2) && d > d2 {
+                    continue;
+                }
+
+                // Compute full weights from ALL committed_ois.
+                let (w_d_d2, w_d2_d) = self.calculate_pairwise_weight(d, d2);
+                weights_computed += 1;
+
+                // Store the computed weights (overwrite any partial values from
+                // incremental updates — the full computation is authoritative).
+                self.graphs[graph_idx].weights.insert((d, d2), w_d_d2);
+                self.graphs[graph_idx].weights.insert((d2, d), w_d2_d);
+
+                // Mark all replicas that contributed as counted (so the
+                // incremental update doesn't double-count).
+                let pair = (d.min(d2), d.max(d2));
+                let node1 = self.nodes.get(&d).unwrap();
+                let node2 = self.nodes.get(&d2).unwrap();
+                let replica_set = self.graphs[graph_idx]
+                    .counted_replicas
+                    .entry(pair)
+                    .or_default();
+                for (&i, _) in &node1.committed_ois {
+                    if node2.committed_ois.contains_key(&i) {
+                        replica_set.insert(i);
+                    }
+                }
+
+                // Add edge if threshold met and no edge exists yet.
+                if w_d_d2 >= self.half_threshold || w_d2_d >= self.half_threshold {
+                    if self.graphs[graph_idx].edges.contains(&(d, d2))
+                        || self.graphs[graph_idx].edges.contains(&(d2, d))
+                    {
+                        continue;
+                    }
+
+                    if w_d_d2 >= w_d2_d {
+                        self.graphs[graph_idx].edges.insert((d, d2));
+                    } else {
+                        self.graphs[graph_idx].edges.insert((d2, d));
+                    }
+                    edges_added += 1;
+                }
+            }
+        }
+
+        info!(
+            "FairnessLayer: catchup weights for {} new nodes in G[{}]: \
+             pairs_computed={} edges_added={}",
+            newly_classified.len(),
+            graph_idx,
+            weights_computed,
+            edges_added
         );
     }
 
@@ -584,63 +674,6 @@ impl FairnessLayer {
             }
             edges_added += 1;
         }
-
-
-        // === DEBUG: Sample stuck pairs (missing edges) ===
-        for (gi, g) in self.graphs.iter().enumerate() {
-            if g.finalized || g.nodes.is_empty() || g.is_tournament() {
-                continue;
-            }
-            let nodes_vec: Vec<TxDigest> = g.nodes.iter().cloned().collect();
-            let mut stuck_count = 0usize;
-            let mut sampled = 0usize;
-            for i_idx in 0..nodes_vec.len() {
-                for j_idx in (i_idx + 1)..nodes_vec.len() {
-                    let da = nodes_vec[i_idx];
-                    let db = nodes_vec[j_idx];
-                    if g.edges.contains(&(da, db)) || g.edges.contains(&(db, da)) {
-                        continue;
-                    }
-                    stuck_count += 1;
-                    if sampled < 5 {
-                        sampled += 1;
-                        let w_ab = *g.weights.get(&(da, db)).unwrap_or(&0);
-                        let w_ba = *g.weights.get(&(db, da)).unwrap_or(&0);
-                        let node_a = self.nodes.get(&da).unwrap();
-                        let node_b = self.nodes.get(&db).unwrap();
-                        // How many replicas have OIs for BOTH?
-                        let mut could_vote = 0usize;
-                        let mut actually_counted = 0usize;
-                        let pair = (da.min(db), da.max(db));
-                        let counted = g.counted_replicas.get(&pair);
-                        for (&rep, _) in &node_a.committed_ois {
-                            if node_b.committed_ois.contains_key(&rep) {
-                                could_vote += 1;
-                                if counted.map_or(false, |s| s.contains(&rep)) {
-                                    actually_counted += 1;
-                                }
-                            }
-                        }
-                        info!(
-                            "DEBUG_STUCK G[{}] pair ({}, {}): w_ab={} w_ba={} \
-                             could_vote={} actually_counted={} threshold={} \
-                             a_ois={:?} b_ois={:?}",
-                            gi, da, db, w_ab, w_ba,
-                            could_vote, actually_counted, self.half_threshold,
-                            node_a.committed_ois, node_b.committed_ois,
-                        );
-                    }
-                }
-            }
-            if stuck_count > 0 {
-                info!(
-                    "DEBUG_STUCK G[{}] total_stuck_pairs={} (out of {} needed)",
-                    gi, stuck_count,
-                    nodes_vec.len() * (nodes_vec.len() - 1) / 2
-                );
-            }
-        }
-        // === END DEBUG ===
 
         info!(
             "FairnessLayer: weights pairs_checked={} skipped_counted={} skipped_edge={} \
