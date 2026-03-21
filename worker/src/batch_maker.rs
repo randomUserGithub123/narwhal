@@ -1,4 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+// Modified for FairDAG-RL: uses shared LocalOrderTracker to assign ordering
+// indicators based on first-arrival time (regardless of source).
+use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker};
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
@@ -9,6 +12,7 @@ use crypto::PublicKey;
 use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
+use log::debug;
 use network::ReliableSender;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
@@ -21,7 +25,12 @@ use tokio::time::{sleep, Duration, Instant};
 pub mod batch_maker_tests;
 
 pub type Transaction = Vec<u8>;
-pub type Batch = Vec<Transaction>;
+
+/// FairDAG-RL: A batch entry is a transaction paired with its ordering indicator.
+pub type BatchEntry = (Transaction, u64); // (raw_tx, ordering_indicator)
+
+/// A batch is a sequence of (transaction, ordering_indicator) pairs.
+pub type Batch = Vec<BatchEntry>;
 
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
@@ -41,6 +50,15 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
+
+    // =========================================================================
+    // FairDAG-RL: shared local order tracker
+    // =========================================================================
+    /// Shared tracker that records the local arrival order of transactions.
+    /// This is the same tracker used by the WorkerReceiverHandler for
+    /// indirect arrivals — so if a tx arrived in another worker's batch
+    /// first, it already has an earlier OI.
+    tracker: LocalOrderTracker,
 }
 
 impl BatchMaker {
@@ -50,6 +68,7 @@ impl BatchMaker {
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        tracker: LocalOrderTracker,
     ) {
         tokio::spawn(async move {
             Self {
@@ -61,6 +80,7 @@ impl BatchMaker {
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
+                tracker,
             }
             .run()
             .await;
@@ -76,8 +96,21 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
+                    // FairDAG-RL: record this tx in the shared tracker.
+                    // If it already arrived via another worker's batch, this
+                    // returns the EARLIER OI. If it's genuinely new, it gets
+                    // the next counter value.
+                    let tx_digest = extract_tx_digest(&transaction);
+                    let oi = self.tracker.record(tx_digest);
+
+                    debug!(
+                        "FairDAG BatchMaker: tx {} → OI {} (counter at {})",
+                        tx_digest, oi, self.tracker.current_counter()
+                    );
+
                     self.current_batch_size += transaction.len();
-                    self.current_batch.push(transaction);
+                    self.current_batch.push((transaction, oi));
+
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -93,7 +126,7 @@ impl BatchMaker {
                 }
             }
 
-            // Give the change to schedule other tasks.
+            // Give the chance to schedule other tasks.
             tokio::task::yield_now().await;
         }
     }
@@ -103,17 +136,23 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
 
-        // Gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]
         let tx_ids: Vec<_> = self
             .current_batch
             .iter()
-            .filter(|tx| tx.len() > 8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
+            .filter(|(tx, _)| tx.len() > 8)
+            .filter_map(|(tx, _)| tx[1..9].try_into().ok())
             .collect();
 
+        debug!(
+            "FairDAG BatchMaker: sealing batch with {} entries, OI range [{}, {}]",
+            self.current_batch.len(),
+            self.current_batch.first().map(|(_, oi)| *oi).unwrap_or(0),
+            self.current_batch.last().map(|(_, oi)| *oi).unwrap_or(0),
+        );
+
         self.current_batch_size = 0;
-        let batch: Vec<_> = self.current_batch.drain(..).collect();
+        let batch: Batch = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 

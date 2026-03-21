@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+// Modified for FairDAG-RL: wires up fair ordering output from consensus.
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
@@ -6,6 +7,7 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use env_logger::Env;
+use log::info;
 use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
@@ -65,7 +67,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Runs either a worker or a primary.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let key_file = matches.value_of("keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
@@ -91,6 +92,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
+    // FairDAG-RL: Channel for fair-ordered transaction output.
+    let (tx_fair_output, rx_fair_output) = channel(CHANNEL_CAPACITY);
+
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
@@ -101,16 +105,18 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 keypair,
                 committee.clone(),
                 parameters.clone(),
-                store,
+                store.clone(),
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
+                /* store */ store,                    // FairDAG-RL: pass store
                 /* rx_primary */ rx_new_certificates,
                 /* tx_primary */ tx_feedback,
                 tx_output,
+                /* tx_fair_output */ tx_fair_output,  // FairDAG-RL: fair ordering output
             );
         }
 
@@ -126,16 +132,37 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         _ => unreachable!(),
     }
 
-    // Analyze the consensus' output.
-    analyze(rx_output).await;
+    // Analyze the consensus' output and the fair ordering output.
+    analyze(rx_output, rx_fair_output).await;
 
-    // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();
 }
 
-/// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>) {
-    while let Some(_certificate) = rx_output.recv().await {
-        // NOTE: Here goes the application logic.
+/// Receives an ordered list of certificates and fair-ordered transactions.
+async fn analyze(
+    mut rx_output: Receiver<Certificate>,
+    mut rx_fair_output: Receiver<Vec<u64>>,
+) {
+    loop {
+        tokio::select! {
+            Some(_certificate) = rx_output.recv() => {
+                // NOTE: Here goes the application logic for committed certificates.
+            }
+
+            Some(fair_ordered_txs) = rx_fair_output.recv() => {
+                // FairDAG-RL: This is the fair transaction ordering output.
+                // Each batch of tx digests is ordered according to the
+                // γ-Batch-Order-Fairness property.
+                for tx_id in &fair_ordered_txs {
+                    info!("FairDAG-RL ordered transaction: {}", tx_id);
+                }
+
+                // NOTE: Here goes the application logic for executing transactions
+                // in the fair order. For example:
+                //   - Look up full transaction data from the store
+                //   - Execute state transitions in this order
+                //   - Apply to the application state machine
+            }
+        }
     }
 }

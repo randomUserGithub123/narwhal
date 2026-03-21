@@ -2,6 +2,7 @@
 mod batch_maker;
 mod helper;
 mod primary_connector;
+mod local_order_tracker;
 mod processor;
 mod quorum_waiter;
 mod synchronizer;

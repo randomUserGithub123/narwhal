@@ -1,4 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+# Modified for FairDAG-RL: adds parsing of fair ordering output and
+# end-to-end FairDAG finalization metrics.
 from datetime import datetime
 from glob import glob
 from multiprocessing import Pool
@@ -68,6 +70,8 @@ class LogParser:
             fissure_attacks,
             sluggish_attacks,
             speculative_attacks,
+            fair_ordered_txs,
+            fair_graph_stats,
         ) = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
@@ -85,6 +89,19 @@ class LogParser:
             [x.items() for x in speculative_attacks]
         )
 
+        # FairDAG-RL: merge fair ordering results across primaries.
+        # fair_ordered_txs[i] is a dict {tx_id: timestamp} from primary i.
+        # We keep the EARLIEST timestamp (first primary to finalize it).
+        self.fair_ordered_txs = self._merge_results(
+            [x.items() for x in fair_ordered_txs]
+        )
+
+        # FairDAG-RL: merge graph finalization stats.
+        # Each is a list of (graph_round, num_txs, total_ordered, timestamp).
+        self.fair_graph_stats = []
+        for stats_list in fair_graph_stats:
+            self.fair_graph_stats.extend(stats_list)
+
         # Parse the workers logs.
         try:
             with Pool() as p:
@@ -97,7 +114,6 @@ class LogParser:
         }
 
         # self.received_samples: for each worker, maps sample_tx_id -> batch_digest
-        # transactions may be duplicated across workers
         self.all_received_samples = self._merge_dicts(self.received_samples)
 
         # Determine whether the primary and the workers are collocated.
@@ -229,6 +245,35 @@ class LogParser:
         ]
         speculative_attacks = self._merge_frontrun_attack([tmp])
 
+        # ===============================================================
+        # FairDAG-RL: Parse fair ordering output
+        # ===============================================================
+
+        # Per-transaction fair ordering timestamps.
+        # Matches: "[2025-01-01T00:00:00Z INFO  node] FairDAG-RL ordered transaction: 12345"
+        tmp = findall(
+            r"\[(.*Z) .* FairDAG-RL ordered transaction: (\d+)",
+            log,
+        )
+        fair_ordered_txs = {int(tx_id): _to_posix(t) for t, tx_id in tmp}
+
+        # Graph finalization stats.
+        # Matches: "FairnessLayer: finalized 42 transactions from graph 3 (round 8). Total ordered: 150"
+        tmp = findall(
+            r"\[(.*Z) .* FairnessLayer: finalized (\d+) transactions from graph (\d+) \(round (\d+)\)\. Total ordered: (\d+)",
+            log,
+        )
+        fair_graph_stats = [
+            {
+                'timestamp': _to_posix(t),
+                'num_txs': int(num_txs),
+                'graph_idx': int(graph_idx),
+                'round': int(round_num),
+                'total_ordered': int(total),
+            }
+            for t, num_txs, graph_idx, round_num, total in tmp
+        ]
+
         configs = {
             "header_size": int(search(r"Header size .* (\d+)", log).group(1)),
             "max_header_delay": int(search(r"Max header delay .* (\d+)", log).group(1)),
@@ -251,6 +296,8 @@ class LogParser:
             fissure_attacks,
             sluggish_attacks,
             speculative_attacks,
+            fair_ordered_txs,
+            fair_graph_stats,
         )
 
     def _parse_workers(self, log):
@@ -299,15 +346,6 @@ class LogParser:
 
     # ------------------------------------------------------------------
     # Throughput & latency — direct counting of all transactions
-    # ------------------------------------------------------------------
-    #
-    # Since we now log every transaction, we know for each tx:
-    #   • when the client sent it              (all_sent_samples)
-    #   • which batch(es) it landed in         (all_received_samples)
-    #   • when each batch was committed        (commits)
-    #
-    # A tx is "committed" when at least one of its batches is committed.
-    # We count each tx only once (unique).
     # ------------------------------------------------------------------
 
     def _committed_tx_stats(self):
@@ -360,23 +398,120 @@ class LogParser:
     # ---- End-to-end (client send → commit) ----
 
     def _end_to_end_throughput(self):
-        if not self.commits:
+        if not self.fair_ordered_txs:
             return 0, 0, 0
 
         start = min(self.start)
-        end = max(self.commits.values())
+        end = max(self.fair_ordered_txs.values())
         duration = end - start
         if duration <= 0:
             return 0, 0, 0
 
-        committed_count, _ = self._committed_tx_stats()
-        tps = committed_count / duration
+        fair_count, _ = self._fairdag_tx_stats()
+        tps = fair_count / duration
         bps = tps * self.size[0]
         return tps, bps, duration
 
     def _end_to_end_latency(self):
-        _, latencies = self._committed_tx_stats()
+        _, latencies = self._fairdag_tx_stats()
         return mean(latencies) if latencies else 0
+
+    # ------------------------------------------------------------------
+    # FairDAG-RL: End-to-end fair ordering metrics
+    # ------------------------------------------------------------------
+
+    def _fairdag_tx_stats(self):
+        """
+        For each transaction that was both sent by a client AND fair-ordered
+        by FairDAG-RL, compute the end-to-end latency:
+            fair_order_time − client_send_time
+
+        Returns:
+            fair_count   – number of txs that were fair-ordered
+            latencies    – list of latencies (seconds) per fair-ordered tx
+        """
+        fair_count = 0
+        latencies = []
+
+        for tx_id, fair_time in self.fair_ordered_txs.items():
+            if tx_id not in self.all_sent_samples:
+                continue
+            send_time = self.all_sent_samples[tx_id]
+            fair_count += 1
+            latencies.append(fair_time - send_time)
+
+        return fair_count, latencies
+
+    def _fairdag_throughput(self):
+        """
+        FairDAG-RL end-to-end throughput:
+            fair-ordered txs / (last_fair_order − first_client_start)
+        """
+        if not self.fair_ordered_txs:
+            return 0, 0, 0
+
+        start = min(self.start)
+        end = max(self.fair_ordered_txs.values())
+        duration = end - start
+        if duration <= 0:
+            return 0, 0, 0
+
+        fair_count, _ = self._fairdag_tx_stats()
+        tps = fair_count / duration
+        bps = tps * self.size[0]
+        return tps, bps, duration
+
+    def _fairdag_latency(self):
+        """
+        FairDAG-RL end-to-end latency (mean):
+            mean(fair_order_time − client_send_time) for all fair-ordered txs
+        """
+        _, latencies = self._fairdag_tx_stats()
+        return mean(latencies) if latencies else 0
+
+    def _fairdag_finalization_overhead(self):
+        """
+        Compute the overhead of fair ordering on top of Tusk commit.
+        For each tx that was both Tusk-committed and fair-ordered:
+            overhead = fair_order_time − tusk_commit_time
+
+        Returns mean overhead in seconds, or 0 if no data.
+        """
+        overheads = []
+
+        for tx_id, fair_time in self.fair_ordered_txs.items():
+            if tx_id not in self.all_received_samples:
+                continue
+
+            # Find the earliest Tusk commit time for this tx
+            batch_ids = self.all_received_samples[tx_id]
+            commit_times = [
+                self.commits[b] for b in batch_ids if b in self.commits
+            ]
+            if commit_times:
+                tusk_time = min(commit_times)
+                overheads.append(fair_time - tusk_time)
+
+        return mean(overheads) if overheads else 0
+
+    def _fairdag_graph_summary(self):
+        """
+        Summarize graph finalization events:
+            - Number of graphs finalized
+            - Mean txs per graph
+            - Total txs fair-ordered
+        """
+        if not self.fair_graph_stats:
+            return 0, 0, 0
+
+        num_graphs = len(self.fair_graph_stats)
+        txs_per_graph = [s['num_txs'] for s in self.fair_graph_stats]
+        total_ordered = max(
+            (s['total_ordered'] for s in self.fair_graph_stats), default=0
+        )
+        avg_txs = mean(txs_per_graph) if txs_per_graph else 0
+
+        return num_graphs, avg_txs, total_ordered
 
     # ------------------------------------------------------------------
     # Output
@@ -395,6 +530,13 @@ class LogParser:
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
+
+        # FairDAG-RL metrics
+        fairdag_tps, fairdag_bps, fairdag_duration = self._fairdag_throughput()
+        fairdag_latency = self._fairdag_latency() * 1_000
+        fairdag_overhead = self._fairdag_finalization_overhead() * 1_000
+        fairdag_count, _ = self._fairdag_tx_stats()
+        num_graphs, avg_txs_per_graph, total_fair_ordered = self._fairdag_graph_summary()
 
         # Attack calculation
         attack_print = ""
@@ -438,9 +580,15 @@ class LogParser:
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
             f' Consensus latency: {round(consensus_latency):,} ms\n'
             '\n'
+            ' + FAIRDAG-RL:\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            f' Fair ordering overhead: {round(fairdag_overhead):,} ms\n'
+            f' Fair-ordered txs: {fairdag_count:,}\n'
+            f' Graphs finalized: {num_graphs:,}\n'
+            f' Avg txs/graph: {round(avg_txs_per_graph, 1)}\n'
+            f' Total fair-ordered (from logs): {total_fair_ordered:,}\n'
             '\n'
             ' + ATTACK:\n'
             f' {attack_print} \n'
