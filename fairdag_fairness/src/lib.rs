@@ -363,12 +363,36 @@ impl FairnessLayer {
                 self.nodes.get_mut(&d).unwrap().graph_index = Some(graph_idx);
                 self.graphs[graph_idx].nodes.insert(d);
                 solid_count += 1;
+
+                // DEBUG: Log how many OIs this node already had from previous subdags
+                let node_debug = self.nodes.get(&d).unwrap();
+                let prior_ois = node_debug.committed_ois.len();
+                if prior_ois > 1 {
+                    info!(
+                        "DEBUG_CLASSIFY G[{}] node {} classified as {:?} with {} prior OIs: {:?}",
+                        graph_idx, d, node_debug.node_type, prior_ois,
+                        node_debug.committed_ois
+                    );
+                }
+
             } else if ap >= self.half_threshold {
                 // Line 18: node(d).type := shaded; Gr.nodes.add(node(d))
                 self.nodes.get_mut(&d).unwrap().node_type = NodeType::Shaded;
                 self.nodes.get_mut(&d).unwrap().graph_index = Some(graph_idx);
                 self.graphs[graph_idx].nodes.insert(d);
                 shaded_count += 1;
+
+                // DEBUG: Log how many OIs this node already had from previous subdags
+                let node_debug = self.nodes.get(&d).unwrap();
+                let prior_ois = node_debug.committed_ois.len();
+                if prior_ois > 1 {
+                    info!(
+                        "DEBUG_CLASSIFY G[{}] node {} classified as {:?} with {} prior OIs: {:?}",
+                        graph_idx, d, node_debug.node_type, prior_ois,
+                        node_debug.committed_ois
+                    );
+                }
+
             } else {
                 blank_count += 1;
             }
@@ -560,6 +584,63 @@ impl FairnessLayer {
             }
             edges_added += 1;
         }
+
+
+        // === DEBUG: Sample stuck pairs (missing edges) ===
+        for (gi, g) in self.graphs.iter().enumerate() {
+            if g.finalized || g.nodes.is_empty() || g.is_tournament() {
+                continue;
+            }
+            let nodes_vec: Vec<TxDigest> = g.nodes.iter().cloned().collect();
+            let mut stuck_count = 0usize;
+            let mut sampled = 0usize;
+            for i_idx in 0..nodes_vec.len() {
+                for j_idx in (i_idx + 1)..nodes_vec.len() {
+                    let da = nodes_vec[i_idx];
+                    let db = nodes_vec[j_idx];
+                    if g.edges.contains(&(da, db)) || g.edges.contains(&(db, da)) {
+                        continue;
+                    }
+                    stuck_count += 1;
+                    if sampled < 5 {
+                        sampled += 1;
+                        let w_ab = *g.weights.get(&(da, db)).unwrap_or(&0);
+                        let w_ba = *g.weights.get(&(db, da)).unwrap_or(&0);
+                        let node_a = self.nodes.get(&da).unwrap();
+                        let node_b = self.nodes.get(&db).unwrap();
+                        // How many replicas have OIs for BOTH?
+                        let mut could_vote = 0usize;
+                        let mut actually_counted = 0usize;
+                        let pair = (da.min(db), da.max(db));
+                        let counted = g.counted_replicas.get(&pair);
+                        for (&rep, _) in &node_a.committed_ois {
+                            if node_b.committed_ois.contains_key(&rep) {
+                                could_vote += 1;
+                                if counted.map_or(false, |s| s.contains(&rep)) {
+                                    actually_counted += 1;
+                                }
+                            }
+                        }
+                        info!(
+                            "DEBUG_STUCK G[{}] pair ({}, {}): w_ab={} w_ba={} \
+                             could_vote={} actually_counted={} threshold={} \
+                             a_ois={:?} b_ois={:?}",
+                            gi, da, db, w_ab, w_ba,
+                            could_vote, actually_counted, self.half_threshold,
+                            node_a.committed_ois, node_b.committed_ois,
+                        );
+                    }
+                }
+            }
+            if stuck_count > 0 {
+                info!(
+                    "DEBUG_STUCK G[{}] total_stuck_pairs={} (out of {} needed)",
+                    gi, stuck_count,
+                    nodes_vec.len() * (nodes_vec.len() - 1) / 2
+                );
+            }
+        }
+        // === END DEBUG ===
 
         info!(
             "FairnessLayer: weights pairs_checked={} skipped_counted={} skipped_edge={} \
