@@ -1,13 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Modified for FairDAG-RL (v3).
+// Modified for FairDAG-RL (v4).
 //
-// KEY CHANGE: A shared LocalOrderTracker is created and given to both:
-//   - BatchMaker (records client tx arrivals)
-//   - WorkerReceiverHandler (records indirect tx arrivals from other workers' batches)
-//
-// This ensures that the OI reflects the TRUE first-arrival time at this replica,
-// regardless of whether the tx came from a client or from another worker.
+// Changes from plain Narwhal:
+//   1. SharedLocalOrderTracker for OI assignment (v3)
+//   2. WorkerMessage::Batch carries (tx, oi) pairs (v3)
+//   3. PrimaryReceiverHandler dispatches ExecuteSubdag to FairDagProcessor (v4)
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::fairdag_processor::FairDagProcessor;
 use crate::helper::Helper;
 use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker};
 use crate::primary_connector::PrimaryConnector;
@@ -21,7 +20,7 @@ use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{debug, error, info, warn};
 use network::{MessageHandler, Receiver, Writer};
-use primary::PrimaryWorkerMessage;
+use primary::{Certificate, PrimaryWorkerMessage, Round};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
@@ -33,9 +32,6 @@ pub mod worker_tests;
 
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
-
-/// The primary round number.
-pub type Round = u64;
 
 /// Indicates a serialized `WorkerPrimaryMessage` message.
 pub type SerializedBatchDigestMessage = Vec<u8>;
@@ -70,8 +66,6 @@ impl Worker {
         store: Store,
     ) {
         // FairDAG-RL: Create the shared local order tracker.
-        // This single tracker is shared across the BatchMaker (client txs)
-        // and the WorkerReceiverHandler (other workers' batches).
         let tracker = LocalOrderTracker::new();
 
         let worker = Self {
@@ -84,9 +78,21 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();
+
+        // FairDAG-RL: Channel for committed subdags → FairDagProcessor.
+        let (tx_fairdag, rx_fairdag) = channel(CHANNEL_CAPACITY);
+
+        worker.handle_primary_messages(tx_fairdag);
         worker.handle_clients_transactions(tx_primary.clone(), tracker.clone());
         worker.handle_workers_messages(tx_primary, tracker);
+
+        // FairDAG-RL: Spawn the FairDagProcessor. It reads batches from the
+        // local store and runs the fairness layer.
+        FairDagProcessor::spawn(
+            worker.committee.clone(),
+            worker.store.clone(),
+            rx_fairdag,
+        );
 
         PrimaryConnector::spawn(
             worker
@@ -110,7 +116,10 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(
+        &self,
+        tx_fairdag: Sender<(Round, Vec<Certificate>)>,
+    ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         let mut address = self
@@ -121,7 +130,10 @@ impl Worker {
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
             address,
-            PrimaryReceiverHandler { tx_synchronizer },
+            PrimaryReceiverHandler {
+                tx_synchronizer,
+                tx_fairdag,
+            },
         );
 
         Synchronizer::spawn(
@@ -214,7 +226,6 @@ impl Worker {
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
             address,
-            // FairDAG-RL: WorkerReceiverHandler gets the shared tracker.
             WorkerReceiverHandler {
                 tx_helper,
                 tx_processor,
@@ -267,15 +278,11 @@ impl MessageHandler for TxReceiverHandler {
 }
 
 /// Handles incoming messages from other workers.
-/// FairDAG-RL: When receiving a batch from another worker, records each tx in
-/// the shared LocalOrderTracker BEFORE forwarding to the processor. This ensures
-/// that indirectly-arrived transactions get an OI reflecting their true
-/// first-arrival time at this replica.
+/// FairDAG-RL: records indirect tx arrivals in the shared tracker.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
-    /// FairDAG-RL: shared local order tracker.
     tracker: LocalOrderTracker,
 }
 
@@ -285,25 +292,14 @@ impl MessageHandler for WorkerReceiverHandler {
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(ref batch_entries)) => {
-                // FairDAG-RL: Record each transaction from this batch in the
-                // shared tracker. If a tx hasn't been seen yet (hasn't arrived
-                // from our own client), it gets an OI NOW — reflecting indirect
-                // arrival. If it was already seen (client sent it first), the
-                // tracker returns the existing earlier OI (no-op for ordering).
+                // FairDAG-RL: Record indirect arrivals.
                 for (tx_bytes, _sender_oi) in batch_entries {
                     let tx_digest = extract_tx_digest(tx_bytes);
                     self.tracker.record(tx_digest);
                 }
 
-                debug!(
-                    "FairDAG: recorded {} indirect tx arrivals from other worker batch",
-                    batch_entries.len()
-                );
-
-                // Forward the raw serialized batch to the processor as before.
                 self.tx_processor
                     .send(serialized.to_vec())
                     .await
@@ -322,9 +318,12 @@ impl MessageHandler for WorkerReceiverHandler {
 }
 
 /// Handles incoming primary messages.
+/// FairDAG-RL: dispatches ExecuteSubdag to the FairDagProcessor channel.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
+    /// FairDAG-RL: channel to FairDagProcessor for committed subdags.
+    tx_fairdag: Sender<(Round, Vec<Certificate>)>,
 }
 
 #[async_trait]
@@ -336,11 +335,25 @@ impl MessageHandler for PrimaryReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self
-                .tx_synchronizer
-                .send(message)
-                .await
-                .expect("Failed to send transaction"),
+            Ok(PrimaryWorkerMessage::ExecuteSubdag(leader_round, certificates)) => {
+                // FairDAG-RL: route to FairDagProcessor, NOT to synchronizer.
+                info!(
+                    "Worker received ExecuteSubdag for leader round {} with {} certs",
+                    leader_round,
+                    certificates.len()
+                );
+                self.tx_fairdag
+                    .send((leader_round, certificates))
+                    .await
+                    .expect("Failed to send subdag to FairDagProcessor");
+            }
+            Ok(message) => {
+                // Synchronize and Cleanup go to the synchronizer as before.
+                self.tx_synchronizer
+                    .send(message)
+                    .await
+                    .expect("Failed to send primary message to synchronizer");
+            }
         }
         Ok(())
     }

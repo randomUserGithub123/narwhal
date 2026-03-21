@@ -45,6 +45,9 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Round),
+    /// FairDAG-RL: The primary sends an entire committed subdag to the worker
+    /// for fair ordering. Contains (leader_round, certificates_in_subdag).
+    ExecuteSubdag(Round, Vec<Certificate>),
 }
 
 /// The messages sent by the workers to their primary.
@@ -66,6 +69,7 @@ impl Primary {
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
+        rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,  // FairDAG-RL
     ) {
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
@@ -169,8 +173,13 @@ impl Primary {
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(name, &committee, consensus_round.clone(), rx_consensus, tx_committed_own_headers, tx_clean_certificate);
-
+        GarbageCollector::spawn(
+            &name,
+            &committee,
+            consensus_round.clone(),
+            rx_consensus,
+            rx_committed_subdags,  // FairDAG-RL: forward subdags to workers
+        );
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
 

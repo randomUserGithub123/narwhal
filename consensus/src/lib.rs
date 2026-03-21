@@ -1,32 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Modified for FairDAG-RL (v2 — simplified design).
-//
-// KEY INSIGHT: Ordering indicators travel inside the batch data through the
-// normal Narwhal pipeline. After Tusk commits a leader, we:
-//   1. Collect all certificates in the committed subdag
-//   2. For each certificate, look up its batch digests (header.payload)
-//   3. Read each batch from the store
-//   4. Deserialize the batch to extract (tx_bytes, ordering_indicator) pairs
-//   5. Feed the reconstructed local orderings to the FairnessLayer
-//
-// This means NO changes to Header, Proposer, PrimaryWorkerMessage, or primary.rs.
-// The only changes outside this file are:
-//   - BatchMaker: assigns OI and stores (tx, OI) in batch
-//   - WorkerMessage::Batch type: Vec<(Transaction, u64)> instead of Vec<Transaction>
-
+// Modified for FairDAG-RL: sends committed subdags to GarbageCollector
+// for forwarding to workers, where the fairness layer runs.
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
-use fairdag_fairness::{
-    CommittedSubdag, CommittedVertex, FairnessLayer, TxDigest,
-};
-use log::{debug, error, info, log_enabled, warn};
+use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
-use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
-use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -36,23 +17,15 @@ pub mod consensus_tests;
 /// The representation of the DAG in memory.
 type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 
-/// Batch entry type — must match worker::batch_maker::BatchEntry.
-type Transaction = Vec<u8>;
-type BatchEntry = (Transaction, u64); // (raw_tx, ordering_indicator)
-type Batch = Vec<BatchEntry>;
-
-/// WorkerMessage — must match worker::worker::WorkerMessage for deserialization.
-/// We only need the Batch variant for reading from store.
-#[derive(Debug, Serialize, Deserialize)]
-enum WorkerMessage {
-    Batch(Batch),
-    BatchRequest(Vec<Digest>, PublicKey),
-}
-
 /// The state that needs to be persisted for crash-recovery.
 struct State {
+    /// The last committed round.
     last_committed_round: Round,
+    // Keeps the last committed round for each authority. This map is used to clean up the dag and
+    // ensure we don't commit twice the same certificate.
     last_committed: HashMap<PublicKey, Round>,
+    /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
+    /// must be regularly cleaned up through the function `update`.
     dag: Dag,
 }
 
@@ -70,6 +43,7 @@ impl State {
         }
     }
 
+    /// Update and clean up internal state base on committed certificates.
     fn update(&mut self, certificate: &Certificate, gc_depth: Round) {
         self.last_committed
             .entry(certificate.origin())
@@ -79,6 +53,8 @@ impl State {
         let last_committed_round = *self.last_committed.values().max().unwrap();
         self.last_committed_round = last_committed_round;
 
+        // TODO: This cleanup is dangerous: we need to ensure consensus can receive idempotent replies
+        // from the primary. Here we risk cleaning up a certificate and receiving it again later.
         for (name, round) in &self.last_committed {
             self.dag.retain(|r, authorities| {
                 authorities.retain(|n, _| n != name || r >= round);
@@ -94,50 +70,34 @@ pub struct Consensus {
     /// The depth of the garbage collector.
     gc_depth: Round,
 
-    /// Receives new certificates from the primary.
+    /// Receives new certificates from the primary. The primary should send us new certificates only
+    /// if it already sent us its whole history.
     rx_primary: Receiver<Certificate>,
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup).
+    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     tx_primary: Sender<Certificate>,
     /// Outputs the sequence of ordered certificates to the application layer.
     tx_output: Sender<Certificate>,
 
-    /// NEW: Outputs fair-ordered transaction digests to the application layer.
-    tx_fair_output: Sender<Vec<TxDigest>>,
+    /// FairDAG-RL: sends entire committed subdags (leader_round, certificates)
+    /// to GarbageCollector, which forwards them to workers for fair ordering.
+    tx_committed_subdags: Sender<(Round, Vec<Certificate>)>,
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
 
-    /// Block height.
+    /// Block height: when converting dag into a chain, label each block with a height
     block_height: u64,
-
-    /// NEW: The FairDAG-RL fairness layer.
-    fairness_layer: FairnessLayer,
-
-    /// NEW: Sorted committee keys for replica indexing.
-    sorted_keys: Vec<PublicKey>,
-
-    /// NEW: Store access — needed to read batch contents after commit.
-    store: Store,
 }
 
 impl Consensus {
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
-        store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
         tx_output: Sender<Certificate>,
-        tx_fair_output: Sender<Vec<TxDigest>>,
+        tx_committed_subdags: Sender<(Round, Vec<Certificate>)>,
     ) {
-        let n = committee.size();
-        let f = (n - 1) / 3;
-
-        let mut sorted_keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
-        sorted_keys.sort();
-
-        let fairness_layer = FairnessLayer::new(sorted_keys.clone(), f);
-
         tokio::spawn(async move {
             Self {
                 committee: committee.clone(),
@@ -145,149 +105,42 @@ impl Consensus {
                 rx_primary,
                 tx_primary,
                 tx_output,
-                tx_fair_output,
+                tx_committed_subdags,
                 genesis: Certificate::genesis(&committee),
                 block_height: 0,
-                fairness_layer,
-                sorted_keys,
-                store,
             }
             .run()
             .await;
         });
     }
 
-    /// Extract the subdag A_r from committed certificates by reading their
-    /// batches from the store and extracting (tx_digest, ordering_indicator) pairs.
-    async fn extract_subdag(
-        &self,
-        leader_round: Round,
-        committed_sequence: &[Certificate],
-    ) -> CommittedSubdag {
-        let mut vertices: Vec<CommittedVertex> = Vec::new();
-
-        info!(
-            "DIAG extract_subdag: leader_round={} certs={}",
-            leader_round, committed_sequence.len()
-        );
-
-        for cert in committed_sequence {
-            let author = cert.origin();
-            let replica_index = self
-                .sorted_keys
-                .iter()
-                .position(|k| *k == author)
-                .expect("Certificate author not in committee");
-
-            let mut ordering_entries: Vec<(TxDigest, u64)> = Vec::new();
-            let num_batches = cert.header.payload.len();
-            let mut batches_found = 0usize;
-            let mut batches_missing = 0usize;
-            let mut batches_deser_fail = 0usize;
-
-            for batch_digest in cert.header.payload.keys() {
-                match self.store.clone().read(batch_digest.to_vec()).await {
-                    Ok(Some(serialized_batch)) => {
-                        batches_found += 1;
-                        match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            Ok(WorkerMessage::Batch(batch_entries)) => {
-                                for (tx_bytes, oi) in batch_entries {
-                                    let tx_id = Self::extract_tx_digest(&tx_bytes);
-                                    ordering_entries.push((tx_id, oi));
-                                }
-                            }
-                            Ok(_) => {
-                                batches_deser_fail += 1;
-                                warn!(
-                                    "Unexpected message type in store for batch {:?}",
-                                    batch_digest
-                                );
-                            }
-                            Err(e) => {
-                                batches_deser_fail += 1;
-                                error!(
-                                    "DIAG deser_fail batch {:?}: {} (first 32 bytes: {:?})",
-                                    batch_digest, e,
-                                    &serialized_batch[..std::cmp::min(32, serialized_batch.len())]
-                                );
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        batches_missing += 1;
-                        warn!(
-                            "Batch {:?} not found in store (may have been GC'd)",
-                            batch_digest
-                        );
-                    }
-                    Err(e) => {
-                        error!("Store read error for batch {:?}: {}", batch_digest, e);
-                    }
-                }
-            }
-
-            info!(
-                "DIAG extract_subdag: cert round={} replica_idx={} payload_batches={} found={} missing={} deser_fail={} ordering_entries={}",
-                cert.round(), replica_index, num_batches, batches_found, batches_missing, batches_deser_fail, ordering_entries.len()
-            );
-
-            // Log first few entries
-            for (ei, (tx_id, oi)) in ordering_entries.iter().take(3).enumerate() {
-                info!(
-                    "DIAG extract_subdag: cert round={} replica={} entry[{}] tx_id={} oi={}",
-                    cert.round(), replica_index, ei, tx_id, oi
-                );
-            }
-
-            vertices.push(CommittedVertex {
-                replica: author,
-                replica_index,
-                round: cert.round(),
-                ordering_entries,
-            });
-        }
-
-        vertices.sort_by_key(|v| v.round);
-
-        CommittedSubdag {
-            leader_round,
-            vertices,
-        }
-    }
-
-    /// Extract a u64 transaction digest from raw transaction bytes.
-    /// Convention: first 8 bytes are the tx unique identifier.
-    fn extract_tx_digest(tx: &[u8]) -> TxDigest {
-        if tx.len() >= 8 {
-            u64::from_be_bytes(tx[..8].try_into().unwrap_or([0u8; 8]))
-        } else {
-            let mut hash: u64 = 0;
-            for (i, &byte) in tx.iter().enumerate() {
-                hash ^= (byte as u64) << ((i % 8) * 8);
-            }
-            hash
-        }
-    }
-
     async fn run(&mut self) {
+        // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
 
+        // Listen to incoming certificates.
         while let Some(certificate) = self.rx_primary.recv().await {
             debug!("Processing {:?}", certificate);
             let round = certificate.round();
 
+            // Add the new certificate to the local storage.
             state
                 .dag
                 .entry(round)
                 .or_insert_with(HashMap::new)
                 .insert(certificate.origin(), (certificate.digest(), certificate));
 
+            // Try to order the dag to commit. Start from the highest round for which we have at least
+            // 2f+1 certificates. This is because we need them to reveal the common coin.
             let r = round - 1;
 
+            // We only elect leaders for even round numbers.
             if r % 2 != 0 || r < 4 {
                 continue;
             }
 
+            // Get the certificate's digest of the leader of round r-2. If we already ordered this leader,
+            // there is nothing to do.
             let leader_round = r - 2;
             if leader_round <= state.last_committed_round {
                 continue;
@@ -297,6 +150,7 @@ impl Consensus {
                 None => continue,
             };
 
+            // Check if the leader has f+1 support from its children (ie. round r-1).
             let stake: Stake = state
                 .dag
                 .get(&(r - 1))
@@ -306,20 +160,29 @@ impl Consensus {
                 .map(|(_, x)| self.committee.stake(&x.origin()))
                 .sum();
 
+            // If it is the case, we can commit the leader. But first, we need to recursively go back to
+            // the last committed leader, and commit all preceding leaders in the right order. Committing
+            // a leader block means committing all its dependencies.
             if stake < self.committee.validity_threshold() {
                 debug!("Leader {:?} does not have enough support", leader);
                 continue;
             }
 
+            // Get an ordered list of past leaders that are linked to the current leader.
             debug!("Leader {:?} has enough support", leader);
             let mut sequence = Vec::new();
             for leader in self.order_leaders(leader, &state).iter().rev() {
+                // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                 for x in self.order_dag(leader, &state) {
+                    // Update and clean up internal state.
                     state.update(&x, self.gc_depth);
+
+                    // Add the certificate to the sequence.
                     sequence.push(x);
                 }
             }
 
+            // Log the latest committed round of every authority (for debug).
             if log_enabled!(log::Level::Debug) {
                 for (name, round) in &state.last_committed {
                     debug!("Latest commit of {}: Round {}", name, round);
@@ -327,28 +190,21 @@ impl Consensus {
             }
 
             // =================================================================
-            // FairDAG-RL: Extract subdag and process through fairness layer
+            // FairDAG-RL: send entire subdag to GC → workers for fair ordering
             // =================================================================
             if !sequence.is_empty() {
-                let subdag = self.extract_subdag(leader_round, &sequence).await;
-                let fair_ordered = self.fairness_layer.process_subdag(&subdag);
-
-                if !fair_ordered.is_empty() {
-                    info!(
-                        "FairDAG: outputting {} fair-ordered transactions from leader round {}",
-                        fair_ordered.len(),
-                        leader_round
-                    );
-                    if let Err(e) = self.tx_fair_output.send(fair_ordered).await {
-                        warn!("Failed to output fair-ordered transactions: {}", e);
-                    }
+                if let Err(e) = self
+                    .tx_committed_subdags
+                    .send((leader_round, sequence.clone()))
+                    .await
+                {
+                    warn!("Failed to send committed subdag: {}", e);
                 }
             }
 
-            // Output the sequence in the right order (original Tusk output).
+            // Output the sequence in the right order.
             for certificate in sequence {
                 self.block_height += 1;
-
                 #[cfg(not(feature = "benchmark"))]
                 {
                     info!("Committed {}", certificate.header);
@@ -360,6 +216,7 @@ impl Consensus {
 
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
+                    // NOTE: This log entry is used to compute performance.
                     info!("Committed {} -> {:?}", certificate.header, digest);
                     info!(
                         "FairDag Committed {} in height {}",
@@ -379,19 +236,27 @@ impl Consensus {
         }
     }
 
+    /// Returns the certificate (and the certificate's digest) originated by the leader of the
+    /// specified round (if any).
     fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
+        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
+        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
+        // compute the coin). We currently just use round-robin.
         #[cfg(test)]
         let coin = 0;
         #[cfg(not(test))]
         let coin = round;
 
+        // Elect the leader.
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
         let leader = keys[coin as usize % self.committee.size()];
 
+        // Return its certificate and the certificate's digest.
         dag.get(&round).map(|x| x.get(&leader)).flatten()
     }
 
+    /// Order the past leaders that we didn't already commit.
     fn order_leaders(&self, leader: &Certificate, state: &State) -> Vec<Certificate> {
         let mut to_commit = vec![leader.clone()];
         let mut leader = leader;
@@ -399,11 +264,13 @@ impl Consensus {
             .rev()
             .step_by(2)
         {
+            // Get the certificate proposed by the previous leader.
             let (_, prev_leader) = match self.leader(r, &state.dag) {
                 Some(x) => x,
                 None => continue,
             };
 
+            // Check whether there is a path between the last two leaders.
             if self.linked(leader, prev_leader, &state.dag) {
                 to_commit.push(prev_leader.clone());
                 leader = prev_leader;
@@ -412,6 +279,7 @@ impl Consensus {
         to_commit
     }
 
+    /// Checks if there is a path between two leaders.
     fn linked(&self, leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
         let mut parents = vec![leader];
         for r in (prev_leader.round()..leader.round()).rev() {
@@ -426,6 +294,8 @@ impl Consensus {
         parents.contains(&prev_leader)
     }
 
+    /// Flatten the dag referenced by the input certificate. This is a classic depth-first search (pre-order):
+    /// https://en.wikipedia.org/wiki/Tree_traversal#Pre-order
     fn order_dag(&self, leader: &Certificate, state: &State) -> Vec<Certificate> {
         debug!("Processing sub-dag of {:?}", leader);
         let mut ordered = Vec::new();
@@ -443,9 +313,11 @@ impl Consensus {
                     .flatten()
                 {
                     Some(x) => x,
-                    None => continue,
+                    None => continue, // We already ordered or GC up to here.
                 };
 
+                // We skip the certificate if we (1) already processed it or (2) we reached a round that we already
+                // committed for this authority.
                 let mut skip = already_ordered.contains(&digest);
                 skip |= state
                     .last_committed
@@ -458,7 +330,10 @@ impl Consensus {
             }
         }
 
+        // Ensure we do not commit garbage collected certificates.
         ordered.retain(|x| x.round() + self.gc_depth >= state.last_committed_round);
+
+        // Ordering the output by round is not really necessary but it makes the commit sequence prettier.
         ordered.sort_by_key(|x| x.round());
         ordered
     }
