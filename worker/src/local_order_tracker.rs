@@ -73,12 +73,10 @@ impl LocalOrderTracker {
 }
 
 /// Extract a u64 transaction digest from raw transaction bytes.
-/// Convention: first 8 bytes are the unique tx identifier.
 pub fn extract_tx_digest(tx: &[u8]) -> TxDigest {
-    if tx.len() >= 8 {
-        u64::from_be_bytes(tx[..8].try_into().unwrap_or([0u8; 8]))
+    if tx.len() > 8 {
+        u64::from_be_bytes(tx[1..9].try_into().unwrap_or([0u8; 8]))
     } else {
-        // Fallback for very short transactions.
         let mut hash: u64 = 0;
         for (i, &byte) in tx.iter().enumerate() {
             hash ^= (byte as u64) << ((i % 8) * 8);
