@@ -120,13 +120,19 @@ def local(ctx, debug=True):
 
 @task
 def das(ctx, debug=True, console=False, build=True, username="mputnik"):
-    for attack_type, arbitragers, batch_size, faults, workers_per_node, nodes, runs, input_rate in [
+    for attack_type, arbitragers, batch_size, gamma, faults, workers_per_node, nodes, runs, input_rate in [
         # (0, 1, 25, 0, 1, 4, 5, 4000),
         # (0, 1, 50, 0, 1, 4, 5, 4000),
         # (0, 1, 100, 0, 1, 4, 5, 4000),
         # (0, 1, 200, 0, 1, 4, 5, 4000),
         # (0, 1, 400, 0, 1, 4, 5, 4000),
         # (0, 1, 800, 0, 1, 4, 5, 4000),
+        ### Changing GAMMA
+        (0, 1, 25 * 128, 1.0, 1, 1, 5, 5, 4000),
+        (0, 1, 25 * 128, 0.9, 1, 1, 6, 5, 4000),
+        (0, 1, 25 * 128, 0.8, 1, 1, 7, 5, 4000),
+        (0, 1, 25 * 128, 0.7, 1, 1, 10, 5, 4000),
+        (0, 1, 25 * 128, 0.6, 1, 1, 17, 5, 4000),
         ### Chaning input_rate ###
         # (0, 1, 4_000, 1, 1, 4, 5, 500),
         # (0, 1, 4_000, 1, 1, 4, 5, 1000),
@@ -158,7 +164,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # (0, 1, 4_000, 4, 1, 15, 5, 4000),
         # (0, 1, 4_000, 5, 1, 16, 5, 4000),
         # (0, 1, 4_000, 5, 1, 17, 5, 4000),
-        (0, 1, 10 * 128, 4, 1, 17, 1, 4000),
+        # (0, 1, 10 * 128, 4, 1, 17, 1, 4000),
     ]:
         
         assert attack_type in [
@@ -189,7 +195,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": batch_size,  # bytes
             "max_batch_delay": 1000,  # ms
-            "gamma": 1.0, # batch-OF parameter,
+            "gamma": gamma, # batch-OF parameter,
             "scc_ordering": "alphabetical", # batch-OF parameter
         }
 
