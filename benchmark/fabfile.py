@@ -228,8 +228,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                 ).run(debug, console, build)
 
                 consensus_tps_raw, _, _ = ret._consensus_throughput()
-                exec_time = int(ret.get_execution_time())
-                if int(consensus_tps_raw) < 1 or exec_time <= 40:
+                _, _, exec_time = ret._end_to_end_throughput()
+                if int(consensus_tps_raw) < 1 or int(exec_time) <= 40:
                     print(f"SKIPPING RESULTS DUE TO LOW TPS {consensus_tps_raw} or low execution time {exec_time}s")
                     continue # Skip until DAS nodes work
 
