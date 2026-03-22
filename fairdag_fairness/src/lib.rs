@@ -6,8 +6,7 @@
 //   - Per-graph u16 local indices (graphs have ≤ INITIAL_GRAPH_CAPACITY nodes)
 //   - Nibble-packed weight matrices
 //   - Adjacency-list edges with bitset existence check
-//   - u8 bitmask for counted_replicas (supports N ≤ 8)
-//   - ordered_digests HashSet for correct skip-checking after recycling
+//   - u32 bitmask for counted_replicas (supports N ≤ 32)
 //
 // IMPORTANT: If this code panics, the tokio task in fairdag_processor.rs
 // will silently die. To surface panics, modify FairDagProcessor::spawn:
@@ -45,6 +44,8 @@ pub type OrderingEntry = (TxDigest, u64);
 const NONE_LOCAL: u16 = u16::MAX;
 
 /// Initial capacity for per-graph dense arrays.
+/// Memory per graph ≈ 1.625 × C² + 4 × C² (counted u32) ≈ 5.625 × C² bytes.
+/// At 16384: ~1.4 GB per graph, ~4.2 GB for 3 active graphs.
 const INITIAL_GRAPH_CAPACITY: usize = 16_384;
 
 // =============================================================================
@@ -191,7 +192,9 @@ pub struct DependencyGraph {
     pub edges: Vec<Vec<u16>>,
     pub edge_pair_count: usize,
     pub has_edge_pair: Vec<u64>,
-    pub counted: Vec<u8>,
+    /// u32 bitmask per symmetric pair: bit r is set if replica r's weight
+    /// contribution has been counted for this pair. Supports N ≤ 32.
+    pub counted: Vec<u32>,
     pub finalized: bool,
     pub final_order: Vec<TxDigest>,
 }
@@ -212,7 +215,7 @@ impl DependencyGraph {
             edges: (0..cap).map(|_| Vec::with_capacity(16)).collect(),
             edge_pair_count: 0,
             has_edge_pair: vec![0u64; bit_words],
-            counted: vec![0u8; cap * cap],
+            counted: vec![0u32; cap * cap],
             finalized: false,
             final_order: Vec::new(),
         }
@@ -295,12 +298,12 @@ impl DependencyGraph {
     }
 
     #[inline]
-    fn get_counted(&self, li: u16, lj: u16) -> u8 {
+    fn get_counted(&self, li: u16, lj: u16) -> u32 {
         self.counted[pair_idx(li, lj, self.capacity)]
     }
 
     #[inline]
-    fn set_counted(&mut self, li: u16, lj: u16, val: u8) {
+    fn set_counted(&mut self, li: u16, lj: u16, val: u32) {
         self.counted[pair_idx(li, lj, self.capacity)] = val;
     }
 
@@ -336,8 +339,6 @@ pub struct FairnessLayer {
 
     // --- Ordered tracking ---
     /// Permanent set of all digests that have been finalized. Survives recycling.
-    /// Checked BEFORE creating a dense index, so recycled slots are never
-    /// confused with previously ordered transactions.
     ordered_digests: HashSet<TxDigest>,
 
     // --- Graphs ---
@@ -357,6 +358,12 @@ pub struct FairnessLayer {
 impl FairnessLayer {
     pub fn new(committee_keys: Vec<PublicKey>, f: usize) -> Self {
         let n = committee_keys.len();
+        assert!(
+            n <= 32,
+            "FATAL: N={} exceeds maximum 32 (counted bitmask is u32). \
+             Use u64 counted masks for larger committees.",
+            n
+        );
         let solid_threshold = n - f;
         let half_threshold = (n - f + 1) / 2;
 
@@ -403,18 +410,15 @@ impl FairnessLayer {
         }
 
         let idx = if let Some(recycled) = self.free_list.pop() {
-            // Reuse a recycled slot.
             self.dense_to_digest[recycled as usize] = digest;
             self.nodes[recycled as usize] = TransactionNode::new(digest, recycled, self.n);
             recycled
         } else {
-            // Allocate a new slot.
             let idx = self.next_dense_idx;
             if idx == u32::MAX {
                 panic!(
                     "FATAL: Dense index overflow at u32::MAX. \
-                     free_list is empty, live nodes = {}, ordered = {}. \
-                     This indicates a recycling bug.",
+                     free_list is empty, live nodes = {}, ordered = {}.",
                     self.digest_to_dense.len(),
                     self.ordered_digests.len()
                 );
@@ -429,9 +433,6 @@ impl FairnessLayer {
         idx
     }
 
-    /// Recycle the dense index of a finalized transaction.
-    /// After this call, the digest is permanently in `ordered_digests` and the
-    /// dense slot is returned to the free list for reuse.
     fn recycle_ordered_tx(&mut self, digest: TxDigest) {
         self.ordered_digests.insert(digest);
         if let Some(dense) = self.digest_to_dense.remove(&digest) {
@@ -559,9 +560,6 @@ impl FairnessLayer {
         for vertex in &subdag.vertices {
             let i = vertex.replica_index;
             for &(d, oi) in &vertex.ordering_entries {
-                // Skip already-ordered digests BEFORE creating a dense index.
-                // Critical for correctness after recycling: the old dense slot
-                // may have been reused for a different transaction.
                 if self.ordered_digests.contains(&d) {
                     continue;
                 }
@@ -673,12 +671,12 @@ impl FairnessLayer {
                 self.graphs[graph_idx].set_weight_val(d_local, d2_local, w12 as u8);
                 self.graphs[graph_idx].set_weight_val(d2_local, d_local, w21 as u8);
 
-                let mut mask: u8 = 0;
+                let mut mask: u32 = 0;
                 for r in 0..n {
                     if self.nodes[d_dense as usize].committed_ois[r].is_some()
                         && self.nodes[d2_dense as usize].committed_ois[r].is_some()
                     {
-                        mask |= 1u8 << r;
+                        mask |= 1u32 << r;
                     }
                 }
                 self.graphs[graph_idx].set_counted(d_local, d2_local, mask);
@@ -726,7 +724,6 @@ impl FairnessLayer {
             let i = vertex.replica_index;
 
             for &(d, _oi) in &vertex.ordering_entries {
-                // After recycling, the digest may no longer have a dense index.
                 let d_dense = match self.digest_to_dense.get(&d) {
                     Some(&idx) => idx,
                     None => continue,
@@ -767,11 +764,11 @@ impl FairnessLayer {
 
                     let pidx = pair_idx(d_local, d2_local, cap);
                     let counted_mask = self.graphs[g_idx].counted[pidx];
-                    if counted_mask & (1u8 << i) != 0 {
+                    if counted_mask & (1u32 << i) != 0 {
                         stat_pairs_skipped_counted += 1;
                         continue;
                     }
-                    self.graphs[g_idx].counted[pidx] = counted_mask | (1u8 << i);
+                    self.graphs[g_idx].counted[pidx] = counted_mask | (1u32 << i);
 
                     if d_oi < d2_oi {
                         self.graphs[g_idx].inc_weight_val(d_local, d2_local);
@@ -1071,12 +1068,12 @@ impl FairnessLayer {
                 self.graphs[target_graph_idx].set_weight_val(d_local, d2_local, w12 as u8);
                 self.graphs[target_graph_idx].set_weight_val(d2_local, d_local, w21 as u8);
 
-                let mut mask: u8 = 0;
+                let mut mask: u32 = 0;
                 for r in 0..n {
                     if self.nodes[dense as usize].committed_ois[r].is_some()
                         && self.nodes[d2_dense as usize].committed_ois[r].is_some()
                     {
-                        mask |= 1u8 << r;
+                        mask |= 1u32 << r;
                     }
                 }
                 self.graphs[target_graph_idx].set_counted(d_local, d2_local, mask);
