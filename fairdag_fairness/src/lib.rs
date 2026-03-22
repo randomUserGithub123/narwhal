@@ -45,7 +45,7 @@ pub type OrderingEntry = (TxDigest, u64);
 const NONE_LOCAL: u16 = u16::MAX;
 
 /// Initial capacity for per-graph dense arrays.
-const INITIAL_GRAPH_CAPACITY: usize = 2048;
+const INITIAL_GRAPH_CAPACITY: usize = 16_384;
 
 // =============================================================================
 // CommittedVertex / CommittedSubdag — input from consensus
