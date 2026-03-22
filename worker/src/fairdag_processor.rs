@@ -32,7 +32,7 @@ impl FairDagProcessor {
 
         let fairness_layer = FairnessLayer::new(sorted_keys.clone(), f);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             Self {
                 store,
                 fairness_layer,
@@ -42,6 +42,13 @@ impl FairDagProcessor {
             .run()
             .await;
         });
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                log::error!("FATAL: FairDagProcessor panicked: {:?}", e);
+                std::process::abort();  // loud death instead of silent
+            }
+        });
+
     }
 
     async fn run(&mut self) {

@@ -1,20 +1,26 @@
 // Copyright(C) FairDAG-RL Implementation
 // Implements the Fairness Layer of FairDAG-RL (Sections 6.1–6.3 of the paper).
 //
-// Option C optimization for fair benchmarking against global_order.rs:
-//   - Dense u16 index mapping (TxDigest → u16) eliminates hash overhead
-//   - Nibble-packed weight matrices (matching global_order.rs representation)
+// Option C optimization + Option B index recycling:
+//   - Dense u32 global indices with free-list recycling after finalization
+//   - Per-graph u16 local indices (graphs have ≤ INITIAL_GRAPH_CAPACITY nodes)
+//   - Nibble-packed weight matrices
 //   - Adjacency-list edges with bitset existence check
-//   - Pre-allocated Tarjan arrays
-//   - Vec-based committed_ois/rounds (indexed by ReplicaIndex, size = N)
 //   - u8 bitmask for counted_replicas (supports N ≤ 8)
+//   - ordered_digests HashSet for correct skip-checking after recycling
+//
+// IMPORTANT: If this code panics, the tokio task in fairdag_processor.rs
+// will silently die. To surface panics, modify FairDagProcessor::spawn:
+//
+//   let handle = tokio::spawn(async move { Self { .. }.run().await; });
+//   tokio::spawn(async move {
+//       if let Err(e) = handle.await {
+//           log::error!("FairDagProcessor panicked: {:?}", e);
+//           std::process::abort();
+//       }
+//   });
 //
 // INSTRUMENTED BUILD: contains FAIRDAG_PERF timing lines for profiling.
-//
-// Protocol references in comments refer to:
-//   Figure 7:  Transaction dissemination and DAG vertex proposal
-//   Figure 8:  Dependency graph construction
-//   Figure 11: Ordering finalization
 
 use crypto::PublicKey;
 use log::{info, warn};
@@ -35,7 +41,10 @@ pub type OrderingEntry = (TxDigest, u64);
 // Constants
 // =============================================================================
 
+/// Sentinel value for "no local index assigned" in per-graph mappings.
 const NONE_LOCAL: u16 = u16::MAX;
+
+/// Initial capacity for per-graph dense arrays.
 const INITIAL_GRAPH_CAPACITY: usize = 2048;
 
 // =============================================================================
@@ -114,7 +123,7 @@ fn bit_set(bits: &mut [u64], idx: usize) {
 }
 
 // =============================================================================
-// Index helpers
+// Index helpers (per-graph local indices, u16)
 // =============================================================================
 
 #[inline(always)]
@@ -135,7 +144,7 @@ fn pair_idx(i: u16, j: u16, cap: usize) -> usize {
 #[derive(Clone, Debug)]
 pub struct TransactionNode {
     pub digest: TxDigest,
-    pub dense_idx: u16,
+    pub dense_idx: u32,
     pub node_type: NodeType,
     pub committed_ois: Vec<Option<u64>>,
     pub committed_rounds: Vec<Option<Round>>,
@@ -143,7 +152,7 @@ pub struct TransactionNode {
 }
 
 impl TransactionNode {
-    fn new(digest: TxDigest, dense_idx: u16, n: usize) -> Self {
+    fn new(digest: TxDigest, dense_idx: u32, n: usize) -> Self {
         TransactionNode {
             digest,
             dense_idx,
@@ -165,13 +174,18 @@ impl TransactionNode {
 
 // =============================================================================
 // DependencyGraph
+//
+// Uses u16 local indices internally (graphs have at most INITIAL_GRAPH_CAPACITY nodes).
+// Maps to/from u32 global dense indices via local_to_global / global_to_local.
 // =============================================================================
 
 pub struct DependencyGraph {
     pub round: Round,
     pub node_count: usize,
     pub capacity: usize,
-    pub local_to_global: Vec<u16>,
+    /// local_idx (u16) -> global dense idx (u32).
+    pub local_to_global: Vec<u32>,
+    /// global dense idx (u32) -> local_idx (u16). NONE_LOCAL if not in graph.
     pub global_to_local: Vec<u16>,
     pub weight: Vec<u8>,
     pub edges: Vec<Vec<u16>>,
@@ -205,14 +219,14 @@ impl DependencyGraph {
     }
 
     #[inline]
-    fn ensure_global_capacity(&mut self, global_idx: u16) {
+    fn ensure_global_capacity(&mut self, global_idx: u32) {
         let needed = global_idx as usize + 1;
         if needed > self.global_to_local.len() {
             self.global_to_local.resize(needed, NONE_LOCAL);
         }
     }
 
-    fn add_node(&mut self, global_dense_idx: u16) -> u16 {
+    fn add_node(&mut self, global_dense_idx: u32) -> u16 {
         self.ensure_global_capacity(global_dense_idx);
         let existing = self.global_to_local[global_dense_idx as usize];
         if existing != NONE_LOCAL {
@@ -221,7 +235,9 @@ impl DependencyGraph {
         let local_idx = self.node_count as u16;
         assert!(
             (local_idx as usize) < self.capacity,
-            "DependencyGraph capacity {} exceeded", self.capacity
+            "FATAL: DependencyGraph capacity {} exceeded at node_count={}. \
+             Increase INITIAL_GRAPH_CAPACITY.",
+            self.capacity, self.node_count
         );
         self.local_to_global.push(global_dense_idx);
         self.global_to_local[global_dense_idx as usize] = local_idx;
@@ -230,7 +246,7 @@ impl DependencyGraph {
     }
 
     #[inline]
-    fn get_local(&self, global_dense_idx: u16) -> Option<u16> {
+    fn get_local(&self, global_dense_idx: u32) -> Option<u16> {
         let g = global_dense_idx as usize;
         if g < self.global_to_local.len() {
             let l = self.global_to_local[g];
@@ -308,13 +324,23 @@ pub struct FairnessLayer {
     solid_threshold: usize,
     half_threshold: usize,
 
-    digest_to_dense: HashMap<TxDigest, u16>,
+    // --- Dense index mapping (u32 global indices with recycling) ---
+    digest_to_dense: HashMap<TxDigest, u32>,
     dense_to_digest: Vec<TxDigest>,
-    next_dense_idx: u16,
+    next_dense_idx: u32,
+    /// Recycled dense indices available for reuse.
+    free_list: Vec<u32>,
 
+    // --- Node storage (indexed by global dense idx) ---
     nodes: Vec<TransactionNode>,
-    ordered: Vec<bool>,
 
+    // --- Ordered tracking ---
+    /// Permanent set of all digests that have been finalized. Survives recycling.
+    /// Checked BEFORE creating a dense index, so recycled slots are never
+    /// confused with previously ordered transactions.
+    ordered_digests: HashSet<TxDigest>,
+
+    // --- Graphs ---
     graphs: Vec<DependencyGraph>,
     round_to_graph: HashMap<Round, usize>,
 
@@ -322,9 +348,9 @@ pub struct FairnessLayer {
     replica_indices: HashMap<PublicKey, ReplicaIndex>,
 
     use_hamiltonian_path: bool,
-    pending_readd: Vec<u16>,
+    /// Global dense indices of nodes waiting to be re-added to the next graph.
+    pending_readd: Vec<u32>,
 
-    /// Monotonic subdag counter for FAIRDAG_PERF logs.
     subdag_count: u64,
 }
 
@@ -354,8 +380,9 @@ impl FairnessLayer {
             digest_to_dense: HashMap::new(),
             dense_to_digest: Vec::new(),
             next_dense_idx: 0,
+            free_list: Vec::new(),
             nodes: Vec::new(),
-            ordered: Vec::new(),
+            ordered_digests: HashSet::new(),
             graphs: Vec::new(),
             round_to_graph: HashMap::new(),
             output_sequence: Vec::new(),
@@ -367,24 +394,51 @@ impl FairnessLayer {
     }
 
     // =========================================================================
-    // Dense index management
+    // Dense index management with recycling
     // =========================================================================
 
-    fn get_or_create_dense(&mut self, digest: TxDigest) -> u16 {
+    fn get_or_create_dense(&mut self, digest: TxDigest) -> u32 {
         if let Some(&idx) = self.digest_to_dense.get(&digest) {
             return idx;
         }
-        let idx = self.next_dense_idx;
-        self.next_dense_idx = self
-            .next_dense_idx
-            .checked_add(1)
-            .expect("Dense index overflow (>65535 unique transactions)");
+
+        let idx = if let Some(recycled) = self.free_list.pop() {
+            // Reuse a recycled slot.
+            self.dense_to_digest[recycled as usize] = digest;
+            self.nodes[recycled as usize] = TransactionNode::new(digest, recycled, self.n);
+            recycled
+        } else {
+            // Allocate a new slot.
+            let idx = self.next_dense_idx;
+            if idx == u32::MAX {
+                panic!(
+                    "FATAL: Dense index overflow at u32::MAX. \
+                     free_list is empty, live nodes = {}, ordered = {}. \
+                     This indicates a recycling bug.",
+                    self.digest_to_dense.len(),
+                    self.ordered_digests.len()
+                );
+            }
+            self.next_dense_idx = idx + 1;
+            self.dense_to_digest.push(digest);
+            self.nodes.push(TransactionNode::new(digest, idx, self.n));
+            idx
+        };
+
         self.digest_to_dense.insert(digest, idx);
-        self.dense_to_digest.push(digest);
-        self.nodes
-            .push(TransactionNode::new(digest, idx, self.n));
-        self.ordered.push(false);
         idx
+    }
+
+    /// Recycle the dense index of a finalized transaction.
+    /// After this call, the digest is permanently in `ordered_digests` and the
+    /// dense slot is returned to the free list for reuse.
+    fn recycle_ordered_tx(&mut self, digest: TxDigest) {
+        self.ordered_digests.insert(digest);
+        if let Some(dense) = self.digest_to_dense.remove(&digest) {
+            self.dense_to_digest[dense as usize] = 0;
+            self.nodes[dense as usize] = TransactionNode::new(0, dense, self.n);
+            self.free_list.push(dense);
+        }
     }
 
     // =========================================================================
@@ -404,15 +458,18 @@ impl FairnessLayer {
             .sum();
         info!(
             "FairnessLayer: processing subdag leader_round={} vertices={} total_entries={}",
-            r,
-            subdag.vertices.len(),
-            total_entries
+            r, subdag.vertices.len(), total_entries
         );
         info!(
-            "FAIRDAG_PERF: sd={} phase=start round={} vertices={} entries={} active_graphs={} total_nodes={}",
-            sd, r, subdag.vertices.len(), total_entries, 
+            "FAIRDAG_PERF: sd={} phase=start round={} vertices={} entries={} \
+             active_graphs={} live_dense={} free_list={} ordered_total={} \
+             next_dense_idx={}",
+            sd, r, subdag.vertices.len(), total_entries,
             self.graphs.iter().filter(|g| !g.finalized).count(),
-            self.next_dense_idx
+            self.digest_to_dense.len(),
+            self.free_list.len(),
+            self.ordered_digests.len(),
+            self.next_dense_idx,
         );
 
         // Phase 1: Create graph
@@ -495,17 +552,20 @@ impl FairnessLayer {
     // Figure 8, Lines 3-10: Find nodes updated with Ar
     // =========================================================================
 
-    fn update_nodes_from_subdag(&mut self, subdag: &CommittedSubdag) -> Vec<u16> {
-        let mut updated_set: HashSet<u16> = HashSet::new();
+    fn update_nodes_from_subdag(&mut self, subdag: &CommittedSubdag) -> Vec<u32> {
+        let mut updated_set: HashSet<u32> = HashSet::new();
         let r = subdag.leader_round;
 
         for vertex in &subdag.vertices {
             let i = vertex.replica_index;
             for &(d, oi) in &vertex.ordering_entries {
-                let dense = self.get_or_create_dense(d);
-                if self.ordered[dense as usize] {
+                // Skip already-ordered digests BEFORE creating a dense index.
+                // Critical for correctness after recycling: the old dense slot
+                // may have been reused for a different transaction.
+                if self.ordered_digests.contains(&d) {
                     continue;
                 }
+                let dense = self.get_or_create_dense(d);
                 let node = &mut self.nodes[dense as usize];
                 if node.committed_ois[i].is_none() {
                     node.committed_ois[i] = Some(oi);
@@ -515,13 +575,12 @@ impl FairnessLayer {
             }
         }
 
-        let mut updated: Vec<u16> = updated_set.into_iter().collect();
+        let mut updated: Vec<u32> = updated_set.into_iter().collect();
         updated.sort_unstable();
 
         info!(
             "FairnessLayer: update_nodes round={} updated={}",
-            r,
-            updated.len()
+            r, updated.len()
         );
         updated
     }
@@ -534,12 +593,12 @@ impl FairnessLayer {
         &mut self,
         r: Round,
         graph_idx: usize,
-        updated_nodes: &[u16],
-    ) -> Vec<u16> {
+        updated_nodes: &[u32],
+    ) -> Vec<u32> {
         let mut solid_count = 0usize;
         let mut shaded_count = 0usize;
         let mut blank_count = 0usize;
-        let mut newly_classified: Vec<u16> = Vec::new();
+        let mut newly_classified: Vec<u32> = Vec::new();
 
         for &dense in updated_nodes {
             if self.nodes[dense as usize].node_type != NodeType::Blank {
@@ -580,14 +639,14 @@ impl FairnessLayer {
     fn compute_catchup_weights_for_new_nodes(
         &mut self,
         graph_idx: usize,
-        newly_classified: &[u16],
+        newly_classified: &[u32],
     ) {
         if newly_classified.is_empty() {
             return;
         }
 
         let t_start = Instant::now();
-        let newly_set: HashSet<u16> = newly_classified.iter().copied().collect();
+        let newly_set: HashSet<u32> = newly_classified.iter().copied().collect();
         let mut edges_added = 0usize;
         let mut weights_computed = 0usize;
         let n = self.n;
@@ -667,13 +726,11 @@ impl FairnessLayer {
             let i = vertex.replica_index;
 
             for &(d, _oi) in &vertex.ordering_entries {
+                // After recycling, the digest may no longer have a dense index.
                 let d_dense = match self.digest_to_dense.get(&d) {
                     Some(&idx) => idx,
                     None => continue,
                 };
-                if self.ordered[d_dense as usize] {
-                    continue;
-                }
 
                 let g_idx = match self.nodes[d_dense as usize].graph_index {
                     Some(idx) => idx,
@@ -832,18 +889,15 @@ impl FairnessLayer {
         let t_start = Instant::now();
         let node_count = self.graphs[graph_idx].node_count;
 
-        // Tarjan SCC
         let t_scc = Instant::now();
         let sccs = tarjan_scc_dense(node_count, &self.graphs[graph_idx].edges);
         let t_scc_done = t_scc.elapsed();
 
-        // Topo sort
         let t_topo = Instant::now();
         let topo_order =
             topological_sort_sccs_dense(&sccs, &self.graphs[graph_idx].edges, node_count);
         let t_topo_done = t_topo.elapsed();
 
-        // Find last solid SCC
         let mut last_solid_pos: Option<usize> = None;
         for (pos, &scc_idx) in topo_order.iter().enumerate() {
             let has_solid = sccs[scc_idx].iter().any(|&li| {
@@ -856,9 +910,8 @@ impl FairnessLayer {
         }
 
         let mut ordered_digests: Vec<TxDigest> = Vec::new();
-        let mut to_readd: Vec<u16> = Vec::new();
+        let mut to_readd: Vec<u32> = Vec::new();
 
-        // Build path
         let t_path = Instant::now();
         match last_solid_pos {
             Some(cutoff) => {
@@ -898,21 +951,20 @@ impl FairnessLayer {
         }
         let t_path_done = t_path.elapsed();
 
-        // Mark finalized
+        // Mark finalized.
         self.graphs[graph_idx].finalized = true;
         self.graphs[graph_idx].final_order = ordered_digests.clone();
 
-        for &d in &ordered_digests {
-            let dense = self.digest_to_dense[&d];
-            self.ordered[dense as usize] = true;
-        }
         self.output_sequence.extend(&ordered_digests);
 
-        // Re-add shaded nodes
+        // Recycle dense indices of finalized transactions.
+        let recycled_count = ordered_digests.len();
+        for &d in &ordered_digests {
+            self.recycle_ordered_tx(d);
+        }
+
+        // Re-add shaded nodes.
         let t_readd = Instant::now();
-
-        let to_readd_len = to_readd.len();
-
         if !to_readd.is_empty() {
             let next_graph_idx = self.find_next_unfinalized_graph(graph_idx);
             match next_graph_idx {
@@ -953,9 +1005,11 @@ impl FairnessLayer {
 
         info!(
             "FAIRDAG_PERF: sd={} phase=finalize_graph G[{}] round={} nodes={} sccs={} \
-             ordered={} readd={} scc_us={} topo_us={} path_us={} readd_us={} total_us={}",
+             ordered={} recycled={} free_list={} readd={} scc_us={} topo_us={} path_us={} \
+             readd_us={} total_us={}",
             self.subdag_count, graph_idx, self.graphs[graph_idx].round,
             node_count, sccs.len(), ordered_digests.len(),
+            recycled_count, self.free_list.len(),
             self.pending_readd.len(),
             t_scc_done.as_micros(), t_topo_done.as_micros(), t_path_done.as_micros(),
             t_readd_done.as_micros(), t_total.as_micros(),
@@ -977,7 +1031,7 @@ impl FairnessLayer {
     // Figure 11, Lines 14-29: Re-add nodes to graph Gr'
     // =========================================================================
 
-    fn readd_nodes_to_graph(&mut self, to_readd: Vec<u16>, target_graph_idx: usize) {
+    fn readd_nodes_to_graph(&mut self, to_readd: Vec<u32>, target_graph_idx: usize) {
         let t_start = Instant::now();
         let r_prime = self.graphs[target_graph_idx].round;
         let n = self.n;
@@ -1050,7 +1104,7 @@ impl FairnessLayer {
     // Pairwise weight calculation
     // =========================================================================
 
-    fn calculate_pairwise_weight(&self, dense1: u16, dense2: u16) -> (usize, usize) {
+    fn calculate_pairwise_weight(&self, dense1: u32, dense2: u32) -> (usize, usize) {
         let node1 = &self.nodes[dense1 as usize];
         let node2 = &self.nodes[dense2 as usize];
         let mut w12: usize = 0;
@@ -1078,10 +1132,10 @@ impl FairnessLayer {
             return;
         }
 
-        let pending: Vec<u16> = self
+        let pending: Vec<u32> = self
             .pending_readd
             .drain(..)
-            .filter(|&d| !self.ordered[d as usize])
+            .filter(|&d| !self.ordered_digests.contains(&self.nodes[d as usize].digest))
             .collect();
 
         if !pending.is_empty() {
@@ -1102,10 +1156,7 @@ impl FairnessLayer {
     }
 
     pub fn pending_count(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|n| !self.ordered[n.dense_idx as usize])
-            .count()
+        self.digest_to_dense.len()
     }
 
     pub fn replica_index(&self, pk: &PublicKey) -> Option<ReplicaIndex> {
@@ -1278,11 +1329,11 @@ fn hamiltonian_path_dense(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
                 }
             }
             if !inserted {
-                warn!(
-                    "Hamiltonian path: could not find insertion point for {} — appending",
-                    v
+                panic!(
+                    "FATAL: Hamiltonian path insertion failed for node {} \
+                     in SCC of size {}. This indicates a graph corruption bug.",
+                    v, scc.len()
                 );
-                path.push_back(v);
             }
         }
     }
