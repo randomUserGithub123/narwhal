@@ -20,17 +20,24 @@ pub struct FairDagProcessor {
 
 impl FairDagProcessor {
     pub fn spawn(
-        committee: Committee,
+        mut committee: Committee,
         store: Store,
         rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
+        fault_threshold: u64,
     ) {
         let n = committee.size();
-        let f = (n - 1) / 3;
+        let f = fault_threshold as usize;
 
         let mut sorted_keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
         sorted_keys.sort();
 
-        let fairness_layer = FairnessLayer::new(sorted_keys.clone(), f);
+        let gamma = committee.get_gamma().unwrap();
+
+        let fairness_layer = FairnessLayer::new(
+            sorted_keys.clone(), 
+            f,
+            gamma
+        );
 
         let handle = tokio::spawn(async move {
             Self {

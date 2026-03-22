@@ -31,7 +31,7 @@ use tokio::sync::mpsc::{channel, Sender};
 pub mod worker_tests;
 
 /// The default channel capacity for each channel of the worker.
-pub const CHANNEL_CAPACITY: usize = 1_000;
+pub const CHANNEL_CAPACITY: usize = 10_000;
 
 /// Indicates a serialized `WorkerPrimaryMessage` message.
 pub type SerializedBatchDigestMessage = Vec<u8>;
@@ -92,6 +92,7 @@ impl Worker {
             worker.committee.clone(),
             worker.store.clone(),
             rx_fairdag,
+            worker.parameters.fault_threshold,
         );
 
         PrimaryConnector::spawn(

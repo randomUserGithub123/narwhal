@@ -80,6 +80,11 @@ pub struct Parameters {
     /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
     /// is not reached. Denominated in ms.
     pub max_batch_delay: u64,
+
+    pub gamma: f64,
+    pub scc_ordering: String,
+    pub fault_threshold: u64
+
 }
 
 impl Default for Parameters {
@@ -92,6 +97,9 @@ impl Default for Parameters {
             sync_retry_nodes: 3,
             batch_size: 500_000,
             max_batch_delay: 100,
+            gamma: 1.0,
+            scc_ordering: String::from("alphabetical"),
+            fault_threshold: 1
         }
     }
 }
@@ -107,6 +115,9 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Batch size set to {} B", self.batch_size);
         info!("Max batch delay set to {} ms", self.max_batch_delay);
+        info!("Gamma set to {}", self.gamma);
+        info!("SCC ordering set to {}", self.scc_ordering);
+        info!("Node fault_threshold set to {}", self.fault_threshold);
     }
 }
 
@@ -143,11 +154,21 @@ pub struct Authority {
 #[derive(Clone, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
+    #[serde(skip)]
+    gamma: Option<f64>,
 }
 
 impl Import for Committee {}
 
 impl Committee {
+
+    pub fn get_gamma(&mut self) -> Option<f64> {
+        self.gamma
+    }
+
+    pub fn set_gamma(&mut self, gamma: f64) {
+        self.gamma = Some(gamma);
+    }
 
     /// Return the attacking type.
     pub fn attack_type(&self, name: &PublicKey) -> AttackType {
@@ -173,12 +194,15 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the stake required to reach a quorum (2f+1).
+    /// Returns the stake required to reach a quorum (N-f).
     pub fn quorum_threshold(&self) -> Stake {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (2 N + 3) / 3 = 2f + 1 + (2k + 2)/3 = 2f + 1 + k = N - f
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        2 * total_votes / 3 + 1
+        let gamma = self.gamma.unwrap_or(1.0);
+        let k_raw = (2.0 * (gamma + 1.0)) / (2.0 * gamma - 1.0);
+        let k = (k_raw * 1e10).round() / 1e10;
+        ((k - 1.0) * total_votes as f64 / k + 1.0) as u32
     }
 
     /// Returns the stake required to reach availability (f+1).
@@ -186,7 +210,10 @@ impl Committee {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        (total_votes + 2) / 3
+        let gamma = self.gamma.unwrap_or(1.0);
+        let k_raw = (2.0 * (gamma + 1.0)) / (2.0 * gamma - 1.0);
+        let k = (k_raw * 1e10).round() / 1e10;
+        ((total_votes as f64 + (k - 1.0)) / k) as u32
     }
 
     /// Returns the primary addresses of the target primary.

@@ -75,7 +75,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     // Read the committee and node's keypair from file.
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
-    let committee =
+    let mut committee =
         Committee::import(committee_file).context("Failed to load the committee information")?;
 
     // Load default parameters if none are specified.
@@ -85,6 +85,10 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         }
         None => Parameters::default(),
     };
+
+    committee.set_gamma(
+        parameters.gamma
+    );
 
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;

@@ -325,15 +325,21 @@ pub struct FairnessLayer {
 }
 
 impl FairnessLayer {
-    pub fn new(committee_keys: Vec<PublicKey>, f: usize) -> Self {
+    pub fn new(committee_keys: Vec<PublicKey>, f: usize, gamma: f64) -> Self {
+        
         let n = committee_keys.len();
         assert!(
             n <= 32,
             "FATAL: N={} exceeds maximum 32 (counted bitmask is u32).",
             n
         );
-        let solid_threshold = n - f;
-        let half_threshold = (n - f + 1) / 2;
+
+        let solid_threshold = n - 2 * f;
+        let non_blank_threshold = (((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0) * 1e10).round() / 1e10;
+        let half_threshold = non_blank_threshold.floor() as usize;
+
+        // let solid_threshold = n - f;
+        // let half_threshold = (n - f + 1) / 2;
 
         let replica_indices: HashMap<PublicKey, ReplicaIndex> = committee_keys
             .into_iter()

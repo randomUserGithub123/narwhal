@@ -280,11 +280,18 @@ class NodeParameters:
             inputs += [json['sync_retry_nodes']]
             inputs += [json['batch_size']]
             inputs += [json['max_batch_delay']]
+            inputs += [json['fault_threshold']]
         except KeyError as e:
             raise ConfigError(f'Malformed parameters: missing key {e}')
 
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
+        
+        if not isinstance(json['gamma'], float):
+            raise ConfigError('Invalid parameters type: gamma')
+        
+        if not isinstance(json['scc_ordering'], str):
+            raise ConfigError('Invalid parameters type: scc_ordering')
 
         self.json = json
 

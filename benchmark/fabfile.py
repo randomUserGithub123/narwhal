@@ -1,4 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+import math
+
 from fabric import task
 
 import os
@@ -156,7 +158,7 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # (0, 1, 4_000, 4, 1, 15, 5, 4000),
         # (0, 1, 4_000, 5, 1, 16, 5, 4000),
         # (0, 1, 4_000, 5, 1, 17, 5, 4000),
-        (0, 1, 4_000, 5, 1, 18, 1, 4000),
+        (0, 1, 10 * 128, 4, 1, 17, 1, 4000),
     ]:
         
         assert attack_type in [
@@ -187,7 +189,23 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": batch_size,  # bytes
             "max_batch_delay": 1000,  # ms
+            "gamma": 1.0, # batch-OF parameter,
+            "scc_ordering": "alphabetical", # batch-OF parameter
         }
+
+        k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
+        node_params.update({
+            "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
+        })
+
+        assert bench_params['faults'] <= node_params['fault_threshold']
+        assert node_params['gamma'] > 0.5 and node_params['gamma'] <= 1.0
+        assert node_params["scc_ordering"] in [
+            "alphabetical",
+            "hamiltonian_cycle",
+            # "ranked_pairs"
+        ]
+
         if console:
             os.system('export RUSTFLAGS="--cfg tokio_unstable"')
         try:
@@ -198,15 +216,28 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
                 workers_per_node,
                 nodes,
             )
-            for i in range(runs):
-                print(f"DAS run {i}\n")
+            run = 0
+            while run < runs:
+               
+                print(f"\n=============================\nDAS experiment[{attack_type, arbitragers, faults, workers_per_node, nodes, input_rate}] run[{run}]\n=============================\n")
+
                 ret = DASBench(
                     bench_params, 
                     node_params, 
                     username
                 ).run(debug, console, build)
+
+                consensus_tps_raw, _, _ = ret._consensus_throughput()
+                exec_time = int(ret.get_execution_time())
+                if int(consensus_tps_raw) < 1 or exec_time <= 40:
+                    print(f"SKIPPING RESULTS DUE TO LOW TPS {consensus_tps_raw} or low execution time {exec_time}s")
+                    continue # Skip until DAS nodes work
+
                 print(ret.result())
                 ret.print(filename)
+
+                run += 1
+
             if attack_type == 1:
                 succ_num, total_num = _get_fissure_total(filename)
                 fissure_total_result = ""
