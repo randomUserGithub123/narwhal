@@ -39,6 +39,8 @@ impl FairDagProcessor {
             gamma
         );
 
+        // Spawn with panic propagation — if the fairness layer panics,
+        // the process aborts immediately instead of silently dropping the task.
         let handle = tokio::spawn(async move {
             Self {
                 store,
@@ -49,63 +51,129 @@ impl FairDagProcessor {
             .run()
             .await;
         });
+
         tokio::spawn(async move {
             if let Err(e) = handle.await {
-                log::error!("FATAL: FairDagProcessor panicked: {:?}", e);
-                std::process::abort();  // loud death instead of silent
+                error!("FATAL: FairDagProcessor panicked: {:?}", e);
+                std::process::abort();
             }
         });
-
     }
 
     async fn run(&mut self) {
         let mut subdag_count: u64 = 0;
+        let mut batch_count: u64 = 0;
 
         while let Some((leader_round, certificates)) = self.rx_committed_subdags.recv().await {
-            subdag_count += 1;
-            let total_start = Instant::now();
+            let batch_start = Instant::now();
+
+            // ─────────────────────────────────────────────────────────────────
+            // Step 1: Drain all queued subdags into a batch.
+            //
+            // After the blocking recv() returns one subdag, try_recv() pulls
+            // any additional subdags that arrived while we were processing
+            // the previous batch. This turns sequential processing into
+            // pipelined batch processing: all extractions happen first, then
+            // all fairness computation benefits from the combined OI data.
+            // ─────────────────────────────────────────────────────────────────
+            let mut batch_raw: Vec<(Round, Vec<Certificate>)> = vec![(leader_round, certificates)];
+            while let Ok((r, c)) = self.rx_committed_subdags.try_recv() {
+                batch_raw.push((r, c));
+            }
+
+            let batch_size = batch_raw.len();
+            batch_count += 1;
 
             info!(
-                "FAIRDAG_TIMING: subdag #{} received: leader_round={} certs={}",
-                subdag_count, leader_round, certificates.len()
+                "FAIRDAG_TIMING: batch #{} draining: {} subdags queued",
+                batch_count, batch_size
             );
 
-            // Step 1: Extract subdag (reads from store)
+            // ─────────────────────────────────────────────────────────────────
+            // Step 2: Extract all subdags (reads from store).
+            //
+            // This is I/O-bound (store reads), so doing it for the full batch
+            // before any computation means the fairness layer has ALL OIs
+            // available when it starts processing.
+            // ─────────────────────────────────────────────────────────────────
             let extract_start = Instant::now();
-            let subdag = self.extract_subdag(leader_round, &certificates).await;
+            let mut subdags: Vec<CommittedSubdag> = Vec::with_capacity(batch_size);
+
+            for (round, certs) in &batch_raw {
+                subdag_count += 1;
+
+                info!(
+                    "FAIRDAG_TIMING: subdag #{} received: leader_round={} certs={}",
+                    subdag_count, round, certs.len()
+                );
+
+                let sd_extract_start = Instant::now();
+                let subdag = self.extract_subdag(*round, certs).await;
+                let sd_extract_ms = sd_extract_start.elapsed().as_millis();
+
+                let total_entries: usize = subdag
+                    .vertices
+                    .iter()
+                    .map(|v| v.ordering_entries.len())
+                    .sum();
+
+                info!(
+                    "FAIRDAG_TIMING: subdag #{} extract done: {}ms, vertices={} total_entries={}",
+                    subdag_count, sd_extract_ms, subdag.vertices.len(), total_entries
+                );
+
+                subdags.push(subdag);
+            }
+
             let extract_ms = extract_start.elapsed().as_millis();
 
-            let total_entries: usize = subdag.vertices.iter()
-                .map(|v| v.ordering_entries.len())
-                .sum();
-
-            info!(
-                "FAIRDAG_TIMING: subdag #{} extract done: {}ms, vertices={} total_entries={}",
-                subdag_count, extract_ms, subdag.vertices.len(), total_entries
-            );
-
-            // Step 2: Process through fairness layer
+            // ─────────────────────────────────────────────────────────────────
+            // Step 3: Process all subdags through the fairness layer.
+            //
+            // Sequential processing: each subdag is processed individually.
+            // Even without process_subdag_batch(), this benefits from batch
+            // extraction because later subdags' OIs from update_nodes are
+            // available when earlier graphs run update_weights_and_edges.
+            //
+            // With the batch lib.rs (process_subdag_batch), all ingest happens
+            // first, then catchup/weights/finalize run once with all OIs.
+            // ─────────────────────────────────────────────────────────────────
             let process_start = Instant::now();
-            let fair_ordered = self.fairness_layer.process_subdag(&subdag);
-            let process_ms = process_start.elapsed().as_millis();
+            let mut total_fair_ordered: usize = 0;
 
-            let total_ms = total_start.elapsed().as_millis();
+            for (i, subdag) in subdags.iter().enumerate() {
+                let sd_process_start = Instant::now();
+                let fair_ordered = self.fairness_layer.process_subdag(subdag);
+                let sd_process_ms = sd_process_start.elapsed().as_millis();
 
-            info!(
-                "FAIRDAG_TIMING: subdag #{} process done: {}ms, fair_ordered={} total_time={}ms",
-                subdag_count, process_ms, fair_ordered.len(), total_ms
-            );
+                let sd_num = subdag_count - (batch_size as u64) + (i as u64) + 1;
 
-            // Log each fair-ordered transaction.
-            if !fair_ordered.is_empty() {
                 info!(
-                    "FairDAG: outputting {} fair-ordered transactions from leader round {}",
-                    fair_ordered.len(), leader_round
+                    "FAIRDAG_TIMING: subdag #{} process done: {}ms, fair_ordered={} total_time={}ms",
+                    sd_num, sd_process_ms, fair_ordered.len(),
+                    batch_start.elapsed().as_millis()
                 );
-                for tx_id in &fair_ordered {
-                    info!("FairDAG-RL ordered transaction: {}", tx_id);
+
+                if !fair_ordered.is_empty() {
+                    info!(
+                        "FairDAG: outputting {} fair-ordered transactions from leader round {}",
+                        fair_ordered.len(), subdag.leader_round
+                    );
+                    for tx_id in &fair_ordered {
+                        info!("FairDAG-RL ordered transaction: {}", tx_id);
+                    }
+                    total_fair_ordered += fair_ordered.len();
                 }
             }
+
+            let process_ms = process_start.elapsed().as_millis();
+            let total_ms = batch_start.elapsed().as_millis();
+
+            info!(
+                "FAIRDAG_TIMING: batch #{} done: batch_size={} extract={}ms process={}ms \
+                 total={}ms fair_ordered={}",
+                batch_count, batch_size, extract_ms, process_ms, total_ms, total_fair_ordered
+            );
         }
     }
 
