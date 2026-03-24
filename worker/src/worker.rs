@@ -1,18 +1,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Modified for FairDAG-RL (v5) — Explicit Missing Edge Updates.
+// Modified for FairDAG-RL (v5).
 //
 // Changes from v4:
-//   1. WorkerMessage::Batch now carries an optional lz4-compressed
-//      MissingEdgeUpdate payload.
-//   2. PrimaryReceiverHandler dispatches ExecuteSubdag to FairDagProcessor.
-//   3. FairnessToWorkerMessage channel: FairnessLayer → BatchMaker for
-//      MissingEdgeRequest / GraphResolved notifications.
-//   4. BatchMaker receives missing edge requests and produces explicit updates.
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
+//   1. WorkerMessage::Batch now carries lz4-compressed MissingEdgeContributions
+//   2. WorkerReceiverHandler extracts contributions and forwards to FairDagProcessor
+//   3. New channel: FairDagProcessor → BatchMaker for MissingEdgeRequests
+//   4. New channel: WorkerReceiverHandler → FairDagProcessor for received contributions
+
+use crate::batch_maker::{
+    Batch, BatchMaker, MissingEdgeContribution, MissingEdgeRequest, Transaction,
+};
 use crate::fairdag_processor::FairDagProcessor;
 use crate::helper::Helper;
 use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker};
-use crate::missing_edge_types::{FairnessToWorkerMessage, MissingEdgeUpdate};
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
@@ -41,11 +41,13 @@ pub const CHANNEL_CAPACITY: usize = 10_000;
 pub type SerializedBatchDigestMessage = Vec<u8>;
 
 /// The message exchanged between workers.
-/// FairDAG-RL v5: Batch carries Vec<(Transaction, u64)> and an optional
-/// lz4-compressed MissingEdgeUpdate payload.
+/// FairDAG-RL v5: Batch carries Vec<(Transaction, u64)> + lz4-compressed
+/// MissingEdgeContributions (empty Vec<u8> if none).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Batch(Batch, Option<Vec<u8>>), // (entries, optional compressed MissingEdgeUpdate)
+    /// (batch_entries, lz4_compressed_contributions)
+    /// If compressed_contributions is empty, there are no edge contributions.
+    Batch(Batch, Vec<u8>),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
@@ -73,14 +75,6 @@ impl Worker {
         // FairDAG-RL: Create the shared local order tracker.
         let tracker = LocalOrderTracker::new();
 
-        // Determine our replica index for missing edge updates.
-        let mut sorted_keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
-        sorted_keys.sort();
-        let our_replica_index = sorted_keys
-            .iter()
-            .position(|k| *k == name)
-            .expect("Our public key not in committee");
-
         let worker = Self {
             name,
             id,
@@ -95,27 +89,28 @@ impl Worker {
         // FairDAG-RL: Channel for committed subdags → FairDagProcessor.
         let (tx_fairdag, rx_fairdag) = channel(CHANNEL_CAPACITY);
 
-        // FairDAG-RL v5: Channel for FairnessLayer → BatchMaker
-        // (MissingEdgeRequest / GraphResolved notifications).
-        let (tx_fairness_to_worker, rx_fairness_to_worker) = channel(CHANNEL_CAPACITY);
+        // FairDAG-RL v5: Channel for FairDagProcessor → BatchMaker (missing edge requests).
+        let (tx_missing_edge, rx_missing_edge) = channel(CHANNEL_CAPACITY);
+
+        // FairDAG-RL v5: Channel for received MissingEdgeContributions → FairDagProcessor.
+        let (tx_edge_contributions, rx_edge_contributions) = channel(CHANNEL_CAPACITY);
 
         worker.handle_primary_messages(tx_fairdag);
         worker.handle_clients_transactions(
             tx_primary.clone(),
             tracker.clone(),
-            rx_fairness_to_worker,
-            our_replica_index,
+            rx_missing_edge,
         );
-        worker.handle_workers_messages(tx_primary, tracker);
+        worker.handle_workers_messages(tx_primary, tracker, tx_edge_contributions);
 
-        // FairDAG-RL: Spawn the FairDagProcessor. It reads batches from the
-        // local store and runs the fairness layer.
+        // FairDAG-RL: Spawn the FairDagProcessor with edge update channels.
         FairDagProcessor::spawn(
             worker.committee.clone(),
             worker.store.clone(),
             rx_fairdag,
             worker.parameters.fault_threshold,
-            tx_fairness_to_worker,
+            tx_missing_edge,
+            rx_edge_contributions,
         );
 
         PrimaryConnector::spawn(
@@ -182,8 +177,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tracker: LocalOrderTracker,
-        rx_fairness_to_worker: tokio::sync::mpsc::Receiver<FairnessToWorkerMessage>,
-        our_replica_index: usize,
+        rx_missing_edge: tokio::sync::mpsc::Receiver<MissingEdgeRequest>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -195,13 +189,9 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
-            address,
-            TxReceiverHandler { tx_batch_maker },
-        );
+        Receiver::spawn(address, TxReceiverHandler { tx_batch_maker });
 
-        // FairDAG-RL v5: BatchMaker gets the shared tracker AND the
-        // fairness-to-worker channel for explicit missing edge updates.
+        // FairDAG-RL v5: BatchMaker gets the missing edge request channel.
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
@@ -213,8 +203,7 @@ impl Worker {
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
             tracker,
-            rx_fairness_to_worker,
-            our_replica_index,
+            rx_missing_edge,
         );
 
         QuorumWaiter::spawn(
@@ -243,6 +232,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tracker: LocalOrderTracker,
+        tx_edge_contributions: Sender<Vec<MissingEdgeContribution>>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -259,6 +249,7 @@ impl Worker {
                 tx_helper,
                 tx_processor,
                 tracker,
+                tx_edge_contributions,
             },
         );
 
@@ -307,12 +298,15 @@ impl MessageHandler for TxReceiverHandler {
 }
 
 /// Handles incoming messages from other workers.
-/// FairDAG-RL: records indirect tx arrivals in the shared tracker.
+/// FairDAG-RL v5: extracts lz4-compressed MissingEdgeContributions from batches
+/// and forwards them to FairDagProcessor.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tracker: LocalOrderTracker,
+    /// Channel to forward received edge contributions to FairDagProcessor.
+    tx_edge_contributions: Sender<Vec<MissingEdgeContribution>>,
 }
 
 #[async_trait]
@@ -322,11 +316,46 @@ impl MessageHandler for WorkerReceiverHandler {
         let _ = writer.send(Bytes::from("Ack")).await;
 
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(ref batch_entries, _compressed_update)) => {
+            Ok(WorkerMessage::Batch(ref batch_entries, ref compressed_contributions)) => {
                 // FairDAG-RL: Record indirect arrivals.
                 for (tx_bytes, _sender_oi) in batch_entries {
                     let tx_digest = extract_tx_digest(tx_bytes);
                     self.tracker.record(tx_digest);
+                }
+
+                // FairDAG-RL v5: Extract and forward edge contributions.
+                if !compressed_contributions.is_empty() {
+                    match lz4_flex::decompress_size_prepended(compressed_contributions) {
+                        Ok(decompressed) => {
+                            match bincode::deserialize::<Vec<MissingEdgeContribution>>(&decompressed)
+                            {
+                                Ok(contributions) if !contributions.is_empty() => {
+                                    debug!(
+                                        "FairDAG WorkerReceiver: extracted {} edge contributions from batch",
+                                        contributions.len()
+                                    );
+                                    if let Err(e) =
+                                        self.tx_edge_contributions.send(contributions).await
+                                    {
+                                        warn!(
+                                            "Failed to forward edge contributions: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                Ok(_) => {} // empty list, ignore
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize edge contributions: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to decompress edge contributions: {}", e);
+                        }
+                    }
                 }
 
                 self.tx_processor
@@ -365,7 +394,6 @@ impl MessageHandler for PrimaryReceiverHandler {
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
             Ok(PrimaryWorkerMessage::ExecuteSubdag(leader_round, certificates)) => {
-                // FairDAG-RL: route to FairDagProcessor, NOT to synchronizer.
                 info!(
                     "Worker received ExecuteSubdag for leader round {} with {} certs",
                     leader_round,
@@ -377,7 +405,6 @@ impl MessageHandler for PrimaryReceiverHandler {
                     .expect("Failed to send subdag to FairDagProcessor");
             }
             Ok(message) => {
-                // Synchronize and Cleanup go to the synchronizer as before.
                 self.tx_synchronizer
                     .send(message)
                     .await

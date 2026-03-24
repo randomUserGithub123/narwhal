@@ -7,15 +7,16 @@
 // from a client or indirectly via another worker's batch.
 //
 // This struct is shared (via Arc) between:
-//   - BatchMaker: records client transactions, checks OIs for edge update requests
+//   - BatchMaker: records client transactions, retrieves OI for sealing batches
 //   - WorkerReceiverHandler: records transactions arriving in other workers' batches
+//   - MissingEdgeTracker: queries OIs for explicit edge contributions
 //
 // Uses std::sync::Mutex (not tokio::sync::Mutex) because the critical section
 // is just a HashMap lookup + counter increment — no async work inside the lock.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::convert::TryInto;
+use std::sync::{Arc, Mutex};
 
 pub type TxDigest = u64;
 
@@ -69,19 +70,42 @@ impl LocalOrderTracker {
         inner.counter
     }
 
-    /// Batch lookup: returns (tx_digest, oi) for every digest ONLY if ALL have
-    /// been seen. Returns None if any requested digest has not been observed yet.
-    /// Used by BatchMaker to check readiness of a MissingEdgeRequest.
-    pub fn batch_lookup_all(&self, digests: &[TxDigest]) -> Option<Vec<(TxDigest, u64)>> {
+    // =========================================================================
+    // Explicit-edge-update helpers
+    // =========================================================================
+
+    /// Check if ALL of the given tx digests have been seen locally.
+    /// Returns true only if every digest has an assigned OI.
+    pub fn has_all(&self, digests: &[TxDigest]) -> bool {
         let inner = self.inner.lock().unwrap();
-        let mut result = Vec::with_capacity(digests.len());
-        for &d in digests {
-            match inner.seen.get(&d) {
-                Some(&oi) => result.push((d, oi)),
-                None => return None,
-            }
-        }
-        Some(result)
+        digests.iter().all(|d| inner.seen.contains_key(d))
+    }
+
+    /// Collect OIs for a set of tx digests. Returns None for any unseen digest.
+    /// Use after `has_all()` returns true to bulk-export the OIs.
+    pub fn get_ois_bulk(&self, digests: &[TxDigest]) -> Vec<(TxDigest, Option<u64>)> {
+        let inner = self.inner.lock().unwrap();
+        digests
+            .iter()
+            .map(|&d| (d, inner.seen.get(&d).copied()))
+            .collect()
+    }
+
+    /// Collect OIs for a set of tx digests, returning only those that are present.
+    /// Panics if any digest is missing — call only after `has_all()` confirms.
+    pub fn get_ois_bulk_unwrap(&self, digests: &[TxDigest]) -> Vec<(TxDigest, u64)> {
+        let inner = self.inner.lock().unwrap();
+        digests
+            .iter()
+            .map(|&d| {
+                let oi = inner
+                    .seen
+                    .get(&d)
+                    .copied()
+                    .expect("get_ois_bulk_unwrap called with unseen digest");
+                (d, oi)
+            })
+            .collect()
     }
 }
 

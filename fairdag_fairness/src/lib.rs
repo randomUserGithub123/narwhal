@@ -1,37 +1,39 @@
-// Copyright(C) FairDAG-RL Implementation
-// v5: Explicit Missing Edge Updates with Independent Graphs
+// Copyright(C) FairDAG-RL Implementation — v5
 //
-// Key changes from v4 (implicit edge updates):
+// Implements the Fairness Layer with Themis-style explicit edge updates.
 //
-// 1. EXPLICIT EDGE UPDATES: Instead of silently carrying over OIs across
-//    graphs, missing edges are resolved via an explicit protocol:
-//    - When a graph has missing edges, FairnessLayer emits a
-//      MissingEdgeRequest to the BatchMaker.
-//    - Each replica produces a MissingEdgeUpdate (lz4-compressed in batches).
-//    - Once n-f replica updates are collected, missing edges are resolved.
+// Key changes from v4 (implicit missing-edge resolution):
 //
-// 2. INDEPENDENT GRAPHS: Each dependency graph is independent. Nodes are NOT
-//    re-added from one graph to the next via "carrying over" OIs. Instead,
-//    shaded nodes after the last solid SCC are moved to the next graph with
-//    fresh weight computation from explicit updates only.
+//   1. NO IMPLICIT WEIGHT UPDATES: `update_weights_and_edges()` is removed.
+//      Instead, missing edges are resolved via explicit `apply_fair_update()`
+//      when n-f contributions arrive from other replicas.
 //
-// 3. PARALLEL GRAPH CONSTRUCTION: Since graphs are independent, new graphs
-//    can be constructed in parallel (rayon). Finalization is still sequential
-//    in round-increasing order (protocol requirement).
+//   2. NO READD: Each graph is fully independent. When a graph is finalized,
+//      everything after the last solid SCC is DISCARDED — no shaded/blank
+//      nodes are re-added to later graphs. This enables parallel graph
+//      construction.
 //
-// 4. COMPRESSION: MissingEdgeUpdates are lz4-compressed in batches.
+//   3. NEW PUBLIC API:
+//      - `process_subdag_explicit()` → (ordered_txs, Option<missing_request>)
+//        Processes a subdag and returns both the ordered txs (if graph is a
+//        tournament) and an optional missing-edge request (if not).
+//      - `apply_fair_update(graph_round, contributions)` → ordered_txs
+//        Applies explicit edge contributions from n-f replicas to resolve
+//        missing edges in a parked graph, following Themis's FairUpdate.
+//
+//   4. PARALLEL-READY: Since graphs are independent, the ingest phase can
+//      be parallelized. The `process_subdag_explicit` method is designed to
+//      be called sequentially (it mutates shared node state), but the
+//      extraction phase (in FairDagProcessor) runs in parallel tokio tasks.
+//
+// Retained from v4: dense u32 indices, free-list recycling, nibble-packed
+// weights, u32 counted masks (N ≤ 32), Tarjan SCC, Hamiltonian path.
 
 use crypto::PublicKey;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
-
-// Re-export the missing edge types used by workers.
-pub use crate::missing_edge_types::{
-    EdgeDirection, FairnessToWorkerMessage, GraphId, GraphResolved,
-    MissingEdgeRequest, MissingEdgeUpdate, PairwiseVote,
-};
 
 // =============================================================================
 // Types
@@ -175,12 +177,11 @@ impl TransactionNode {
 }
 
 // =============================================================================
-// DependencyGraph — now tracks explicit edge update votes
+// DependencyGraph
 // =============================================================================
 
 pub struct DependencyGraph {
     pub round: Round,
-    pub graph_id: GraphId,
     pub node_count: usize,
     pub capacity: usize,
     pub local_to_global: Vec<u32>,
@@ -193,18 +194,8 @@ pub struct DependencyGraph {
     pub missing_pairs: Vec<(u16, u16)>,
     pub finalized: bool,
     pub final_order: Vec<TxDigest>,
-
-    // v5: Explicit edge update tracking
-    /// Number of distinct replica updates received for this graph.
-    pub replica_updates_received: HashSet<usize>,
-    /// Whether we've already sent a MissingEdgeRequest for this graph.
-    pub request_sent: bool,
-    /// Whether this graph has been resolved (all missing edges filled via
-    /// explicit updates reaching n-f threshold).
-    pub resolved: bool,
-    /// Accumulated explicit edge votes: (d1, d2) → Vec of (replica_index, direction).
-    /// Canonical key: d1 < d2.
-    pub explicit_votes: HashMap<(TxDigest, TxDigest), Vec<(usize, EdgeDirection)>>,
+    /// v5: Whether we have already sent a MissingEdgeRequest for this graph.
+    pub missing_edge_request_sent: bool,
 }
 
 impl DependencyGraph {
@@ -214,7 +205,6 @@ impl DependencyGraph {
         let bit_words = (cap * cap + 63) / 64;
         DependencyGraph {
             round,
-            graph_id: round, // graph_id = leader_round
             node_count: 0,
             capacity: cap,
             local_to_global: Vec::with_capacity(cap),
@@ -227,10 +217,7 @@ impl DependencyGraph {
             missing_pairs: Vec::new(),
             finalized: false,
             final_order: Vec::new(),
-            replica_updates_received: HashSet::new(),
-            request_sent: false,
-            resolved: false,
-            explicit_votes: HashMap::new(),
+            missing_edge_request_sent: false,
         }
     }
 
@@ -245,7 +232,9 @@ impl DependencyGraph {
     fn add_node(&mut self, global_dense_idx: u32) -> u16 {
         self.ensure_global_capacity(global_dense_idx);
         let existing = self.global_to_local[global_dense_idx as usize];
-        if existing != NONE_LOCAL { return existing; }
+        if existing != NONE_LOCAL {
+            return existing;
+        }
         let local_idx = self.node_count as u16;
         assert!(
             (local_idx as usize) < self.capacity,
@@ -264,7 +253,9 @@ impl DependencyGraph {
         if g < self.global_to_local.len() {
             let l = self.global_to_local[g];
             if l != NONE_LOCAL { Some(l) } else { None }
-        } else { None }
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -281,7 +272,9 @@ impl DependencyGraph {
 
     fn add_edge(&mut self, from: u16, to: u16) -> bool {
         let pidx = pair_idx(from, to, self.capacity);
-        if bit_get(&self.has_edge_pair, pidx) { return false; }
+        if bit_get(&self.has_edge_pair, pidx) {
+            return false;
+        }
         bit_set(&mut self.has_edge_pair, pidx);
         self.edge_pair_count += 1;
         self.edges[from as usize].push(to);
@@ -306,15 +299,36 @@ impl DependencyGraph {
         self.has_edge_pair = Vec::new();
         self.counted = Vec::new();
         self.missing_pairs = Vec::new();
-        self.explicit_votes = HashMap::new();
-        for e in &mut self.edges { *e = Vec::new(); }
+        for e in &mut self.edges {
+            *e = Vec::new();
+        }
         self.edges = Vec::new();
         self.global_to_local = Vec::new();
+    }
+
+    /// v5: Collect all unique tx digests involved in missing pairs.
+    fn missing_edge_tx_digests(&self) -> Vec<u32> {
+        let mut dense_set: HashSet<u32> = HashSet::new();
+        for &(li, lj) in &self.missing_pairs {
+            dense_set.insert(self.local_to_global[li as usize]);
+            dense_set.insert(self.local_to_global[lj as usize]);
+        }
+        dense_set.into_iter().collect()
     }
 }
 
 // =============================================================================
-// FairnessLayer — v5 with explicit edge updates
+// IngestResult
+// =============================================================================
+
+struct IngestResult {
+    graph_idx: usize,
+    newly_classified: Vec<u32>,
+    round: Round,
+}
+
+// =============================================================================
+// FairnessLayer
 // =============================================================================
 
 pub struct FairnessLayer {
@@ -332,14 +346,12 @@ pub struct FairnessLayer {
     ordered_digests: HashSet<TxDigest>,
 
     graphs: Vec<DependencyGraph>,
-    /// graph_id (= leader_round) → index in self.graphs
-    graph_id_to_idx: HashMap<GraphId, usize>,
+    round_to_graph: HashMap<Round, usize>,
 
     output_sequence: Vec<TxDigest>,
     replica_indices: HashMap<PublicKey, ReplicaIndex>,
 
     use_hamiltonian_path: bool,
-    pending_readd: Vec<u32>,
 
     subdag_count: u64,
     batch_count: u64,
@@ -350,7 +362,8 @@ impl FairnessLayer {
         let n = committee_keys.len();
         assert!(n <= 32, "FATAL: N={} exceeds 32 (counted bitmask is u32).", n);
         let solid_threshold = n - 2 * f;
-        let non_blank_threshold = (((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0) * 1e10).round() / 1e10;
+        let non_blank_threshold =
+            (((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0) * 1e10).round() / 1e10;
         let half_threshold = non_blank_threshold.floor() as usize;
 
         let replica_indices: HashMap<PublicKey, ReplicaIndex> = committee_keys
@@ -365,7 +378,10 @@ impl FairnessLayer {
         );
 
         FairnessLayer {
-            n, f, solid_threshold, half_threshold,
+            n,
+            f,
+            solid_threshold,
+            half_threshold,
             digest_to_dense: HashMap::new(),
             dense_to_digest: Vec::new(),
             next_dense_idx: 0,
@@ -373,11 +389,10 @@ impl FairnessLayer {
             nodes: Vec::new(),
             ordered_digests: HashSet::new(),
             graphs: Vec::new(),
-            graph_id_to_idx: HashMap::new(),
+            round_to_graph: HashMap::new(),
             output_sequence: Vec::new(),
             replica_indices,
             use_hamiltonian_path: false,
-            pending_readd: Vec::new(),
             subdag_count: 0,
             batch_count: 0,
         }
@@ -398,7 +413,11 @@ impl FairnessLayer {
         } else {
             let idx = self.next_dense_idx;
             if idx == u32::MAX {
-                panic!("FATAL: Dense index overflow.");
+                panic!(
+                    "FATAL: Dense index overflow. free_list empty, live={}, ordered={}.",
+                    self.digest_to_dense.len(),
+                    self.ordered_digests.len()
+                );
             }
             self.next_dense_idx = idx + 1;
             self.dense_to_digest.push(digest);
@@ -419,190 +438,285 @@ impl FairnessLayer {
     }
 
     // =========================================================================
-    // PUBLIC API: Backward compatible single subdag
+    // PUBLIC API: Backward-compatible single subdag
     // =========================================================================
 
     pub fn process_subdag(&mut self, subdag: &CommittedSubdag) -> Vec<TxDigest> {
-        let (ordered, _msgs) = self.process_subdag_batch_explicit(
-            &[subdag.clone()], &[],
-        );
+        let (ordered, _missing) = self.process_subdag_explicit(subdag);
         ordered
     }
 
     // =========================================================================
-    // PUBLIC API: Batch processing with explicit edge updates
+    // PUBLIC API v5: Explicit missing-edge processing
     //
-    // Returns (ordered_txs, messages_for_batchmaker)
+    // Returns:
+    //   - Vec<TxDigest>: transactions that were fully ordered (graph was tournament)
+    //   - Option<(Round, Vec<TxDigest>)>: if the graph has missing edges,
+    //     returns (graph_round, needed_tx_digests) for the MissingEdgeRequest
     // =========================================================================
 
-    pub fn process_subdag_batch_explicit(
+    pub fn process_subdag_explicit(
         &mut self,
-        subdags: &[CommittedSubdag],
-        edge_updates: &[MissingEdgeUpdate],
-    ) -> (Vec<TxDigest>, Vec<FairnessToWorkerMessage>) {
-        if subdags.is_empty() && edge_updates.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-
+        subdag: &CommittedSubdag,
+    ) -> (Vec<TxDigest>, Option<(Round, Vec<TxDigest>)>) {
         let total_start = Instant::now();
-        self.batch_count += 1;
-        let batch_id = self.batch_count;
+        self.subdag_count += 1;
+        let sd = self.subdag_count;
+
+        let total_entries: usize = subdag
+            .vertices
+            .iter()
+            .map(|v| v.ordering_entries.len())
+            .sum();
 
         info!(
-            "FAIRDAG_PERF: batch={} phase=start subdags={} edge_updates={} \
-             active_graphs={}",
-            batch_id, subdags.len(), edge_updates.len(),
+            "FAIRDAG_PERF: sd={} phase=start entries={} active_graphs={} live_dense={} \
+             free_list={} ordered_total={}",
+            sd,
+            total_entries,
             self.graphs.iter().filter(|g| !g.finalized).count(),
+            self.digest_to_dense.len(),
+            self.free_list.len(),
+            self.ordered_digests.len(),
         );
 
-        let mut messages: Vec<FairnessToWorkerMessage> = Vec::new();
-
         // =====================================================================
-        // Phase 1: Ingest subdags — create new graphs, update nodes, classify
+        // Phase 1: Ingest subdag (create graph, update nodes, classify)
         // =====================================================================
         let t_ingest = Instant::now();
-        struct IngestResult {
-            graph_idx: usize,
-            newly_classified: Vec<u32>,
-        }
-        let mut work_items: Vec<IngestResult> = Vec::new();
-
-        for subdag in subdags {
-            self.subdag_count += 1;
-            let (graph_idx, newly_classified) = self.ingest_subdag(subdag);
-            work_items.push(IngestResult { graph_idx, newly_classified });
-        }
-        let t_ingest_ms = t_ingest.elapsed().as_micros();
+        let result = self.ingest_subdag(subdag);
+        let t_ingest_done = t_ingest.elapsed();
 
         // =====================================================================
-        // Phase 2: Compute initial weights for newly classified nodes.
-        //          This uses ONLY the OIs available from the current subdag
-        //          (no cross-graph carrying). Missing pairs are tracked.
+        // Phase 2: Compute catchup weights for newly classified nodes
         // =====================================================================
         let t_catchup = Instant::now();
-        for item in &work_items {
-            if !item.newly_classified.is_empty() {
-                self.compute_catchup_weights_for_new_nodes(
-                    item.graph_idx, &item.newly_classified,
-                );
-            }
-        }
-        let t_catchup_ms = t_catchup.elapsed().as_micros();
+        let (pairs, edges, missing) = if result.newly_classified.is_empty() {
+            (0, 0, 0)
+        } else {
+            self.compute_catchup_weights_for_new_nodes(result.graph_idx, &result.newly_classified)
+        };
+        let t_catchup_done = t_catchup.elapsed();
 
         // =====================================================================
-        // Phase 3: Apply explicit edge updates from committed batches.
-        //          Each update is a replica's pairwise votes for a specific graph.
-        // =====================================================================
-        let t_apply = Instant::now();
-        let mut updates_applied = 0usize;
-        let mut edges_resolved_from_updates = 0usize;
-
-        for update in edge_updates {
-            let resolved = self.apply_explicit_edge_update(update);
-            if resolved > 0 {
-                edges_resolved_from_updates += resolved;
-            }
-            updates_applied += 1;
-        }
-        let t_apply_ms = t_apply.elapsed().as_micros();
-
-        // =====================================================================
-        // Phase 4: For new graphs with missing pairs, emit MissingEdgeRequests
-        //          (only if not already sent).
-        // =====================================================================
-        let t_request = Instant::now();
-        for g_idx in 0..self.graphs.len() {
-            if self.graphs[g_idx].finalized { continue; }
-            if self.graphs[g_idx].request_sent { continue; }
-            if self.graphs[g_idx].missing_pairs.is_empty() { continue; }
-
-            let request = self.build_missing_edge_request(g_idx);
-            self.graphs[g_idx].request_sent = true;
-
-            info!(
-                "FairnessLayer: emitting MissingEdgeRequest for graph {} \
-                 (round {}) with {} pairs, {} txs",
-                self.graphs[g_idx].graph_id,
-                self.graphs[g_idx].round,
-                request.missing_pairs.len(),
-                request.missing_tx_digests.len(),
-            );
-
-            messages.push(FairnessToWorkerMessage::MissingEdgeRequest(request));
-        }
-        let t_request_ms = t_request.elapsed().as_micros();
-
-        // =====================================================================
-        // Phase 5: Try to resolve missing edges from explicit votes that have
-        //          reached n-f threshold, then finalize tournament graphs.
-        // =====================================================================
-        let t_resolve = Instant::now();
-        let resolved_from_votes = self.resolve_edges_from_votes();
-        let t_resolve_ms = t_resolve.elapsed().as_micros();
-
-        // =====================================================================
-        // Phase 6: Finalize graphs in round-increasing order.
+        // Phase 3: Try finalization (NO implicit weight update)
         // =====================================================================
         let t_finalize = Instant::now();
-        let (ordered, resolved_graph_ids) = self.try_finalize_all_graphs();
+        let ordered = self.try_finalize_all_graphs();
+        let t_finalize_done = t_finalize.elapsed();
 
-        // Emit GraphResolved for any newly finalized graphs.
-        for graph_id in &resolved_graph_ids {
-            messages.push(FairnessToWorkerMessage::GraphResolved(GraphResolved {
-                graph_id: *graph_id,
-            }));
-        }
-        let t_finalize_ms = t_finalize.elapsed().as_micros();
+        // =====================================================================
+        // Phase 4: Check for missing edges in the current graph
+        // =====================================================================
+        let missing_request = self.check_for_missing_edge_request(result.graph_idx);
 
-        let t_total = total_start.elapsed().as_micros();
+        let t_total = total_start.elapsed();
 
         info!(
-            "FAIRDAG_PERF: batch={} phase=done total_us={} ingest_us={} \
-             catchup_us={} apply_us={} request_us={} resolve_us={} \
-             finalize_us={} updates_applied={} edges_from_updates={} \
-             edges_from_votes={} finalized={} messages_out={}",
-            batch_id, t_total, t_ingest_ms, t_catchup_ms, t_apply_ms,
-            t_request_ms, t_resolve_ms, t_finalize_ms,
-            updates_applied, edges_resolved_from_updates,
-            resolved_from_votes, ordered.len(), messages.len(),
+            "FAIRDAG_PERF: sd={} phase=done total_us={} ingest_us={} catchup_us={} \
+             finalize_us={} catchup_pairs={} catchup_edges={} catchup_missing={} \
+             finalized={} has_missing_request={}",
+            sd,
+            t_total.as_micros(),
+            t_ingest_done.as_micros(),
+            t_catchup_done.as_micros(),
+            t_finalize_done.as_micros(),
+            pairs, edges, missing,
+            ordered.len(),
+            missing_request.is_some(),
         );
 
-        (ordered, messages)
+        (ordered, missing_request)
     }
 
     // =========================================================================
-    // Ingest a single subdag: create graph, update nodes, classify
-    // Returns (graph_idx, newly_classified_dense_indices)
+    // PUBLIC API v5: Apply explicit edge updates (Themis FairUpdate)
+    //
+    // Called when n-f MissingEdgeContributions have been collected for a
+    // parked graph. Each contribution is a Vec<(TxDigest, u64)> — the OIs
+    // from one replica for the txs involved in missing edges.
+    //
+    // Steps (following Themis FairUpdate, Fig. 2):
+    //   1. For each pair (tx, tx') with no edge yet, compute weights using
+    //      the contribution OIs.
+    //   2. If weight reaches threshold, add the edge.
+    //   3. Try finalization again.
     // =========================================================================
 
-    fn ingest_subdag(&mut self, subdag: &CommittedSubdag) -> (usize, Vec<u32>) {
+    pub fn apply_fair_update(
+        &mut self,
+        graph_round: Round,
+        contributions: &[Vec<(TxDigest, u64)>],
+    ) -> Vec<TxDigest> {
+        let graph_idx = match self.round_to_graph.get(&graph_round) {
+            Some(&idx) => idx,
+            None => {
+                warn!(
+                    "FairUpdate: no graph found for round {} — ignoring",
+                    graph_round
+                );
+                return Vec::new();
+            }
+        };
+
+        if self.graphs[graph_idx].finalized {
+            warn!(
+                "FairUpdate: graph {} (round {}) already finalized — ignoring",
+                graph_idx, graph_round
+            );
+            return Vec::new();
+        }
+
+        let update_start = Instant::now();
+
+        // Build a map from TxDigest → Vec<u64> (one OI per contribution).
+        let mut digest_ois: HashMap<TxDigest, Vec<u64>> = HashMap::new();
+        for contrib_ois in contributions {
+            for &(digest, oi) in contrib_ois {
+                digest_ois.entry(digest).or_default().push(oi);
+            }
+        }
+
+        // Process only the missing pairs.
+        let ht = self.half_threshold;
+        let missing_pairs: Vec<(u16, u16)> =
+            self.graphs[graph_idx].missing_pairs.clone();
+        let mut resolved: Vec<usize> = Vec::new();
+
+        for (pair_pos, &(li, lj)) in missing_pairs.iter().enumerate() {
+            if self.graphs[graph_idx].has_edge(li, lj) {
+                resolved.push(pair_pos);
+                continue;
+            }
+
+            let di_dense = self.graphs[graph_idx].local_to_global[li as usize];
+            let dj_dense = self.graphs[graph_idx].local_to_global[lj as usize];
+            let di_digest = self.nodes[di_dense as usize].digest;
+            let dj_digest = self.nodes[dj_dense as usize].digest;
+
+            // Get OIs from all contributions for this pair.
+            let ois_i = digest_ois.get(&di_digest);
+            let ois_j = digest_ois.get(&dj_digest);
+
+            if let (Some(ois_i), Some(ois_j)) = (ois_i, ois_j) {
+                // Count pairwise preferences from the contributions.
+                let mut w_ij: usize = 0;
+                let mut w_ji: usize = 0;
+
+                // Each contribution is one replica's view. We pair up the
+                // OIs from the same contribution index.
+                let pairs_to_check = ois_i.len().min(ois_j.len());
+                for k in 0..pairs_to_check {
+                    if ois_i[k] < ois_j[k] {
+                        w_ij += 1;
+                    } else if ois_j[k] < ois_i[k] {
+                        w_ji += 1;
+                    }
+                }
+
+                // Also incorporate previously computed weights.
+                let existing_w_ij = self.graphs[graph_idx].get_weight_val(li, lj) as usize;
+                let existing_w_ji = self.graphs[graph_idx].get_weight_val(lj, li) as usize;
+                w_ij += existing_w_ij;
+                w_ji += existing_w_ji;
+
+                // Update stored weights.
+                self.graphs[graph_idx].set_weight_val(li, lj, w_ij.min(15) as u8);
+                self.graphs[graph_idx].set_weight_val(lj, li, w_ji.min(15) as u8);
+
+                // Check threshold (Themis FairUpdate: add edge if weight ≥ threshold).
+                if w_ij >= ht || w_ji >= ht {
+                    if w_ij >= w_ji {
+                        self.graphs[graph_idx].add_edge(li, lj);
+                    } else {
+                        self.graphs[graph_idx].add_edge(lj, li);
+                    }
+                    resolved.push(pair_pos);
+                }
+            }
+        }
+
+        // Remove resolved pairs.
+        resolved.sort_unstable();
+        resolved.dedup();
+        for &pos in resolved.iter().rev() {
+            if pos < self.graphs[graph_idx].missing_pairs.len() {
+                self.graphs[graph_idx].missing_pairs.swap_remove(pos);
+            }
+        }
+
+        let update_ms = update_start.elapsed().as_millis();
+
+        info!(
+            "FairUpdate: graph {} (round {}) resolved {} pairs in {}ms, \
+             remaining_missing={} is_tournament={}",
+            graph_idx,
+            graph_round,
+            resolved.len(),
+            update_ms,
+            self.graphs[graph_idx].missing_pairs.len(),
+            self.graphs[graph_idx].is_tournament(),
+        );
+
+        // Try finalization now.
+        self.try_finalize_all_graphs()
+    }
+
+    // =========================================================================
+    // Phase 1: Ingest a single subdag
+    //
+    // Creates graph, updates committed_ois, classifies nodes.
+    // NO readd from prior graphs — each graph is independent.
+    // =========================================================================
+
+    fn ingest_subdag(&mut self, subdag: &CommittedSubdag) -> IngestResult {
         let r = subdag.leader_round;
+        let sd = self.subdag_count;
 
+        let total_entries: usize = subdag
+            .vertices
+            .iter()
+            .map(|v| v.ordering_entries.len())
+            .sum();
+        info!(
+            "FairnessLayer: processing subdag leader_round={} vertices={} total_entries={}",
+            r,
+            subdag.vertices.len(),
+            total_entries
+        );
+
+        // Create graph — each graph is independent, no readd.
         let graph_idx = self.graphs.len();
-        self.graphs.push(DependencyGraph::new(r, INITIAL_GRAPH_CAPACITY));
-        self.graph_id_to_idx.insert(r, graph_idx);
+        self.graphs
+            .push(DependencyGraph::new(r, INITIAL_GRAPH_CAPACITY));
+        self.round_to_graph.insert(r, graph_idx);
 
-        // Process pending readd from prior finalizations.
-        self.process_pending_readd(graph_idx);
-
-        // Update nodes from subdag vertices.
+        // Update nodes
         let updated_nodes = self.update_nodes_from_subdag(subdag);
 
-        // Classify blank nodes.
+        // Classify
         let newly_classified = self.classify_and_add_nodes(r, graph_idx, &updated_nodes);
 
         info!(
-            "FAIRDAG_PERF: ingest round={} graph_idx={} updated={} \
-             newly_classified={} graph_nodes={}",
-            r, graph_idx, updated_nodes.len(), newly_classified.len(),
+            "FAIRDAG_PERF: sd={} phase=ingest round={} graph_idx={} \
+             updated={} newly_classified={} graph_nodes={}",
+            sd,
+            r,
+            graph_idx,
+            updated_nodes.len(),
+            newly_classified.len(),
             self.graphs[graph_idx].node_count,
         );
 
-        (graph_idx, newly_classified)
+        IngestResult {
+            graph_idx,
+            newly_classified,
+            round: r,
+        }
     }
 
     // =========================================================================
-    // Update nodes from subdag (Figure 8, Lines 3-10)
+    // Figure 8, Lines 3-10
     // =========================================================================
 
     fn update_nodes_from_subdag(&mut self, subdag: &CommittedSubdag) -> Vec<u32> {
@@ -631,12 +745,18 @@ impl FairnessLayer {
     }
 
     // =========================================================================
-    // Classify and add nodes (Figure 8, Lines 11-18)
+    // Figure 8, Lines 11-18
     // =========================================================================
 
     fn classify_and_add_nodes(
-        &mut self, r: Round, graph_idx: usize, updated_nodes: &[u32],
+        &mut self,
+        r: Round,
+        graph_idx: usize,
+        updated_nodes: &[u32],
     ) -> Vec<u32> {
+        let mut solid_count = 0usize;
+        let mut shaded_count = 0usize;
+        let mut blank_count = 0usize;
         let mut newly_classified: Vec<u32> = Vec::new();
 
         for &dense in updated_nodes {
@@ -650,23 +770,37 @@ impl FairnessLayer {
                 self.nodes[dense as usize].graph_index = Some(graph_idx);
                 self.graphs[graph_idx].add_node(dense);
                 newly_classified.push(dense);
+                solid_count += 1;
             } else if ap >= self.half_threshold {
                 self.nodes[dense as usize].node_type = NodeType::Shaded;
                 self.nodes[dense as usize].graph_index = Some(graph_idx);
                 self.graphs[graph_idx].add_node(dense);
                 newly_classified.push(dense);
+                shaded_count += 1;
+            } else {
+                blank_count += 1;
+                // v5: Blank nodes are NOT kept for readd — they are simply
+                // left as blank. They'll be classified when a future subdag
+                // brings enough OIs.
             }
         }
 
+        info!(
+            "FairnessLayer: classify round={} G[{}] solid={} shaded={} blank={} total_in_graph={}",
+            r, graph_idx, solid_count, shaded_count, blank_count,
+            self.graphs[graph_idx].node_count
+        );
         newly_classified
     }
 
     // =========================================================================
-    // Catchup weights for newly classified nodes (within same graph only)
+    // Phase 2: Catchup weights + populate missing_pairs
     // =========================================================================
 
     fn compute_catchup_weights_for_new_nodes(
-        &mut self, graph_idx: usize, newly_classified: &[u32],
+        &mut self,
+        graph_idx: usize,
+        newly_classified: &[u32],
     ) -> (usize, usize, usize) {
         if newly_classified.is_empty() {
             return (0, 0, 0);
@@ -676,7 +810,6 @@ impl FairnessLayer {
         let mut edges_added = 0usize;
         let mut weights_computed = 0usize;
         let mut missing_added = 0usize;
-        let n = self.n;
         let ht = self.half_threshold;
 
         for &d_dense in newly_classified {
@@ -685,7 +818,9 @@ impl FairnessLayer {
 
             for li in 0..node_count {
                 let d2_dense = self.graphs[graph_idx].local_to_global[li];
-                if d2_dense == d_dense { continue; }
+                if d2_dense == d_dense {
+                    continue;
+                }
                 let d2_local = li as u16;
 
                 if newly_set.contains(&d2_dense) && d_dense > d2_dense {
@@ -698,6 +833,7 @@ impl FairnessLayer {
                 self.graphs[graph_idx].set_weight_val(d_local, d2_local, w12 as u8);
                 self.graphs[graph_idx].set_weight_val(d2_local, d_local, w21 as u8);
 
+                let n = self.n;
                 let mut mask: u32 = 0;
                 for r in 0..n {
                     if self.nodes[d_dense as usize].committed_ois[r].is_some()
@@ -732,244 +868,111 @@ impl FairnessLayer {
     }
 
     // =========================================================================
-    // Build a MissingEdgeRequest for a graph
+    // Pairwise weight calculation
     // =========================================================================
 
-    fn build_missing_edge_request(&self, graph_idx: usize) -> MissingEdgeRequest {
-        let g = &self.graphs[graph_idx];
-        let mut tx_digests_set: HashSet<TxDigest> = HashSet::new();
-        let mut missing_pairs_digests: Vec<(TxDigest, TxDigest)> = Vec::new();
-
-        for &(li, lj) in &g.missing_pairs {
-            if g.has_edge(li, lj) { continue; } // already resolved
-
-            let di = self.nodes[g.local_to_global[li as usize] as usize].digest;
-            let dj = self.nodes[g.local_to_global[lj as usize] as usize].digest;
-
-            // Canonical ordering: smaller digest first
-            let (d1, d2) = if di < dj { (di, dj) } else { (dj, di) };
-            tx_digests_set.insert(d1);
-            tx_digests_set.insert(d2);
-            missing_pairs_digests.push((d1, d2));
+    fn calculate_pairwise_weight(&self, dense1: u32, dense2: u32) -> (usize, usize) {
+        let node1 = &self.nodes[dense1 as usize];
+        let node2 = &self.nodes[dense2 as usize];
+        let mut w12: usize = 0;
+        let mut w21: usize = 0;
+        for i in 0..self.n {
+            if let (Some(oi1), Some(oi2)) = (node1.committed_ois[i], node2.committed_ois[i]) {
+                if oi1 < oi2 {
+                    w12 += 1;
+                } else {
+                    w21 += 1;
+                }
+            }
         }
-
-        MissingEdgeRequest {
-            graph_id: g.graph_id,
-            missing_tx_digests: tx_digests_set.into_iter().collect(),
-            missing_pairs: missing_pairs_digests,
-        }
+        (w12, w21)
     }
 
     // =========================================================================
-    // Apply an explicit edge update from a replica
-    // Returns number of edges resolved
+    // Check if a graph needs a MissingEdgeRequest
+    //
+    // Returns Some((graph_round, needed_tx_digests)) if the graph has missing
+    // pairs and hasn't already sent a request.
     // =========================================================================
 
-    fn apply_explicit_edge_update(&mut self, update: &MissingEdgeUpdate) -> usize {
-        let graph_idx = match self.graph_id_to_idx.get(&update.graph_id) {
-            Some(&idx) => idx,
-            None => {
-                warn!(
-                    "FairnessLayer: received edge update for unknown graph {}",
-                    update.graph_id
-                );
-                return 0;
-            }
-        };
-
-        if self.graphs[graph_idx].finalized || self.graphs[graph_idx].resolved {
-            return 0;
+    fn check_for_missing_edge_request(
+        &mut self,
+        graph_idx: usize,
+    ) -> Option<(Round, Vec<TxDigest>)> {
+        if self.graphs[graph_idx].finalized {
+            return None;
+        }
+        if self.graphs[graph_idx].missing_pairs.is_empty() {
+            return None;
+        }
+        if self.graphs[graph_idx].missing_edge_request_sent {
+            return None;
         }
 
-        // Record that this replica has submitted an update.
-        self.graphs[graph_idx]
-            .replica_updates_received
-            .insert(update.replica_index);
+        // Collect all tx digests involved in missing pairs.
+        let dense_indices = self.graphs[graph_idx].missing_edge_tx_digests();
+        let needed_digests: Vec<TxDigest> = dense_indices
+            .iter()
+            .map(|&d| self.nodes[d as usize].digest)
+            .collect();
 
-        // Accumulate votes.
-        for vote in &update.votes {
-            // Canonical key: d1 < d2
-            let key = if vote.d1 < vote.d2 {
-                (vote.d1, vote.d2)
-            } else {
-                (vote.d2, vote.d1)
-            };
-
-            // Determine direction relative to canonical key
-            let direction = if vote.d1 < vote.d2 {
-                vote.direction.clone()
-            } else {
-                // Flip direction since we swapped d1/d2
-                match &vote.direction {
-                    EdgeDirection::Forward => EdgeDirection::Reverse,
-                    EdgeDirection::Reverse => EdgeDirection::Forward,
-                    EdgeDirection::Unknown => EdgeDirection::Unknown,
-                }
-            };
-
-            let entry = self.graphs[graph_idx]
-                .explicit_votes
-                .entry(key)
-                .or_insert_with(Vec::new);
-
-            // Only add if this replica hasn't voted for this pair yet.
-            if !entry.iter().any(|(ri, _)| *ri == update.replica_index) {
-                entry.push((update.replica_index, direction));
-            }
-        }
+        self.graphs[graph_idx].missing_edge_request_sent = true;
 
         info!(
-            "FairnessLayer: applied edge update from replica {} for graph {} \
-             ({} votes, {}/{} replicas received)",
-            update.replica_index,
-            update.graph_id,
-            update.votes.len(),
-            self.graphs[graph_idx].replica_updates_received.len(),
-            self.n,
+            "FairnessLayer: graph {} (round {}) has {} missing pairs involving {} unique txs — requesting explicit contributions",
+            graph_idx,
+            self.graphs[graph_idx].round,
+            self.graphs[graph_idx].missing_pairs.len(),
+            needed_digests.len(),
         );
 
-        0 // Actual resolution happens in resolve_edges_from_votes
+        Some((self.graphs[graph_idx].round, needed_digests))
     }
 
     // =========================================================================
-    // Resolve edges from accumulated explicit votes
-    // An edge can be added when n-f replicas have voted for a pair.
-    // Returns total edges resolved.
+    // Phase 3: Finalization (sequential, round-increasing order)
+    //
+    // v5: No readd. Everything after last solid SCC is DISCARDED.
     // =========================================================================
 
-    fn resolve_edges_from_votes(&mut self) -> usize {
-        let n = self.n;
-        let f = self.f;
-        let vote_threshold = n - f; // n-f replicas needed
-        let ht = self.half_threshold;
-        let mut total_resolved = 0usize;
-
-        for g_idx in 0..self.graphs.len() {
-            if self.graphs[g_idx].finalized { continue; }
-            if self.graphs[g_idx].explicit_votes.is_empty() { continue; }
-
-            let mut resolved_positions: Vec<usize> = Vec::new();
-
-            for (pair_pos, &(li, lj)) in self.graphs[g_idx].missing_pairs.iter().enumerate() {
-                if self.graphs[g_idx].has_edge(li, lj) {
-                    resolved_positions.push(pair_pos);
-                    continue;
-                }
-
-                let di_dense = self.graphs[g_idx].local_to_global[li as usize];
-                let dj_dense = self.graphs[g_idx].local_to_global[lj as usize];
-                let di = self.nodes[di_dense as usize].digest;
-                let dj = self.nodes[dj_dense as usize].digest;
-
-                let key = if di < dj { (di, dj) } else { (dj, di) };
-
-                if let Some(votes) = self.graphs[g_idx].explicit_votes.get(&key) {
-                    if votes.len() >= vote_threshold {
-                        // Count Forward vs Reverse votes.
-                        let mut fwd_count = 0usize; // d1 → d2 (canonical)
-                        let mut rev_count = 0usize; // d2 → d1
-
-                        for (_, direction) in votes {
-                            match direction {
-                                EdgeDirection::Forward => fwd_count += 1,
-                                EdgeDirection::Reverse => rev_count += 1,
-                                EdgeDirection::Unknown => {}
-                            }
-                        }
-
-                        // Determine which local index is d1 (the smaller digest)
-                        let (li_d1, li_d2) = if di < dj { (li, lj) } else { (lj, li) };
-
-                        if fwd_count >= ht || rev_count >= ht {
-                            if fwd_count >= rev_count {
-                                // d1 → d2 (canonical forward)
-                                self.graphs[g_idx].add_edge(li_d1, li_d2);
-                            } else {
-                                // d2 → d1
-                                self.graphs[g_idx].add_edge(li_d2, li_d1);
-                            }
-                            resolved_positions.push(pair_pos);
-                            total_resolved += 1;
-                        } else if fwd_count + rev_count >= vote_threshold {
-                            // We have enough votes total but neither direction
-                            // meets the half_threshold. Add edge by majority.
-                            if fwd_count >= rev_count {
-                                self.graphs[g_idx].add_edge(li_d1, li_d2);
-                            } else {
-                                self.graphs[g_idx].add_edge(li_d2, li_d1);
-                            }
-                            resolved_positions.push(pair_pos);
-                            total_resolved += 1;
-                        }
-                    }
-                }
-            }
-
-            // Remove resolved pairs (reverse order to maintain indices).
-            resolved_positions.sort_unstable();
-            resolved_positions.dedup();
-            for &pos in resolved_positions.iter().rev() {
-                self.graphs[g_idx].missing_pairs.swap_remove(pos);
-            }
-
-            // Check if graph is now a tournament.
-            if self.graphs[g_idx].is_tournament() && !self.graphs[g_idx].resolved {
-                self.graphs[g_idx].resolved = true;
-                info!(
-                    "FairnessLayer: graph {} (round {}) resolved to tournament \
-                     via explicit edge updates ({} replicas contributed)",
-                    g_idx, self.graphs[g_idx].round,
-                    self.graphs[g_idx].replica_updates_received.len(),
-                );
-            }
-        }
-
-        total_resolved
-    }
-
-    // =========================================================================
-    // Finalization (sequential, round-increasing order)
-    // Returns (ordered_digests, resolved_graph_ids)
-    // =========================================================================
-
-    fn try_finalize_all_graphs(&mut self) -> (Vec<TxDigest>, Vec<GraphId>) {
+    fn try_finalize_all_graphs(&mut self) -> Vec<TxDigest> {
         let mut newly_ordered: Vec<TxDigest> = Vec::new();
-        let mut resolved_ids: Vec<GraphId> = Vec::new();
 
         for g_idx in 0..self.graphs.len() {
-            if self.graphs[g_idx].finalized { continue; }
+            if self.graphs[g_idx].finalized {
+                continue;
+            }
             if self.graphs[g_idx].node_count == 0 {
                 self.graphs[g_idx].finalized = true;
-                resolved_ids.push(self.graphs[g_idx].graph_id);
                 continue;
             }
 
             if !self.graphs[g_idx].is_tournament() {
                 info!(
-                    "FAIRDAG_PERF: finalize_blocked G[{}] round={} nodes={} \
-                     edges={}/{} missing_pairs={} replicas_heard={}",
-                    g_idx, self.graphs[g_idx].round,
+                    "FAIRDAG_PERF: phase=finalize_blocked G[{}] round={} nodes={} \
+                     edges={}/{} missing_pairs={}",
+                    g_idx,
+                    self.graphs[g_idx].round,
                     self.graphs[g_idx].node_count,
                     self.graphs[g_idx].edge_pair_count,
                     self.graphs[g_idx].node_count * (self.graphs[g_idx].node_count - 1) / 2,
                     self.graphs[g_idx].missing_pairs.len(),
-                    self.graphs[g_idx].replica_updates_received.len(),
                 );
-                break; // Must finalize in order
+                break; // Must finalize in order — can't skip.
             }
 
             info!(
-                "FairnessLayer: graph {} (round {}) is a tournament with {} \
-                 nodes — finalizing",
-                g_idx, self.graphs[g_idx].round, self.graphs[g_idx].node_count
+                "FairnessLayer: graph {} (round {}) is a tournament with {} nodes — finalizing",
+                g_idx,
+                self.graphs[g_idx].round,
+                self.graphs[g_idx].node_count
             );
 
             let order = self.finalize_ordering(g_idx);
-            newly_ordered.extend(&order);
-            resolved_ids.push(self.graphs[g_idx].graph_id);
+            newly_ordered.extend(order);
         }
 
-        (newly_ordered, resolved_ids)
+        newly_ordered
     }
 
     fn finalize_ordering(&mut self, graph_idx: usize) -> Vec<TxDigest> {
@@ -985,17 +988,20 @@ impl FairnessLayer {
                 let dense = self.graphs[graph_idx].local_to_global[li as usize];
                 self.nodes[dense as usize].node_type == NodeType::Solid
             });
-            if has_solid { last_solid_pos = Some(pos); }
+            if has_solid {
+                last_solid_pos = Some(pos);
+            }
         }
 
         let mut ordered_digests: Vec<TxDigest> = Vec::new();
-        let mut to_readd: Vec<u32> = Vec::new();
+        let mut discarded_count: usize = 0;
 
         match last_solid_pos {
             Some(cutoff) => {
                 for (pos, &scc_idx) in topo_order.iter().enumerate() {
                     let scc = &sccs[scc_idx];
                     if pos <= cutoff {
+                        // Order this SCC.
                         let path = if self.use_hamiltonian_path {
                             hamiltonian_path_dense(scc, &self.graphs[graph_idx].edges)
                         } else {
@@ -1010,18 +1016,35 @@ impl FairnessLayer {
                             ordered_digests.push(self.nodes[dense as usize].digest);
                         }
                     } else {
+                        // v5: DISCARD everything after last solid SCC.
+                        // No readd to next graph. These nodes lose their
+                        // classification and can be classified fresh when
+                        // they appear in a future subdag (if ever).
                         for &li in scc {
                             let dense = self.graphs[graph_idx].local_to_global[li as usize];
-                            to_readd.push(dense);
+                            // Reset the node to blank so it can be re-classified
+                            // fresh in a future subdag.
+                            self.nodes[dense as usize].node_type = NodeType::Blank;
+                            self.nodes[dense as usize].graph_index = None;
+                            discarded_count += 1;
                         }
                     }
                 }
             }
             None => {
                 warn!(
-                    "FairnessLayer: graph {} tournament with no solid nodes — deferring",
+                    "FairnessLayer: graph {} tournament with no solid nodes — discarding all",
                     graph_idx
                 );
+                // Discard all nodes — reset to blank.
+                for li in 0..node_count {
+                    let dense = self.graphs[graph_idx].local_to_global[li];
+                    self.nodes[dense as usize].node_type = NodeType::Blank;
+                    self.nodes[dense as usize].graph_index = None;
+                    discarded_count += 1;
+                }
+                self.graphs[graph_idx].finalized = true;
+                self.graphs[graph_idx].release_memory();
                 return Vec::new();
             }
         }
@@ -1034,143 +1057,20 @@ impl FairnessLayer {
             self.recycle_ordered_tx(d);
         }
 
-        // Shaded nodes after last solid SCC → move to next graph (independent).
-        if !to_readd.is_empty() {
-            let next_graph_idx = self.find_next_unfinalized_graph(graph_idx);
-            match next_graph_idx {
-                Some(next_idx) => {
-                    self.readd_nodes_to_graph(to_readd, next_idx);
-                }
-                None => {
-                    for &dense in &to_readd {
-                        self.nodes[dense as usize].node_type = NodeType::Blank;
-                        self.nodes[dense as usize].graph_index = None;
-                    }
-                    self.pending_readd.extend(to_readd);
-                }
-            }
-        }
-
         self.graphs[graph_idx].release_memory();
 
+        // This log line is parsed by logs.py — DO NOT CHANGE FORMAT.
         info!(
             "FairnessLayer: finalized {} transactions from graph {} (round {}). \
-             Total ordered: {}",
-            ordered_digests.len(), graph_idx,
-            self.graphs[graph_idx].round, self.output_sequence.len()
+             Discarded {} post-solid nodes. Total ordered: {}",
+            ordered_digests.len(),
+            graph_idx,
+            self.graphs[graph_idx].round,
+            discarded_count,
+            self.output_sequence.len()
         );
 
         ordered_digests
-    }
-
-    fn find_next_unfinalized_graph(&self, after_idx: usize) -> Option<usize> {
-        for idx in (after_idx + 1)..self.graphs.len() {
-            if !self.graphs[idx].finalized { return Some(idx); }
-        }
-        None
-    }
-
-    // =========================================================================
-    // Re-add nodes to graph (independent: fresh weight computation)
-    // =========================================================================
-
-    fn readd_nodes_to_graph(&mut self, to_readd: Vec<u32>, target_graph_idx: usize) {
-        let r_prime = self.graphs[target_graph_idx].round;
-        let ht = self.half_threshold;
-
-        for &dense in &to_readd {
-            let ap = self.nodes[dense as usize].appearance_count(r_prime);
-
-            if ap >= self.solid_threshold {
-                self.nodes[dense as usize].node_type = NodeType::Solid;
-            } else if ap >= ht {
-                self.nodes[dense as usize].node_type = NodeType::Shaded;
-            } else {
-                self.nodes[dense as usize].node_type = NodeType::Blank;
-                self.nodes[dense as usize].graph_index = None;
-                self.pending_readd.push(dense);
-                continue;
-            }
-
-            self.nodes[dense as usize].graph_index = Some(target_graph_idx);
-            let d_local = self.graphs[target_graph_idx].add_node(dense);
-
-            let node_count = self.graphs[target_graph_idx].node_count;
-            let cap = self.graphs[target_graph_idx].capacity;
-            let n = self.n;
-
-            for li in 0..node_count {
-                let d2_dense = self.graphs[target_graph_idx].local_to_global[li];
-                if d2_dense == dense { continue; }
-                let d2_local = li as u16;
-
-                let (w12, w21) = self.calculate_pairwise_weight(dense, d2_dense);
-
-                self.graphs[target_graph_idx].set_weight_val(d_local, d2_local, w12 as u8);
-                self.graphs[target_graph_idx].set_weight_val(d2_local, d_local, w21 as u8);
-
-                let mut mask: u32 = 0;
-                for r in 0..n {
-                    if self.nodes[dense as usize].committed_ois[r].is_some()
-                        && self.nodes[d2_dense as usize].committed_ois[r].is_some()
-                    {
-                        mask |= 1u32 << r;
-                    }
-                }
-                let pidx = pair_idx(d_local, d2_local, cap);
-                self.graphs[target_graph_idx].counted[pidx] = mask;
-
-                if w12 >= ht || w21 >= ht {
-                    if !self.graphs[target_graph_idx].has_edge(d_local, d2_local) {
-                        if w12 >= w21 {
-                            self.graphs[target_graph_idx].add_edge(d_local, d2_local);
-                        } else {
-                            self.graphs[target_graph_idx].add_edge(d2_local, d_local);
-                        }
-                    }
-                } else {
-                    let (lmin, lmax) = if d_local < d2_local {
-                        (d_local, d2_local)
-                    } else {
-                        (d2_local, d_local)
-                    };
-                    self.graphs[target_graph_idx].missing_pairs.push((lmin, lmax));
-                }
-            }
-        }
-    }
-
-    // =========================================================================
-    // Pairwise weight calculation
-    // =========================================================================
-
-    fn calculate_pairwise_weight(&self, dense1: u32, dense2: u32) -> (usize, usize) {
-        let node1 = &self.nodes[dense1 as usize];
-        let node2 = &self.nodes[dense2 as usize];
-        let mut w12: usize = 0;
-        let mut w21: usize = 0;
-        for i in 0..self.n {
-            if let (Some(oi1), Some(oi2)) = (node1.committed_ois[i], node2.committed_ois[i]) {
-                if oi1 < oi2 { w12 += 1; } else { w21 += 1; }
-            }
-        }
-        (w12, w21)
-    }
-
-    // =========================================================================
-    // Pending re-add processing
-    // =========================================================================
-
-    fn process_pending_readd(&mut self, graph_idx: usize) {
-        if self.pending_readd.is_empty() { return; }
-
-        let pending: Vec<u32> = self.pending_readd.drain(..)
-            .filter(|&d| !self.ordered_digests.contains(&self.nodes[d as usize].digest))
-            .collect();
-
-        if !pending.is_empty() {
-            self.readd_nodes_to_graph(pending, graph_idx);
-        }
     }
 
     // =========================================================================
@@ -1203,7 +1103,9 @@ fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u16>]) -> Vec<Vec<u16>> {
     let mut index_counter: i32 = 0;
 
     for start in 0..node_count {
-        if dfn[start] != 0 { continue; }
+        if dfn[start] != 0 {
+            continue;
+        }
         let mut dfs_stack: Vec<(u16, usize)> = Vec::new();
         let u = start as u16;
         index_counter += 1;
@@ -1236,7 +1138,9 @@ fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u16>]) -> Vec<Vec<u16>> {
                         let w = stack.pop().unwrap();
                         on_stack[w as usize] = false;
                         scc.push(w);
-                        if w == v { break; }
+                        if w == v {
+                            break;
+                        }
                     }
                     scc.sort_unstable();
                     sccs.push(scc);
@@ -1260,11 +1164,15 @@ fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u16>]) -> Vec<Vec<u16>> {
 // =============================================================================
 
 fn topological_sort_sccs_dense(
-    sccs: &[Vec<u16>], edges: &[Vec<u16>], node_count: usize,
+    sccs: &[Vec<u16>],
+    edges: &[Vec<u16>],
+    node_count: usize,
 ) -> Vec<usize> {
     let mut node_to_scc = vec![0usize; node_count];
     for (scc_idx, scc) in sccs.iter().enumerate() {
-        for &node in scc { node_to_scc[node as usize] = scc_idx; }
+        for &node in scc {
+            node_to_scc[node as usize] = scc_idx;
+        }
     }
 
     let scc_n = sccs.len();
@@ -1286,7 +1194,9 @@ fn topological_sort_sccs_dense(
     let mut ready: VecDeque<usize> = VecDeque::new();
     let mut initial: Vec<usize> = (0..scc_n).filter(|&i| in_degree[i] == 0).collect();
     initial.sort_unstable();
-    for s in initial { ready.push_back(s); }
+    for s in initial {
+        ready.push_back(s);
+    }
 
     let mut result: Vec<usize> = Vec::with_capacity(scc_n);
     while let Some(s) = ready.pop_front() {
@@ -1294,10 +1204,14 @@ fn topological_sort_sccs_dense(
         let mut new_ready: Vec<usize> = Vec::new();
         for &v in &adj[s] {
             in_degree[v] -= 1;
-            if in_degree[v] == 0 { new_ready.push(v); }
+            if in_degree[v] == 0 {
+                new_ready.push(v);
+            }
         }
         new_ready.sort_unstable();
-        for v in new_ready { ready.push_back(v); }
+        for v in new_ready {
+            ready.push_back(v);
+        }
     }
     result
 }
@@ -1307,7 +1221,9 @@ fn topological_sort_sccs_dense(
 // =============================================================================
 
 fn hamiltonian_path_dense(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
-    if scc.len() <= 1 { return scc.to_vec(); }
+    if scc.len() <= 1 {
+        return scc.to_vec();
+    }
 
     let has_edge = |u: u16, v: u16| -> bool { edges[u as usize].contains(&v) };
     let mut sorted = scc.to_vec();
@@ -1333,7 +1249,8 @@ fn hamiltonian_path_dense(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
             if !inserted {
                 panic!(
                     "FATAL: Hamiltonian path insertion failed for node {} in SCC of size {}.",
-                    v, scc.len()
+                    v,
+                    scc.len()
                 );
             }
         }

@@ -1,43 +1,97 @@
-// Copyright(C) FairDAG-RL Implementation.
-// Modified for v5: Explicit Missing Edge Updates.
+// FairDAG-RL v5: FairDagProcessor with explicit missing-edge updates
+// and parallel graph construction support.
 //
-// Changes:
-//   1. Extracts MissingEdgeUpdates from batches (decompresses lz4).
-//   2. Passes them to the FairnessLayer alongside subdag data.
-//   3. FairnessLayer sends MissingEdgeRequests back to BatchMaker via channel.
+// Key changes from v4:
+//   1. After graph construction, if there are missing edges, sends a
+//      MissingEdgeRequest to the BatchMaker via tx_missing_edge channel.
+//   2. Receives MissingEdgeContributions from other replicas via
+//      rx_edge_contributions channel.
+//   3. When n-f contributions are collected for a parked graph, runs
+//      FairUpdate to resolve missing edges explicitly.
+//   4. Subdag extraction is parallelized via tokio::spawn — the Store
+//      is Arc-wrapped so cloning is cheap.
+//   5. No implicit weight updates — graphs wait for explicit contributions.
 
-use crate::local_order_tracker::extract_tx_digest;
-use crate::missing_edge_types::{
-    FairnessToWorkerMessage, MissingEdgeUpdate,
-};
+use crate::batch_maker::{MissingEdgeContribution, MissingEdgeRequest};
+use crate::local_order_tracker::{extract_tx_digest, TxDigest};
 use crate::worker::WorkerMessage;
 use config::Committee;
 use crypto::PublicKey;
-use fairdag_fairness::{
-    CommittedSubdag, CommittedVertex, FairnessLayer, Round, TxDigest,
-};
-use log::{error, info, warn};
+use fairdag_fairness::{CommittedSubdag, CommittedVertex, FairnessLayer, Round};
+use log::{debug, error, info, warn};
 use primary::Certificate;
+use std::collections::HashMap;
 use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Tracks accumulated edge contributions for a single parked graph.
+struct ParkedGraph {
+    graph_round: Round,
+    /// Number of distinct replica contributions received so far.
+    contribution_count: usize,
+    /// All contributions received, keyed by source.
+    /// We use the oi_entries directly since we don't have replica ID in the
+    /// contribution — we deduplicate by identical graph_round + content hash.
+    contributions: Vec<MissingEdgeContribution>,
+    /// Set of contribution hashes to avoid duplicates from the same replica.
+    seen_hashes: std::collections::HashSet<u64>,
+}
+
+impl ParkedGraph {
+    fn new(round: Round) -> Self {
+        ParkedGraph {
+            graph_round: round,
+            contribution_count: 0,
+            contributions: Vec::new(),
+            seen_hashes: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Add a contribution. Returns true if this is a new (non-duplicate) contribution.
+    fn add_contribution(&mut self, contrib: MissingEdgeContribution) -> bool {
+        // Simple dedup: hash the OI entries to detect duplicates.
+        let mut hash: u64 = 0;
+        for (d, oi) in &contrib.oi_entries {
+            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(*d ^ *oi);
+        }
+        if self.seen_hashes.insert(hash) {
+            self.contribution_count += 1;
+            self.contributions.push(contrib);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 pub struct FairDagProcessor {
     store: Store,
     fairness_layer: FairnessLayer,
     sorted_keys: Vec<PublicKey>,
     rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
-    /// Channel to send MissingEdgeRequest / GraphResolved to BatchMaker.
-    tx_fairness_to_worker: Sender<FairnessToWorkerMessage>,
+
+    // =========================================================================
+    // Explicit edge update channels and state
+    // =========================================================================
+    /// Send missing edge requests to BatchMaker.
+    tx_missing_edge: Sender<MissingEdgeRequest>,
+    /// Receive edge contributions from other workers (via WorkerReceiverHandler).
+    rx_edge_contributions: Receiver<Vec<MissingEdgeContribution>>,
+    /// Graphs waiting for n-f contributions before FairUpdate can run.
+    parked_graphs: HashMap<Round, ParkedGraph>,
+    /// Required number of contributions: n - f.
+    required_contributions: usize,
 }
 
 impl FairDagProcessor {
     pub fn spawn(
-        mut committee: Committee,
+        committee: Committee,
         store: Store,
         rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
         fault_threshold: u64,
-        tx_fairness_to_worker: Sender<FairnessToWorkerMessage>,
+        tx_missing_edge: Sender<MissingEdgeRequest>,
+        rx_edge_contributions: Receiver<Vec<MissingEdgeContribution>>,
     ) {
         let n = committee.size();
         let f = fault_threshold as usize;
@@ -47,11 +101,9 @@ impl FairDagProcessor {
 
         let gamma = committee.get_gamma().unwrap();
 
-        let fairness_layer = FairnessLayer::new(
-            sorted_keys.clone(),
-            f,
-            gamma,
-        );
+        let fairness_layer = FairnessLayer::new(sorted_keys.clone(), f, gamma);
+
+        let required_contributions = n - f;
 
         let handle = tokio::spawn(async move {
             Self {
@@ -59,7 +111,10 @@ impl FairDagProcessor {
                 fairness_layer,
                 sorted_keys,
                 rx_committed_subdags,
-                tx_fairness_to_worker,
+                tx_missing_edge,
+                rx_edge_contributions,
+                parked_graphs: HashMap::new(),
+                required_contributions,
             }
             .run()
             .await;
@@ -77,124 +132,243 @@ impl FairDagProcessor {
         let mut subdag_count: u64 = 0;
         let mut batch_count: u64 = 0;
 
-        while let Some((leader_round, certificates)) = self.rx_committed_subdags.recv().await {
-            let batch_start = Instant::now();
+        loop {
+            tokio::select! {
+                // ─────────────────────────────────────────────────────────────
+                // Branch 1: Process committed subdags.
+                // ─────────────────────────────────────────────────────────────
+                Some((leader_round, certificates)) = self.rx_committed_subdags.recv() => {
+                    let batch_start = Instant::now();
 
-            // ─────────────────────────────────────────────────────────────────
-            // Step 1: Drain all queued subdags into a batch.
-            // ─────────────────────────────────────────────────────────────────
-            let mut batch_raw: Vec<(Round, Vec<Certificate>)> = vec![(leader_round, certificates)];
-            while let Ok((r, c)) = self.rx_committed_subdags.try_recv() {
-                batch_raw.push((r, c));
-            }
+                    // Drain all queued subdags into a batch.
+                    let mut batch_raw: Vec<(Round, Vec<Certificate>)> =
+                        vec![(leader_round, certificates)];
+                    while let Ok((r, c)) = self.rx_committed_subdags.try_recv() {
+                        batch_raw.push((r, c));
+                    }
 
-            let batch_size = batch_raw.len();
-            batch_count += 1;
+                    let batch_size = batch_raw.len();
+                    batch_count += 1;
 
-            info!(
-                "FAIRDAG_TIMING: batch #{} draining: {} subdags queued",
-                batch_count, batch_size
-            );
-
-            // ─────────────────────────────────────────────────────────────────
-            // Step 2: Extract all subdags and their missing edge updates.
-            // ─────────────────────────────────────────────────────────────────
-            let extract_start = Instant::now();
-            let mut subdags: Vec<CommittedSubdag> = Vec::with_capacity(batch_size);
-            let mut all_edge_updates: Vec<MissingEdgeUpdate> = Vec::new();
-
-            for (round, certs) in &batch_raw {
-                subdag_count += 1;
-
-                info!(
-                    "FAIRDAG_TIMING: subdag #{} received: leader_round={} certs={}",
-                    subdag_count, round, certs.len()
-                );
-
-                let sd_extract_start = Instant::now();
-                let (subdag, edge_updates) = self.extract_subdag(*round, certs).await;
-                let sd_extract_ms = sd_extract_start.elapsed().as_millis();
-
-                let total_entries: usize = subdag
-                    .vertices
-                    .iter()
-                    .map(|v| v.ordering_entries.len())
-                    .sum();
-
-                info!(
-                    "FAIRDAG_TIMING: subdag #{} extract done: {}ms, vertices={} \
-                     total_entries={} edge_updates={}",
-                    subdag_count, sd_extract_ms, subdag.vertices.len(),
-                    total_entries, edge_updates.len()
-                );
-
-                all_edge_updates.extend(edge_updates);
-                subdags.push(subdag);
-            }
-
-            let extract_ms = extract_start.elapsed().as_millis();
-
-            // ─────────────────────────────────────────────────────────────────
-            // Step 3: Process subdags + explicit edge updates through fairness
-            //         layer. The fairness layer handles:
-            //         - Ingesting new OIs from subdags
-            //         - Applying explicit edge updates
-            //         - Constructing new graphs (independent, can be parallel)
-            //         - Finalizing tournament graphs
-            //         - Sending MissingEdgeRequests back to us
-            // ─────────────────────────────────────────────────────────────────
-            let process_start = Instant::now();
-
-            let (fair_ordered, fairness_messages) = self.fairness_layer
-                .process_subdag_batch_explicit(&subdags, &all_edge_updates);
-
-            let process_ms = process_start.elapsed().as_millis();
-
-            // Forward fairness messages to BatchMaker.
-            for msg in fairness_messages {
-                if let Err(e) = self.tx_fairness_to_worker.send(msg).await {
-                    warn!(
-                        "Failed to send fairness message to BatchMaker: {}",
-                        e
+                    info!(
+                        "FAIRDAG_TIMING: batch #{} draining: {} subdags queued",
+                        batch_count, batch_size
                     );
-                }
-            }
 
-            if !fair_ordered.is_empty() {
-                info!(
-                    "FairDAG: outputting {} fair-ordered transactions",
-                    fair_ordered.len()
+                    // ─────────────────────────────────────────────────────────
+                    // Step 1: Extract all subdags (parallel via tokio::spawn).
+                    //
+                    // The Store is Arc-wrapped internally, so cloning it is
+                    // just an Arc increment — no data copy.
+                    // ─────────────────────────────────────────────────────────
+                    let extract_start = Instant::now();
+
+                    let mut extraction_handles = Vec::with_capacity(batch_size);
+
+                    for (round, certs) in batch_raw {
+                        subdag_count += 1;
+                        let store = self.store.clone(); // cheap Arc clone
+                        let sorted_keys = self.sorted_keys.clone();
+
+                        let handle = tokio::spawn(async move {
+                            Self::extract_subdag_static(store, sorted_keys, round, &certs).await
+                        });
+                        extraction_handles.push(handle);
+                    }
+
+                    // Join all extraction tasks (preserving order).
+                    let mut subdags: Vec<CommittedSubdag> = Vec::with_capacity(batch_size);
+                    for handle in extraction_handles {
+                        match handle.await {
+                            Ok(subdag) => subdags.push(subdag),
+                            Err(e) => {
+                                error!("FATAL: subdag extraction task panicked: {:?}", e);
+                                std::process::abort();
+                            }
+                        }
+                    }
+
+                    let extract_ms = extract_start.elapsed().as_millis();
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 2: Process all subdags through the fairness layer.
+                    //
+                    // Each graph is independent (no readd). After processing,
+                    // check for missing edges and send MissingEdgeRequests.
+                    // ─────────────────────────────────────────────────────────
+                    let process_start = Instant::now();
+                    let mut total_fair_ordered: usize = 0;
+
+                    for subdag in &subdags {
+                        let sd_process_start = Instant::now();
+                        let (fair_ordered, missing_request) =
+                            self.fairness_layer.process_subdag_explicit(subdag);
+                        let sd_process_ms = sd_process_start.elapsed().as_millis();
+
+                        info!(
+                            "FAIRDAG_TIMING: subdag process done: {}ms, fair_ordered={} \
+                             has_missing_edge_request={}",
+                            sd_process_ms,
+                            fair_ordered.len(),
+                            missing_request.is_some(),
+                        );
+
+                        if !fair_ordered.is_empty() {
+                            info!(
+                                "FairDAG: outputting {} fair-ordered transactions from leader round {}",
+                                fair_ordered.len(),
+                                subdag.leader_round
+                            );
+                            for tx_id in &fair_ordered {
+                                info!("FairDAG-RL ordered transaction: {}", tx_id);
+                            }
+                            total_fair_ordered += fair_ordered.len();
+                        }
+
+                        // If this graph has missing edges, send request to BatchMaker
+                        // and park the graph for explicit updates.
+                        if let Some((graph_round, needed_digests)) = missing_request {
+                            info!(
+                                "FairDAG: graph round {} has {} missing-edge txs — sending request to BatchMaker",
+                                graph_round,
+                                needed_digests.len()
+                            );
+
+                            let request = MissingEdgeRequest {
+                                graph_round,
+                                needed_tx_digests: needed_digests,
+                            };
+
+                            if let Err(e) = self.tx_missing_edge.send(request).await {
+                                error!("Failed to send MissingEdgeRequest: {}", e);
+                            }
+
+                            self.parked_graphs
+                                .entry(graph_round)
+                                .or_insert_with(|| ParkedGraph::new(graph_round));
+                        }
+                    }
+
+                    let process_ms = process_start.elapsed().as_millis();
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 3: Also drain any edge contributions that arrived
+                    //         while we were processing.
+                    // ─────────────────────────────────────────────────────────
+                    self.drain_and_apply_contributions().await;
+
+                    let total_ms = batch_start.elapsed().as_millis();
+
+                    info!(
+                        "FAIRDAG_TIMING: batch #{} done: batch_size={} extract={}ms process={}ms \
+                         total={}ms fair_ordered={} parked_graphs={}",
+                        batch_count, batch_size, extract_ms, process_ms, total_ms,
+                        total_fair_ordered, self.parked_graphs.len(),
+                    );
+                },
+
+                // ─────────────────────────────────────────────────────────────
+                // Branch 2: Receive edge contributions from other replicas.
+                // ─────────────────────────────────────────────────────────────
+                Some(contributions) = self.rx_edge_contributions.recv() => {
+                    for contrib in contributions {
+                        self.apply_single_contribution(contrib);
+                    }
+
+                    // Check if any parked graph now has enough contributions.
+                    self.try_resolve_parked_graphs();
+                },
+            }
+        }
+    }
+
+    /// Drain all pending edge contributions from the channel and apply them.
+    async fn drain_and_apply_contributions(&mut self) {
+        while let Ok(contributions) = self.rx_edge_contributions.try_recv() {
+            for contrib in contributions {
+                self.apply_single_contribution(contrib);
+            }
+        }
+        self.try_resolve_parked_graphs();
+    }
+
+    /// Apply a single edge contribution to the appropriate parked graph.
+    fn apply_single_contribution(&mut self, contrib: MissingEdgeContribution) {
+        let round = contrib.graph_round;
+
+        if let Some(parked) = self.parked_graphs.get_mut(&round) {
+            let is_new = parked.add_contribution(contrib);
+            if is_new {
+                debug!(
+                    "FairDAG: received edge contribution for graph round {} ({}/{} needed)",
+                    round, parked.contribution_count, self.required_contributions,
                 );
-                for tx_id in &fair_ordered {
-                    info!("FairDAG-RL ordered transaction: {}", tx_id);
-                }
             }
-
-            let total_ms = batch_start.elapsed().as_millis();
-
-            info!(
-                "FAIRDAG_TIMING: batch #{} done: batch_size={} extract={}ms \
-                 process={}ms total={}ms fair_ordered={} edge_updates_applied={}",
-                batch_count, batch_size, extract_ms, process_ms, total_ms,
-                fair_ordered.len(), all_edge_updates.len()
+        } else {
+            debug!(
+                "FairDAG: received edge contribution for unknown/resolved graph round {} — ignoring",
+                round
             );
         }
     }
 
-    /// Extract a subdag from committed certificates.
-    /// Also extracts any MissingEdgeUpdates embedded in batches.
-    async fn extract_subdag(
-        &self,
+    /// Check all parked graphs: if any has n-f contributions, run FairUpdate.
+    fn try_resolve_parked_graphs(&mut self) {
+        let mut resolved_rounds: Vec<Round> = Vec::new();
+
+        for (round, parked) in &self.parked_graphs {
+            if parked.contribution_count >= self.required_contributions {
+                info!(
+                    "FairDAG: graph round {} has {}/{} contributions — running FairUpdate",
+                    round, parked.contribution_count, self.required_contributions
+                );
+                resolved_rounds.push(*round);
+            }
+        }
+
+        for round in resolved_rounds {
+            if let Some(parked) = self.parked_graphs.remove(&round) {
+                let resolve_start = Instant::now();
+
+                // Collect all OI entries from contributions into the format
+                // expected by the fairness layer.
+                let all_oi_sets: Vec<Vec<(TxDigest, u64)>> = parked
+                    .contributions
+                    .into_iter()
+                    .map(|c| c.oi_entries)
+                    .collect();
+
+                let fair_ordered = self
+                    .fairness_layer
+                    .apply_fair_update(round, &all_oi_sets);
+
+                let resolve_ms = resolve_start.elapsed().as_millis();
+
+                info!(
+                    "FairDAG: FairUpdate for graph round {} completed in {}ms — {} transactions ordered",
+                    round, resolve_ms, fair_ordered.len()
+                );
+
+                for tx_id in &fair_ordered {
+                    info!("FairDAG-RL ordered transaction (via FairUpdate): {}", tx_id);
+                }
+            }
+        }
+    }
+
+    /// Static version of extract_subdag that can be called in a spawned task.
+    /// Takes owned Store (cheap clone) and sorted_keys.
+    async fn extract_subdag_static(
+        store: Store,
+        sorted_keys: Vec<PublicKey>,
         leader_round: Round,
         certificates: &[Certificate],
-    ) -> (CommittedSubdag, Vec<MissingEdgeUpdate>) {
+    ) -> CommittedSubdag {
         let mut vertices: Vec<CommittedVertex> = Vec::new();
-        let mut edge_updates: Vec<MissingEdgeUpdate> = Vec::new();
 
         for cert in certificates {
             let author = cert.origin();
-            let replica_index = self
-                .sorted_keys
+            let replica_index = sorted_keys
                 .iter()
                 .position(|k| *k == author)
                 .expect("Certificate author not in committee");
@@ -204,54 +378,18 @@ impl FairDagProcessor {
             let mut batches_missing = 0usize;
 
             for batch_digest in cert.header.payload.keys() {
-                match self.store.clone().read(batch_digest.to_vec()).await {
+                match store.clone().read(batch_digest.to_vec()).await {
                     Ok(Some(serialized_batch)) => {
                         batches_found += 1;
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            Ok(WorkerMessage::Batch(batch_entries, compressed_update)) => {
+                            Ok(WorkerMessage::Batch(batch_entries, _compressed)) => {
                                 for (tx_bytes, oi) in batch_entries {
                                     let tx_id = extract_tx_digest(&tx_bytes);
                                     ordering_entries.push((tx_id, oi));
                                 }
-
-                                // Extract lz4-compressed MissingEdgeUpdates.
-                                if let Some(compressed) = compressed_update {
-                                    match lz4_flex::decompress_size_prepended(&compressed) {
-                                        Ok(bytes) => {
-                                            match bincode::deserialize::<Vec<MissingEdgeUpdate>>(
-                                                &bytes,
-                                            ) {
-                                                Ok(updates) => {
-                                                    info!(
-                                                        "FairDAG: extracted {} missing edge \
-                                                         updates from batch",
-                                                        updates.len()
-                                                    );
-                                                    edge_updates.extend(updates);
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "Failed to deserialize \
-                                                         MissingEdgeUpdate list: {}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Failed to decompress MissingEdgeUpdate: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
                             }
                             Ok(_) => {
-                                warn!(
-                                    "Unexpected message type for batch {:?}",
-                                    batch_digest
-                                );
+                                warn!("Unexpected message type for batch {:?}", batch_digest);
                             }
                             Err(e) => {
                                 error!("Deser fail batch {:?}: {}", batch_digest, e);
@@ -268,10 +406,8 @@ impl FairDagProcessor {
             }
 
             info!(
-                "FAIRDAG_TIMING: extract cert round={} replica={} batches \
-                 found={} missing={} entries={}",
-                cert.round(), replica_index, batches_found, batches_missing,
-                ordering_entries.len()
+                "FAIRDAG_TIMING: extract cert round={} replica={} batches found={} missing={} entries={}",
+                cert.round(), replica_index, batches_found, batches_missing, ordering_entries.len()
             );
 
             vertices.push(CommittedVertex {
@@ -284,12 +420,9 @@ impl FairDagProcessor {
 
         vertices.sort_by_key(|v| v.round);
 
-        (
-            CommittedSubdag {
-                leader_round,
-                vertices,
-            },
-            edge_updates,
-        )
+        CommittedSubdag {
+            leader_round,
+            vertices,
+        }
     }
 }

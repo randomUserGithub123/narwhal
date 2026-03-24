@@ -1,17 +1,17 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Modified for FairDAG-RL v5: Explicit Missing Edge Updates.
+// Modified for FairDAG-RL v5: Explicit missing-edge contributions.
 //
-// The BatchMaker now:
-//   1. Receives MissingEdgeRequest from the FairnessLayer (via channel).
-//   2. For each request, waits until all referenced txs have local OIs.
-//   3. Constructs a MissingEdgeUpdate with pairwise directional votes.
-//   4. Serializes + lz4-compresses the update and attaches it to the next batch.
-//   5. Receives GraphResolved notifications to stop producing stale updates.
-use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker};
-use crate::missing_edge_types::{
-    EdgeDirection, FairnessToWorkerMessage, GraphId, GraphResolved,
-    MissingEdgeRequest, MissingEdgeUpdate, PairwiseVote,
-};
+// When the FairDagProcessor discovers missing edges in a graph, it sends a
+// MissingEdgeRequest to this BatchMaker via a channel. The BatchMaker tracks
+// which tx digests are needed for each graph_round. Once ALL needed txs have
+// been seen locally (via the shared LocalOrderTracker), it generates a
+// MissingEdgeContribution containing this replica's OIs for those txs, and
+// includes it (lz4-compressed) in the next sealed batch.
+//
+// A graph_round is contributed-to at most once — after generating the
+// contribution, the entry is removed from pending state.
+
+use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker, TxDigest};
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
@@ -22,8 +22,10 @@ use crypto::PublicKey;
 use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
-use log::{debug, info as log_info, warn};
+use log::{debug, warn};
 use network::ReliableSender;
+use primary::Round;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::collections::{HashMap, HashSet};
@@ -43,15 +45,43 @@ pub type BatchEntry = (Transaction, u64); // (raw_tx, ordering_indicator)
 /// A batch is a sequence of (transaction, ordering_indicator) pairs.
 pub type Batch = Vec<BatchEntry>;
 
-/// Tracks a pending missing edge request: we need local OIs for all txs
-/// before we can produce the update.
-struct PendingEdgeRequest {
-    request: MissingEdgeRequest,
-    /// Set of tx digests we still need to observe locally.
-    waiting_for: HashSet<u64>,
+// =============================================================================
+// Explicit missing-edge types
+// =============================================================================
+
+/// Sent by FairDagProcessor → BatchMaker when a graph has missing edges.
+/// The batch_maker should wait until all `needed_tx_digests` have been seen
+/// locally, then generate a MissingEdgeContribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingEdgeRequest {
+    /// The graph's leader round — unique identifier for the graph.
+    pub graph_round: Round,
+    /// The tx digests involved in missing edge pairs. The batch_maker
+    /// needs local OIs for ALL of these before it can contribute.
+    pub needed_tx_digests: Vec<TxDigest>,
 }
 
-/// Assemble clients transactions into batches.
+/// This replica's contribution for resolving missing edges in a specific graph.
+/// Contains the OIs as seen by this replica for the needed txs.
+/// Serialized with bincode, then lz4-compressed before inclusion in batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingEdgeContribution {
+    /// Which graph this contribution is for.
+    pub graph_round: Round,
+    /// This replica's OI entries for the missing-edge txs.
+    pub oi_entries: Vec<(TxDigest, u64)>,
+}
+
+/// Tracks the state of a pending missing-edge contribution for one graph.
+struct PendingEdgeGraph {
+    graph_round: Round,
+    needed_digests: HashSet<TxDigest>,
+    /// Once we generate the contribution, this is set to true and the entry
+    /// is moved to `completed_graphs` to avoid duplicate contributions.
+    contributed: bool,
+}
+
+/// Assemble client transactions into batches.
 pub struct BatchMaker {
     /// The preferred batch size (in bytes).
     batch_size: usize,
@@ -76,20 +106,16 @@ pub struct BatchMaker {
     tracker: LocalOrderTracker,
 
     // =========================================================================
-    // FairDAG-RL v5: Explicit missing edge updates
+    // Explicit missing-edge state
     // =========================================================================
-    /// Channel to receive MissingEdgeRequest / GraphResolved from FairnessLayer.
-    rx_fairness: Receiver<FairnessToWorkerMessage>,
-    /// Our replica index (used when constructing MissingEdgeUpdate).
-    our_replica_index: usize,
-    /// Pending requests: graph_id → PendingEdgeRequest.
-    /// Once all txs are available, we produce the update.
-    pending_requests: HashMap<GraphId, PendingEdgeRequest>,
-    /// Ready updates: graph_id → compressed MissingEdgeUpdate bytes.
-    /// These are attached to the next sealed batch.
-    ready_updates: Vec<Vec<u8>>,
-    /// Resolved graph IDs — we stop producing updates for these.
-    resolved_graphs: HashSet<GraphId>,
+    /// Channel to receive missing edge requests from FairDagProcessor.
+    rx_missing_edge: Receiver<MissingEdgeRequest>,
+    /// Graphs awaiting contribution: graph_round → pending state.
+    pending_edge_graphs: HashMap<Round, PendingEdgeGraph>,
+    /// Graphs we already contributed to — never contribute again.
+    completed_graph_rounds: HashSet<Round>,
+    /// Contributions ready to be included in the next sealed batch.
+    ready_contributions: Vec<MissingEdgeContribution>,
 }
 
 impl BatchMaker {
@@ -100,8 +126,7 @@ impl BatchMaker {
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         tracker: LocalOrderTracker,
-        rx_fairness: Receiver<FairnessToWorkerMessage>,
-        our_replica_index: usize,
+        rx_missing_edge: Receiver<MissingEdgeRequest>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -114,146 +139,56 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 tracker,
-                rx_fairness,
-                our_replica_index,
-                pending_requests: HashMap::new(),
-                ready_updates: Vec::new(),
-                resolved_graphs: HashSet::new(),
+                rx_missing_edge,
+                pending_edge_graphs: HashMap::new(),
+                completed_graph_rounds: HashSet::new(),
+                ready_contributions: Vec::new(),
             }
             .run()
             .await;
         });
     }
 
-    /// Check if any pending requests are now ready (all txs have local OIs).
-    fn check_pending_requests(&mut self) {
-        let mut newly_ready: Vec<GraphId> = Vec::new();
+    /// Check all pending edge graphs to see if any are now ready
+    /// (all needed tx digests have been seen in the local tracker).
+    fn check_pending_edge_graphs(&mut self) {
+        let mut newly_ready: Vec<Round> = Vec::new();
 
-        for (graph_id, pending) in &mut self.pending_requests {
-            if self.resolved_graphs.contains(graph_id) {
-                newly_ready.push(*graph_id); // will be discarded
+        for (round, pending) in &self.pending_edge_graphs {
+            if pending.contributed {
                 continue;
             }
-
-            // Check if all waiting txs now have OIs.
-            pending.waiting_for.retain(|tx_digest| {
-                self.tracker.get_oi(*tx_digest).is_none()
-            });
-
-            if pending.waiting_for.is_empty() {
-                newly_ready.push(*graph_id);
+            let needed: Vec<TxDigest> = pending.needed_digests.iter().copied().collect();
+            if self.tracker.has_all(&needed) {
+                newly_ready.push(*round);
             }
         }
 
-        for graph_id in newly_ready {
-            if self.resolved_graphs.contains(&graph_id) {
-                self.pending_requests.remove(&graph_id);
-                continue;
-            }
+        for round in newly_ready {
+            if let Some(pending) = self.pending_edge_graphs.get_mut(&round) {
+                let needed: Vec<TxDigest> = pending.needed_digests.iter().copied().collect();
+                let oi_entries = self.tracker.get_ois_bulk_unwrap(&needed);
 
-            if let Some(pending) = self.pending_requests.remove(&graph_id) {
-                let update = self.produce_update(&pending.request);
-                let serialized = bincode::serialize(&update)
-                    .expect("Failed to serialize MissingEdgeUpdate");
-                let compressed = lz4_flex::compress_prepend_size(&serialized);
+                let contribution = MissingEdgeContribution {
+                    graph_round: round,
+                    oi_entries,
+                };
 
                 debug!(
-                    "FairDAG BatchMaker: produced MissingEdgeUpdate for graph {} \
-                     with {} votes, compressed {}→{} bytes",
-                    graph_id,
-                    update.votes.len(),
-                    serialized.len(),
-                    compressed.len(),
+                    "FairDAG BatchMaker: generated missing-edge contribution for graph round {} ({} entries)",
+                    round,
+                    contribution.oi_entries.len()
                 );
 
-                self.ready_updates.push(compressed);
+                self.ready_contributions.push(contribution);
+                pending.contributed = true;
+                self.completed_graph_rounds.insert(round);
             }
         }
-    }
 
-    /// Produce a MissingEdgeUpdate from a fully-ready request.
-    fn produce_update(&self, request: &MissingEdgeRequest) -> MissingEdgeUpdate {
-        let mut votes: Vec<PairwiseVote> = Vec::with_capacity(request.missing_pairs.len());
-
-        for &(d1, d2) in &request.missing_pairs {
-            let oi1 = self.tracker.get_oi(d1);
-            let oi2 = self.tracker.get_oi(d2);
-
-            let direction = match (oi1, oi2) {
-                (Some(o1), Some(o2)) => {
-                    if o1 < o2 {
-                        EdgeDirection::Forward // d1 before d2
-                    } else {
-                        EdgeDirection::Reverse // d2 before d1
-                    }
-                }
-                _ => EdgeDirection::Unknown,
-            };
-
-            votes.push(PairwiseVote {
-                d1,
-                d2,
-                direction,
-            });
-        }
-
-        MissingEdgeUpdate {
-            graph_id: request.graph_id,
-            replica_index: self.our_replica_index,
-            votes,
-        }
-    }
-
-    /// Handle a message from the FairnessLayer.
-    fn handle_fairness_message(&mut self, msg: FairnessToWorkerMessage) {
-        match msg {
-            FairnessToWorkerMessage::MissingEdgeRequest(request) => {
-                let graph_id = request.graph_id;
-
-                if self.resolved_graphs.contains(&graph_id) {
-                    debug!(
-                        "FairDAG BatchMaker: ignoring MissingEdgeRequest for \
-                         already-resolved graph {}",
-                        graph_id
-                    );
-                    return;
-                }
-
-                // Determine which txs we still need to observe.
-                let mut waiting_for: HashSet<u64> = HashSet::new();
-                for &tx_digest in &request.missing_tx_digests {
-                    if self.tracker.get_oi(tx_digest).is_none() {
-                        waiting_for.insert(tx_digest);
-                    }
-                }
-
-                debug!(
-                    "FairDAG BatchMaker: received MissingEdgeRequest for graph {} \
-                     with {} txs, {} pairs, waiting for {} txs",
-                    graph_id,
-                    request.missing_tx_digests.len(),
-                    request.missing_pairs.len(),
-                    waiting_for.len(),
-                );
-
-                self.pending_requests.insert(graph_id, PendingEdgeRequest {
-                    request,
-                    waiting_for,
-                });
-            }
-            FairnessToWorkerMessage::GraphResolved(GraphResolved { graph_id }) => {
-                debug!(
-                    "FairDAG BatchMaker: graph {} resolved, removing pending requests",
-                    graph_id
-                );
-                self.resolved_graphs.insert(graph_id);
-                self.pending_requests.remove(&graph_id);
-                // Also remove any ready updates for this graph.
-                // (They may still be in ready_updates if not yet sealed.)
-                // We keep them — they'll just be ignored by the fairness layer.
-                // This is safe: the fairness layer ignores updates for resolved graphs.
-            }
-        }
+        // Clean up contributed entries.
+        self.pending_edge_graphs
+            .retain(|_, p| !p.contributed);
     }
 
     /// Main loop receiving incoming transactions and creating batches.
@@ -276,8 +211,9 @@ impl BatchMaker {
                     self.current_batch_size += transaction.len();
                     self.current_batch.push((transaction, oi));
 
-                    // Check if any pending missing edge requests are now ready.
-                    self.check_pending_requests();
+                    // After recording a new tx, check if any pending edge graphs
+                    // are now complete.
+                    self.check_pending_edge_graphs();
 
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
@@ -285,16 +221,54 @@ impl BatchMaker {
                     }
                 },
 
-                // Handle fairness layer messages (missing edge requests / graph resolved).
-                Some(msg) = self.rx_fairness.recv() => {
-                    self.handle_fairness_message(msg);
-                    // Immediately check if any pending requests are ready.
-                    self.check_pending_requests();
+                // Receive missing edge requests from FairDagProcessor.
+                Some(request) = self.rx_missing_edge.recv() => {
+                    if self.completed_graph_rounds.contains(&request.graph_round) {
+                        debug!(
+                            "FairDAG BatchMaker: ignoring duplicate missing-edge request for round {} (already contributed)",
+                            request.graph_round
+                        );
+                        continue;
+                    }
+
+                    if self.pending_edge_graphs.contains_key(&request.graph_round) {
+                        debug!(
+                            "FairDAG BatchMaker: ignoring duplicate missing-edge request for round {} (already pending)",
+                            request.graph_round
+                        );
+                        continue;
+                    }
+
+                    debug!(
+                        "FairDAG BatchMaker: received missing-edge request for graph round {} ({} txs needed)",
+                        request.graph_round,
+                        request.needed_tx_digests.len()
+                    );
+
+                    let needed_set: HashSet<TxDigest> =
+                        request.needed_tx_digests.into_iter().collect();
+
+                    self.pending_edge_graphs.insert(
+                        request.graph_round,
+                        PendingEdgeGraph {
+                            graph_round: request.graph_round,
+                            needed_digests: needed_set,
+                            contributed: false,
+                        },
+                    );
+
+                    // Immediately check if we already have all needed txs.
+                    self.check_pending_edge_graphs();
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    if !self.current_batch.is_empty() {
+                    // Also check pending edge graphs on timer ticks — a tx might
+                    // have arrived via another worker's batch (recorded in tracker
+                    // by WorkerReceiverHandler) without going through our tx channel.
+                    self.check_pending_edge_graphs();
+
+                    if !self.current_batch.is_empty() || !self.ready_contributions.is_empty() {
                         self.seal().await;
                     }
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -319,74 +293,55 @@ impl BatchMaker {
             .filter_map(|(tx, _)| tx[1..9].try_into().ok())
             .collect();
 
-        // FairDAG-RL v5: Collect all ready missing edge updates into a single
-        // compressed blob. Multiple updates (for different graphs) are batched
-        // together: serialize the Vec<MissingEdgeUpdate>, then lz4-compress.
-        let compressed_updates: Option<Vec<u8>> = if !self.ready_updates.is_empty() {
-            // Each ready_update is individually compressed. We concatenate by
-            // wrapping them in a Vec and compressing the whole thing.
-            // Actually, each is already individually compressed. For simplicity,
-            // we'll just take one per seal. For multiple, we serialize the list.
-            //
-            // Design decision: We embed all ready updates as a single compressed
-            // blob. We re-serialize the full list.
-            let mut all_updates: Vec<MissingEdgeUpdate> = Vec::new();
-            for compressed_single in self.ready_updates.drain(..) {
-                let bytes = lz4_flex::decompress_size_prepended(&compressed_single)
-                    .expect("Failed to decompress MissingEdgeUpdate");
-                let update: MissingEdgeUpdate = bincode::deserialize(&bytes)
-                    .expect("Failed to deserialize MissingEdgeUpdate");
-                // Skip updates for already-resolved graphs.
-                if !self.resolved_graphs.contains(&update.graph_id) {
-                    all_updates.push(update);
-                }
-            }
-            if all_updates.is_empty() {
-                None
-            } else {
-                let serialized = bincode::serialize(&all_updates)
-                    .expect("Failed to serialize MissingEdgeUpdate list");
-                let compressed = lz4_flex::compress_prepend_size(&serialized);
-                debug!(
-                    "FairDAG BatchMaker: sealing {} missing edge updates, \
-                     compressed {}→{} bytes",
-                    all_updates.len(), serialized.len(), compressed.len(),
-                );
-                Some(compressed)
-            }
+        // =====================================================================
+        // Compress any ready missing-edge contributions with lz4_flex.
+        // =====================================================================
+        let compressed_contributions: Vec<u8> = if self.ready_contributions.is_empty() {
+            Vec::new()
         } else {
-            None
+            let contributions: Vec<MissingEdgeContribution> =
+                self.ready_contributions.drain(..).collect();
+
+            debug!(
+                "FairDAG BatchMaker: sealing batch with {} missing-edge contributions",
+                contributions.len()
+            );
+
+            let serialized = bincode::serialize(&contributions)
+                .expect("Failed to serialize missing-edge contributions");
+            lz4_flex::compress_prepend_size(&serialized)
         };
 
         debug!(
-            "FairDAG BatchMaker: sealing batch with {} entries, OI range [{}, {}], \
-             has_updates={}",
+            "FairDAG BatchMaker: sealing batch with {} entries, {} bytes compressed contributions, OI range [{}, {}]",
             self.current_batch.len(),
+            compressed_contributions.len(),
             self.current_batch.first().map(|(_, oi)| *oi).unwrap_or(0),
             self.current_batch.last().map(|(_, oi)| *oi).unwrap_or(0),
-            compressed_updates.is_some(),
         );
 
         self.current_batch_size = 0;
         let batch: Batch = self.current_batch.drain(..).collect();
-        let message = WorkerMessage::Batch(batch, compressed_updates);
+        let message = WorkerMessage::Batch(batch, compressed_contributions);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]
         {
+            use crypto::Digest;
+            use ed25519_dalek::{Digest as _, Sha512};
             let digest = Digest(
                 Sha512::digest(&serialized)[..32]
                     .try_into()
                     .unwrap(),
             );
             for id in tx_ids {
-                log_info!(
+                info!(
                     "Batch {:?} contains tx {}",
                     digest,
                     u64::from_be_bytes(id)
                 );
             }
-            log_info!("Batch {:?} contains {} B", digest, size);
+            info!("Batch {:?} contains {} B", digest, size);
         }
 
         // Broadcast the batch through the network.
