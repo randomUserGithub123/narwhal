@@ -30,9 +30,8 @@ struct ParkedGraph {
     graph_round: Round,
     /// Number of distinct replica contributions received so far.
     contribution_count: usize,
-    /// All contributions received, keyed by source.
-    /// We use the oi_entries directly since we don't have replica ID in the
-    /// contribution — we deduplicate by identical graph_round + content hash.
+    /// All contributions received.
+    /// We deduplicate by hashing the directed votes.
     contributions: Vec<MissingEdgeContribution>,
     /// Set of contribution hashes to avoid duplicates from the same replica.
     seen_hashes: std::collections::HashSet<u64>,
@@ -50,10 +49,10 @@ impl ParkedGraph {
 
     /// Add a contribution. Returns true if this is a new (non-duplicate) contribution.
     fn add_contribution(&mut self, contrib: MissingEdgeContribution) -> bool {
-        // Simple dedup: hash the OI entries to detect duplicates.
+        // Simple dedup: hash the directed votes to detect duplicates.
         let mut hash: u64 = 0;
-        for (d, oi) in &contrib.oi_entries {
-            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(*d ^ *oi);
+        for &(from, to) in &contrib.directed_votes {
+            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(from ^ to);
         }
         if self.seen_hashes.insert(hash) {
             self.contribution_count += 1;
@@ -227,15 +226,17 @@ impl FairDagProcessor {
 
                         // If this graph has missing edges, send request to BatchMaker
                         // and park the graph for explicit updates.
-                        if let Some((graph_round, needed_digests)) = missing_request {
+                        if let Some((graph_round, missing_pairs, needed_digests)) = missing_request {
                             info!(
-                                "FairDAG: graph round {} has {} missing-edge txs — sending request to BatchMaker",
+                                "FairDAG: graph round {} has {} missing pairs ({} unique txs) — sending request to BatchMaker",
                                 graph_round,
+                                missing_pairs.len(),
                                 needed_digests.len()
                             );
 
                             let request = MissingEdgeRequest {
                                 graph_round,
+                                missing_pairs,
                                 needed_tx_digests: needed_digests,
                             };
 
@@ -330,17 +331,16 @@ impl FairDagProcessor {
             if let Some(parked) = self.parked_graphs.remove(&round) {
                 let resolve_start = Instant::now();
 
-                // Collect all OI entries from contributions into the format
-                // expected by the fairness layer.
-                let all_oi_sets: Vec<Vec<(TxDigest, u64)>> = parked
+                // Collect directed edge votes from each contribution.
+                let all_vote_sets: Vec<Vec<(TxDigest, TxDigest)>> = parked
                     .contributions
                     .into_iter()
-                    .map(|c| c.oi_entries)
+                    .map(|c| c.directed_votes)
                     .collect();
 
                 let fair_ordered = self
                     .fairness_layer
-                    .apply_fair_update(round, &all_oi_sets);
+                    .apply_fair_update(round, &all_vote_sets);
 
                 let resolve_ms = resolve_start.elapsed().as_millis();
 

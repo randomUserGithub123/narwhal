@@ -50,34 +50,40 @@ pub type Batch = Vec<BatchEntry>;
 // =============================================================================
 
 /// Sent by FairDagProcessor → BatchMaker when a graph has missing edges.
-/// The batch_maker should wait until all `needed_tx_digests` have been seen
-/// locally, then generate a MissingEdgeContribution.
+/// Contains the actual missing edge PAIRS (not just tx digests).
+/// Each worker will vote a direction for each pair based on its local ordering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingEdgeRequest {
     /// The graph's leader round — unique identifier for the graph.
     pub graph_round: Round,
-    /// The tx digests involved in missing edge pairs. The batch_maker
-    /// needs local OIs for ALL of these before it can contribute.
+    /// The missing edge pairs. Each (d1, d2) is a pair of tx digests
+    /// between which no edge could be added during initial graph construction.
+    pub missing_pairs: Vec<(TxDigest, TxDigest)>,
+    /// All unique tx digests involved in missing pairs.
+    /// The batch_maker waits until ALL of these are in the local tracker.
     pub needed_tx_digests: Vec<TxDigest>,
 }
 
-/// This replica's contribution for resolving missing edges in a specific graph.
-/// Contains the OIs as seen by this replica for the needed txs.
+/// This replica's contribution: directed edge votes for missing pairs.
+/// For each missing pair (d1, d2), the worker votes a direction based on
+/// which tx it saw first locally. Encoded as (from, to) = "from before to".
 /// Serialized with bincode, then lz4-compressed before inclusion in batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingEdgeContribution {
     /// Which graph this contribution is for.
     pub graph_round: Round,
-    /// This replica's OI entries for the missing-edge txs.
-    pub oi_entries: Vec<(TxDigest, u64)>,
+    /// Directed edge votes: each (from, to) means "I saw `from` before `to`".
+    pub directed_votes: Vec<(TxDigest, TxDigest)>,
 }
 
 /// Tracks the state of a pending missing-edge contribution for one graph.
 struct PendingEdgeGraph {
     graph_round: Round,
+    /// The missing edge pairs we need to vote on.
+    missing_pairs: Vec<(TxDigest, TxDigest)>,
+    /// All unique tx digests we need to have seen before voting.
     needed_digests: HashSet<TxDigest>,
-    /// Once we generate the contribution, this is set to true and the entry
-    /// is moved to `completed_graphs` to avoid duplicate contributions.
+    /// Once we generate the contribution, this is set to true.
     contributed: bool,
 }
 
@@ -158,8 +164,8 @@ impl BatchMaker {
 
     /// Check all pending edge graphs to see if any are now ready
     /// (all needed tx digests have been seen in the local tracker).
-    /// Returns any newly generated contributions so they can be forwarded
-    /// to FairDagProcessor (our own contribution must be self-injected).
+    /// For each ready graph, votes a direction for each missing edge pair
+    /// based on local arrival order, following Themis FairUpdate.
     fn check_pending_edge_graphs(&mut self) -> Vec<MissingEdgeContribution> {
         let mut newly_ready: Vec<Round> = Vec::new();
 
@@ -177,18 +183,39 @@ impl BatchMaker {
 
         for round in newly_ready {
             if let Some(pending) = self.pending_edge_graphs.get_mut(&round) {
-                let needed: Vec<TxDigest> = pending.needed_digests.iter().copied().collect();
-                let oi_entries = self.tracker.get_ois_bulk_unwrap(&needed);
+                // Vote a direction for each missing pair using local OIs.
+                let mut directed_votes: Vec<(TxDigest, TxDigest)> =
+                    Vec::with_capacity(pending.missing_pairs.len());
+
+                for &(d1, d2) in &pending.missing_pairs {
+                    let oi1 = self.tracker.get_oi(d1);
+                    let oi2 = self.tracker.get_oi(d2);
+
+                    match (oi1, oi2) {
+                        (Some(o1), Some(o2)) => {
+                            if o1 <= o2 {
+                                directed_votes.push((d1, d2));
+                            } else {
+                                directed_votes.push((d2, d1));
+                            }
+                        }
+                        (Some(_), None) => directed_votes.push((d1, d2)),
+                        (None, Some(_)) => directed_votes.push((d2, d1)),
+                        (None, None) => {
+                            if d1 < d2 { directed_votes.push((d1, d2)); }
+                            else { directed_votes.push((d2, d1)); }
+                        }
+                    }
+                }
 
                 let contribution = MissingEdgeContribution {
                     graph_round: round,
-                    oi_entries,
+                    directed_votes,
                 };
 
                 debug!(
-                    "FairDAG BatchMaker: generated missing-edge contribution for graph round {} ({} entries)",
-                    round,
-                    contribution.oi_entries.len()
+                    "FairDAG BatchMaker: generated {} edge votes for graph round {}",
+                    contribution.directed_votes.len(), round,
                 );
 
                 self_contributions.push(contribution.clone());
@@ -198,10 +225,7 @@ impl BatchMaker {
             }
         }
 
-        // Clean up contributed entries.
-        self.pending_edge_graphs
-            .retain(|_, p| !p.contributed);
-
+        self.pending_edge_graphs.retain(|_, p| !p.contributed);
         self_contributions
     }
 
@@ -255,8 +279,9 @@ impl BatchMaker {
                     }
 
                     debug!(
-                        "FairDAG BatchMaker: received missing-edge request for graph round {} ({} txs needed)",
+                        "FairDAG BatchMaker: received missing-edge request for graph round {} ({} pairs, {} unique txs)",
                         request.graph_round,
+                        request.missing_pairs.len(),
                         request.needed_tx_digests.len()
                     );
 
@@ -267,6 +292,7 @@ impl BatchMaker {
                         request.graph_round,
                         PendingEdgeGraph {
                             graph_round: request.graph_round,
+                            missing_pairs: request.missing_pairs,
                             needed_digests: needed_set,
                             contributed: false,
                         },

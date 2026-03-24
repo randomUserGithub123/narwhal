@@ -305,16 +305,6 @@ impl DependencyGraph {
         self.edges = Vec::new();
         self.global_to_local = Vec::new();
     }
-
-    /// v5: Collect all unique tx digests involved in missing pairs.
-    fn missing_edge_tx_digests(&self) -> Vec<u32> {
-        let mut dense_set: HashSet<u32> = HashSet::new();
-        for &(li, lj) in &self.missing_pairs {
-            dense_set.insert(self.local_to_global[li as usize]);
-            dense_set.insert(self.local_to_global[lj as usize]);
-        }
-        dense_set.into_iter().collect()
-    }
 }
 
 // =============================================================================
@@ -451,14 +441,15 @@ impl FairnessLayer {
     //
     // Returns:
     //   - Vec<TxDigest>: transactions that were fully ordered (graph was tournament)
-    //   - Option<(Round, Vec<TxDigest>)>: if the graph has missing edges,
-    //     returns (graph_round, needed_tx_digests) for the MissingEdgeRequest
+    //   - Option<(Round, Vec<(TxDigest, TxDigest)>, Vec<TxDigest>)>:
+    //     if the graph has missing edges, returns
+    //     (graph_round, missing_pairs, needed_tx_digests) for MissingEdgeRequest
     // =========================================================================
 
     pub fn process_subdag_explicit(
         &mut self,
         subdag: &CommittedSubdag,
-    ) -> (Vec<TxDigest>, Option<(Round, Vec<TxDigest>)>) {
+    ) -> (Vec<TxDigest>, Option<(Round, Vec<(TxDigest, TxDigest)>, Vec<TxDigest>)>) {
         let total_start = Instant::now();
         self.subdag_count += 1;
         let sd = self.subdag_count;
@@ -533,20 +524,19 @@ impl FairnessLayer {
     // PUBLIC API v5: Apply explicit edge updates (Themis FairUpdate)
     //
     // Called when n-f MissingEdgeContributions have been collected for a
-    // parked graph. Each contribution is a Vec<(TxDigest, u64)> — the OIs
-    // from one replica for the txs involved in missing edges.
+    // parked graph. Each contribution is a Vec<(TxDigest, TxDigest)> of
+    // directed edge votes: (from, to) means "I saw `from` before `to`".
     //
     // Steps (following Themis FairUpdate, Fig. 2):
-    //   1. For each pair (tx, tx') with no edge yet, compute weights using
-    //      the contribution OIs.
-    //   2. If weight reaches threshold, add the edge.
-    //   3. Try finalization again.
+    //   1. For each missing pair, count how many votes go in each direction.
+    //   2. Combine with existing weights from initial construction.
+    //   3. If combined weight reaches threshold, add edge in majority direction.
     // =========================================================================
 
     pub fn apply_fair_update(
         &mut self,
         graph_round: Round,
-        contributions: &[Vec<(TxDigest, u64)>],
+        contributions: &[Vec<(TxDigest, TxDigest)>],
     ) -> Vec<TxDigest> {
         let graph_idx = match self.round_to_graph.get(&graph_round) {
             Some(&idx) => idx,
@@ -569,15 +559,25 @@ impl FairnessLayer {
 
         let update_start = Instant::now();
 
-        // Build a map from TxDigest → Vec<u64> (one OI per contribution).
-        let mut digest_ois: HashMap<TxDigest, Vec<u64>> = HashMap::new();
-        for contrib_ois in contributions {
-            for &(digest, oi) in contrib_ois {
-                digest_ois.entry(digest).or_default().push(oi);
+        // Build vote tally: for each unordered pair {d1, d2}, count
+        // votes for d1→d2 vs d2→d1 across all contributions.
+        // Key: (min_digest, max_digest) → (votes_min_before_max, votes_max_before_min)
+        let mut vote_tally: HashMap<(TxDigest, TxDigest), (usize, usize)> = HashMap::new();
+
+        for contrib_votes in contributions {
+            for &(from, to) in contrib_votes {
+                let key = if from < to { (from, to) } else { (to, from) };
+                let entry = vote_tally.entry(key).or_insert((0, 0));
+                if from < to {
+                    entry.0 += 1; // vote for min→max
+                } else {
+                    entry.1 += 1; // vote for max→min
+                }
             }
         }
 
-        // Process only the missing pairs.
+        // Process missing pairs: look up vote tally, combine with existing
+        // weights, and resolve edges.
         let ht = self.half_threshold;
         let missing_pairs: Vec<(u16, u16)> =
             self.graphs[graph_idx].missing_pairs.clone();
@@ -591,48 +591,39 @@ impl FairnessLayer {
 
             let di_dense = self.graphs[graph_idx].local_to_global[li as usize];
             let dj_dense = self.graphs[graph_idx].local_to_global[lj as usize];
-            let di_digest = self.nodes[di_dense as usize].digest;
-            let dj_digest = self.nodes[dj_dense as usize].digest;
+            let di = self.nodes[di_dense as usize].digest;
+            let dj = self.nodes[dj_dense as usize].digest;
 
-            // Get OIs from all contributions for this pair.
-            let ois_i = digest_ois.get(&di_digest);
-            let ois_j = digest_ois.get(&dj_digest);
+            // Look up votes for this pair.
+            let key = if di < dj { (di, dj) } else { (dj, di) };
+            let (votes_min_first, votes_max_first) =
+                vote_tally.get(&key).copied().unwrap_or((0, 0));
 
-            if let (Some(ois_i), Some(ois_j)) = (ois_i, ois_j) {
-                // Count pairwise preferences from the contributions.
-                let mut w_ij: usize = 0;
-                let mut w_ji: usize = 0;
+            // Translate to (votes_i_before_j, votes_j_before_i).
+            let (vote_ij, vote_ji) = if di < dj {
+                (votes_min_first, votes_max_first)
+            } else {
+                (votes_max_first, votes_min_first)
+            };
 
-                // Each contribution is one replica's view. We pair up the
-                // OIs from the same contribution index.
-                let pairs_to_check = ois_i.len().min(ois_j.len());
-                for k in 0..pairs_to_check {
-                    if ois_i[k] < ois_j[k] {
-                        w_ij += 1;
-                    } else if ois_j[k] < ois_i[k] {
-                        w_ji += 1;
-                    }
+            // Combine with existing weights from initial graph construction.
+            let existing_ij = self.graphs[graph_idx].get_weight_val(li, lj) as usize;
+            let existing_ji = self.graphs[graph_idx].get_weight_val(lj, li) as usize;
+            let w_ij = existing_ij + vote_ij;
+            let w_ji = existing_ji + vote_ji;
+
+            // Store combined weights (capped at 15 for nibble storage).
+            self.graphs[graph_idx].set_weight_val(li, lj, w_ij.min(15) as u8);
+            self.graphs[graph_idx].set_weight_val(lj, li, w_ji.min(15) as u8);
+
+            // Check threshold (Themis FairUpdate: add edge if weight ≥ threshold).
+            if w_ij >= ht || w_ji >= ht {
+                if w_ij >= w_ji {
+                    self.graphs[graph_idx].add_edge(li, lj);
+                } else {
+                    self.graphs[graph_idx].add_edge(lj, li);
                 }
-
-                // Also incorporate previously computed weights.
-                let existing_w_ij = self.graphs[graph_idx].get_weight_val(li, lj) as usize;
-                let existing_w_ji = self.graphs[graph_idx].get_weight_val(lj, li) as usize;
-                w_ij += existing_w_ij;
-                w_ji += existing_w_ji;
-
-                // Update stored weights.
-                self.graphs[graph_idx].set_weight_val(li, lj, w_ij.min(15) as u8);
-                self.graphs[graph_idx].set_weight_val(lj, li, w_ji.min(15) as u8);
-
-                // Check threshold (Themis FairUpdate: add edge if weight ≥ threshold).
-                if w_ij >= ht || w_ji >= ht {
-                    if w_ij >= w_ji {
-                        self.graphs[graph_idx].add_edge(li, lj);
-                    } else {
-                        self.graphs[graph_idx].add_edge(lj, li);
-                    }
-                    resolved.push(pair_pos);
-                }
+                resolved.push(pair_pos);
             }
         }
 
@@ -892,13 +883,14 @@ impl FairnessLayer {
     // Check if a graph needs a MissingEdgeRequest
     //
     // Returns Some((graph_round, needed_tx_digests)) if the graph has missing
-    // pairs and hasn't already sent a request.
+    // Returns Some((graph_round, missing_pairs_as_digests, unique_tx_digests))
+    // if the graph has missing pairs and hasn't already sent a request.
     // =========================================================================
 
     fn check_for_missing_edge_request(
         &mut self,
         graph_idx: usize,
-    ) -> Option<(Round, Vec<TxDigest>)> {
+    ) -> Option<(Round, Vec<(TxDigest, TxDigest)>, Vec<TxDigest>)> {
         if self.graphs[graph_idx].finalized {
             return None;
         }
@@ -909,24 +901,33 @@ impl FairnessLayer {
             return None;
         }
 
-        // Collect all tx digests involved in missing pairs.
-        let dense_indices = self.graphs[graph_idx].missing_edge_tx_digests();
-        let needed_digests: Vec<TxDigest> = dense_indices
-            .iter()
-            .map(|&d| self.nodes[d as usize].digest)
-            .collect();
+        // Convert missing pairs from local indices to tx digests.
+        let mut missing_digest_pairs: Vec<(TxDigest, TxDigest)> = Vec::new();
+        let mut unique_digests_set: HashSet<TxDigest> = HashSet::new();
+
+        for &(li, lj) in &self.graphs[graph_idx].missing_pairs {
+            let di_dense = self.graphs[graph_idx].local_to_global[li as usize];
+            let dj_dense = self.graphs[graph_idx].local_to_global[lj as usize];
+            let di = self.nodes[di_dense as usize].digest;
+            let dj = self.nodes[dj_dense as usize].digest;
+            missing_digest_pairs.push((di, dj));
+            unique_digests_set.insert(di);
+            unique_digests_set.insert(dj);
+        }
+
+        let needed_digests: Vec<TxDigest> = unique_digests_set.into_iter().collect();
 
         self.graphs[graph_idx].missing_edge_request_sent = true;
 
         info!(
-            "FairnessLayer: graph {} (round {}) has {} missing pairs involving {} unique txs — requesting explicit contributions",
+            "FairnessLayer: graph {} (round {}) has {} missing pairs involving {} unique txs — requesting edge votes",
             graph_idx,
             self.graphs[graph_idx].round,
-            self.graphs[graph_idx].missing_pairs.len(),
+            missing_digest_pairs.len(),
             needed_digests.len(),
         );
 
-        Some((self.graphs[graph_idx].round, needed_digests))
+        Some((self.graphs[graph_idx].round, missing_digest_pairs, needed_digests))
     }
 
     // =========================================================================
