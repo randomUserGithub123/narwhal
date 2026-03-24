@@ -28,13 +28,10 @@ use tokio::sync::mpsc::{Receiver, Sender};
 /// Tracks accumulated edge contributions for a single parked graph.
 struct ParkedGraph {
     graph_round: Round,
-    /// Number of distinct replica contributions received so far.
+    /// Number of contributions received so far.
     contribution_count: usize,
-    /// All contributions received.
-    /// We deduplicate by hashing the directed votes.
+    /// All contributions received (one per replica).
     contributions: Vec<MissingEdgeContribution>,
-    /// Set of contribution hashes to avoid duplicates from the same replica.
-    seen_hashes: std::collections::HashSet<u64>,
 }
 
 impl ParkedGraph {
@@ -43,24 +40,15 @@ impl ParkedGraph {
             graph_round: round,
             contribution_count: 0,
             contributions: Vec::new(),
-            seen_hashes: std::collections::HashSet::new(),
         }
     }
 
-    /// Add a contribution. Returns true if this is a new (non-duplicate) contribution.
-    fn add_contribution(&mut self, contrib: MissingEdgeContribution) -> bool {
-        // Simple dedup: hash the directed votes to detect duplicates.
-        let mut hash: u64 = 0;
-        for &(from, to) in &contrib.directed_votes {
-            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(from ^ to);
-        }
-        if self.seen_hashes.insert(hash) {
-            self.contribution_count += 1;
-            self.contributions.push(contrib);
-            true
-        } else {
-            false
-        }
+    /// Add a contribution. Each contribution comes from a different replica
+    /// (guaranteed by the batch protocol — each worker contributes at most once
+    /// per graph round, gated by `completed_graph_rounds` in BatchMaker).
+    fn add_contribution(&mut self, contrib: MissingEdgeContribution) {
+        self.contribution_count += 1;
+        self.contributions.push(contrib);
     }
 }
 
@@ -298,13 +286,11 @@ impl FairDagProcessor {
         let round = contrib.graph_round;
 
         if let Some(parked) = self.parked_graphs.get_mut(&round) {
-            let is_new = parked.add_contribution(contrib);
-            if is_new {
-                debug!(
-                    "FairDAG: received edge contribution for graph round {} ({}/{} needed)",
-                    round, parked.contribution_count, self.required_contributions,
-                );
-            }
+            parked.add_contribution(contrib);
+            debug!(
+                "FairDAG: received edge contribution for graph round {} ({}/{} needed)",
+                round, parked.contribution_count, self.required_contributions,
+            );
         } else {
             debug!(
                 "FairDAG: received edge contribution for unknown/resolved graph round {} — ignoring",
