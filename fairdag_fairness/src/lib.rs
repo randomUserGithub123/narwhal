@@ -1061,14 +1061,19 @@ impl FairnessLayer {
 
         // This log line is parsed by logs.py — DO NOT CHANGE FORMAT.
         info!(
-            "FairnessLayer: finalized {} transactions from graph {} (round {}). \
-             Discarded {} post-solid nodes. Total ordered: {}",
+            "FairnessLayer: finalized {} transactions from graph {} (round {}). Total ordered: {}",
             ordered_digests.len(),
             graph_idx,
             self.graphs[graph_idx].round,
-            discarded_count,
             self.output_sequence.len()
         );
+
+        if discarded_count > 0 {
+            info!(
+                "FairnessLayer: discarded {} post-solid nodes from graph {} (round {})",
+                discarded_count, graph_idx, self.graphs[graph_idx].round
+            );
+        }
 
         ordered_digests
     }
