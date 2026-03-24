@@ -9,6 +9,7 @@
 // This struct is shared (via Arc) between:
 //   - BatchMaker: records client transactions, retrieves OI for sealing batches
 //   - WorkerReceiverHandler: records transactions arriving in other workers' batches
+//   - BatchMaker (edge updates): looks up OIs for missing-edge requests
 //
 // Uses std::sync::Mutex (not tokio::sync::Mutex) because the critical section
 // is just a HashMap lookup + counter increment — no async work inside the lock.
@@ -69,6 +70,37 @@ impl LocalOrderTracker {
     pub fn current_counter(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.counter
+    }
+
+    /// Batch lookup: returns (tx_digest, oi) for every digest that has been seen.
+    /// Returns None if ANY of the requested digests has not been seen yet.
+    /// This is used by BatchMaker to check whether all txs in a MissingEdgeRequest
+    /// have local OIs before including an edge update in the next batch.
+    pub fn batch_lookup_all(&self, digests: &[TxDigest]) -> Option<Vec<(TxDigest, u64)>> {
+        let inner = self.inner.lock().unwrap();
+        let mut result = Vec::with_capacity(digests.len());
+        for &d in digests {
+            match inner.seen.get(&d) {
+                Some(&oi) => result.push((d, oi)),
+                None => return None, // not all txs seen yet
+            }
+        }
+        Some(result)
+    }
+
+    /// Batch lookup: returns (tx_digest, oi) for every digest that has been seen,
+    /// skipping those not yet seen. Also returns whether ALL were found.
+    pub fn batch_lookup_available(&self, digests: &[TxDigest]) -> (Vec<(TxDigest, u64)>, bool) {
+        let inner = self.inner.lock().unwrap();
+        let mut result = Vec::with_capacity(digests.len());
+        let mut all_found = true;
+        for &d in digests {
+            match inner.seen.get(&d) {
+                Some(&oi) => result.push((d, oi)),
+                None => { all_found = false; }
+            }
+        }
+        (result, all_found)
     }
 }
 
