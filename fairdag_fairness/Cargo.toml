@@ -6,6 +6,7 @@ description = "FairDAG-RL fairness layer: dependency graph construction and orde
 
 [dependencies]
 crypto = { path = "../crypto" }
+worker = { path = "../worker" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 
