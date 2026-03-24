@@ -116,6 +116,11 @@ pub struct BatchMaker {
     completed_graph_rounds: HashSet<Round>,
     /// Contributions ready to be included in the next sealed batch.
     ready_contributions: Vec<MissingEdgeContribution>,
+    /// Channel to send self-generated contributions directly to FairDagProcessor.
+    /// Without this, our own contribution only goes into the sealed batch (which
+    /// is processed by Processor for storage, NOT by WorkerReceiverHandler), so
+    /// the FairDagProcessor would never see it.
+    tx_self_contributions: Sender<Vec<MissingEdgeContribution>>,
 }
 
 impl BatchMaker {
@@ -127,6 +132,7 @@ impl BatchMaker {
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         tracker: LocalOrderTracker,
         rx_missing_edge: Receiver<MissingEdgeRequest>,
+        tx_self_contributions: Sender<Vec<MissingEdgeContribution>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -143,6 +149,7 @@ impl BatchMaker {
                 pending_edge_graphs: HashMap::new(),
                 completed_graph_rounds: HashSet::new(),
                 ready_contributions: Vec::new(),
+                tx_self_contributions,
             }
             .run()
             .await;
@@ -151,7 +158,9 @@ impl BatchMaker {
 
     /// Check all pending edge graphs to see if any are now ready
     /// (all needed tx digests have been seen in the local tracker).
-    fn check_pending_edge_graphs(&mut self) {
+    /// Returns any newly generated contributions so they can be forwarded
+    /// to FairDagProcessor (our own contribution must be self-injected).
+    fn check_pending_edge_graphs(&mut self) -> Vec<MissingEdgeContribution> {
         let mut newly_ready: Vec<Round> = Vec::new();
 
         for (round, pending) in &self.pending_edge_graphs {
@@ -163,6 +172,8 @@ impl BatchMaker {
                 newly_ready.push(*round);
             }
         }
+
+        let mut self_contributions: Vec<MissingEdgeContribution> = Vec::new();
 
         for round in newly_ready {
             if let Some(pending) = self.pending_edge_graphs.get_mut(&round) {
@@ -180,6 +191,7 @@ impl BatchMaker {
                     contribution.oi_entries.len()
                 );
 
+                self_contributions.push(contribution.clone());
                 self.ready_contributions.push(contribution);
                 pending.contributed = true;
                 self.completed_graph_rounds.insert(round);
@@ -189,6 +201,8 @@ impl BatchMaker {
         // Clean up contributed entries.
         self.pending_edge_graphs
             .retain(|_, p| !p.contributed);
+
+        self_contributions
     }
 
     /// Main loop receiving incoming transactions and creating batches.
@@ -213,7 +227,8 @@ impl BatchMaker {
 
                     // After recording a new tx, check if any pending edge graphs
                     // are now complete.
-                    self.check_pending_edge_graphs();
+                    let self_contribs = self.check_pending_edge_graphs();
+                    Self::send_self_contributions(&self.tx_self_contributions, self_contribs).await;
 
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
@@ -258,7 +273,8 @@ impl BatchMaker {
                     );
 
                     // Immediately check if we already have all needed txs.
-                    self.check_pending_edge_graphs();
+                    let self_contribs = self.check_pending_edge_graphs();
+                    Self::send_self_contributions(&self.tx_self_contributions, self_contribs).await;
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
@@ -266,7 +282,8 @@ impl BatchMaker {
                     // Also check pending edge graphs on timer ticks — a tx might
                     // have arrived via another worker's batch (recorded in tracker
                     // by WorkerReceiverHandler) without going through our tx channel.
-                    self.check_pending_edge_graphs();
+                    let self_contribs = self.check_pending_edge_graphs();
+                    Self::send_self_contributions(&self.tx_self_contributions, self_contribs).await;
 
                     if !self.current_batch.is_empty() || !self.ready_contributions.is_empty() {
                         self.seal().await;
@@ -277,6 +294,25 @@ impl BatchMaker {
 
             // Give the chance to schedule other tasks.
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// Forward self-generated contributions directly to FairDagProcessor.
+    /// This is necessary because our own sealed batches go through
+    /// QuorumWaiter → Processor (which only stores them), NOT through
+    /// WorkerReceiverHandler (which extracts contributions).
+    async fn send_self_contributions(
+        tx: &Sender<Vec<MissingEdgeContribution>>,
+        contributions: Vec<MissingEdgeContribution>,
+    ) {
+        if !contributions.is_empty() {
+            debug!(
+                "FairDAG BatchMaker: self-injecting {} contributions to FairDagProcessor",
+                contributions.len()
+            );
+            if let Err(e) = tx.send(contributions).await {
+                warn!("Failed to self-inject contributions to FairDagProcessor: {}", e);
+            }
         }
     }
 

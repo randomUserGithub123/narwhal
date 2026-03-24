@@ -100,6 +100,7 @@ impl Worker {
             tx_primary.clone(),
             tracker.clone(),
             rx_missing_edge,
+            tx_edge_contributions.clone(),
         );
         worker.handle_workers_messages(tx_primary, tracker, tx_edge_contributions);
 
@@ -178,6 +179,7 @@ impl Worker {
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tracker: LocalOrderTracker,
         rx_missing_edge: tokio::sync::mpsc::Receiver<MissingEdgeRequest>,
+        tx_self_contributions: Sender<Vec<MissingEdgeContribution>>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -204,6 +206,7 @@ impl Worker {
                 .collect(),
             tracker,
             rx_missing_edge,
+            tx_self_contributions,
         );
 
         QuorumWaiter::spawn(
