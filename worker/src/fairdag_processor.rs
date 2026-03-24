@@ -1,13 +1,15 @@
 // FairDAG-RL with explicit FairUpdate (Themis-style).
 //
-// Replaces the stateful FairnessLayer with:
-//   - Stateless per-subdag dependency graph construction
-//   - Explicit FairUpdate: missing edges resolved via directed-edge votes
-//     embedded in batches by BatchMaker and extracted on commit
-//   - Parked graphs awaiting quorum of n-f votes
-//   - Sequential finalization by sub_dag_id
+// Architecture:
+//   - Async loop (run): receives subdags, does store reads, dispatches CPU work
+//   - Rayon threads: graph construction + FairUpdate (never block async runtime)
+//   - Channel: rayon tasks send results back to async loop
 //
-// NOTE: Requires `lz4_flex` dependency in worker crate Cargo.toml.
+// Performance features (matching original FairDAG-RL FairnessLayer):
+//   - Nibble-packed weight matrix (4 bits per weight, max 15 — fits N≤15)
+//   - Iterative Tarjan SCC (no stack overflow)
+//   - Pre-sized adjacency lists
+//   - Rayon parallelism: multiple graphs can build concurrently
 
 use crate::local_order_tracker::extract_tx_digest;
 use crate::worker::{FairProposeMessage, FairUpdateVote, WorkerMessage};
@@ -72,335 +74,253 @@ fn unpack_and_decompress_edges(compressed: &[u8], expected_count: usize) -> Vec<
 }
 
 // =========================================================================
-// Graph algorithm helpers
+// Nibble-packed weight helpers (from original FairnessLayer)
 // =========================================================================
 
-/// Tarjan SCC on a subgraph defined by `active` nodes.
-/// Returns (sccs, scc_id) where scc_id[node] = index into sccs.
-fn tarjan_scc(adj: &[Vec<usize>], active: &[usize], k: usize) -> (Vec<Vec<usize>>, Vec<i32>) {
-    let mut dfn = vec![0i32; k];
-    let mut low = vec![0i32; k];
-    let mut on_stack = vec![false; k];
-    let mut scc_id = vec![-1i32; k];
-    let mut sccs: Vec<Vec<usize>> = Vec::new();
-    let mut index_counter: i32 = 0;
-    let mut stack: Vec<usize> = Vec::new();
-
-    fn strongconnect(
-        u: usize,
-        index_counter: &mut i32,
-        stack: &mut Vec<usize>,
-        on_stack: &mut [bool],
-        dfn: &mut [i32],
-        low: &mut [i32],
-        adj: &[Vec<usize>],
-        scc_id: &mut [i32],
-        sccs: &mut Vec<Vec<usize>>,
-    ) {
-        *index_counter += 1;
-        dfn[u] = *index_counter;
-        low[u] = *index_counter;
-        stack.push(u);
-        on_stack[u] = true;
-
-        for &v in &adj[u] {
-            if dfn[v] == 0 {
-                strongconnect(v, index_counter, stack, on_stack, dfn, low, adj, scc_id, sccs);
-                if low[v] < low[u] {
-                    low[u] = low[v];
-                }
-            } else if on_stack[v] && dfn[v] < low[u] {
-                low[u] = dfn[v];
-            }
-        }
-
-        if low[u] == dfn[u] {
-            let mut comp = Vec::new();
-            loop {
-                let w = stack.pop().unwrap();
-                on_stack[w] = false;
-                scc_id[w] = sccs.len() as i32;
-                comp.push(w);
-                if w == u {
-                    break;
-                }
-            }
-            sccs.push(comp);
-        }
+#[inline(always)]
+fn get_weight(packed: &[u8], idx: usize) -> u8 {
+    let b = packed[idx >> 1];
+    if idx & 1 == 0 {
+        b & 0x0F
+    } else {
+        b >> 4
     }
-
-    for &u in active {
-        if dfn[u] == 0 {
-            strongconnect(
-                u,
-                &mut index_counter,
-                &mut stack,
-                &mut on_stack,
-                &mut dfn,
-                &mut low,
-                adj,
-                &mut scc_id,
-                &mut sccs,
-            );
-        }
-    }
-
-    (sccs, scc_id)
 }
 
-fn tarjan_scc_iterative(
-    adj: &[Vec<usize>],
-    active: &[usize],
-    k: usize,
-) -> (Vec<Vec<usize>>, Vec<i32>) {
-    let mut dfn = vec![0i32; k];
-    let mut low = vec![0i32; k];
-    let mut on_stack = vec![false; k];
-    let mut scc_id = vec![-1i32; k];
-    let mut sccs: Vec<Vec<usize>> = Vec::new();
-    let mut index_counter = 0;
-    let mut stack: Vec<usize> = Vec::new();   // Tarjan stack (SCCs)
-    let mut dfs_stack: Vec<(usize, usize)> = Vec::new(); // (node, next_child_index)
+#[inline(always)]
+fn inc_weight(packed: &mut [u8], idx: usize) {
+    let bi = idx >> 1;
+    if idx & 1 == 0 {
+        let low = packed[bi] & 0x0F;
+        if low < 15 {
+            packed[bi] += 1;
+        }
+    } else {
+        let high = packed[bi] >> 4;
+        if high < 15 {
+            packed[bi] += 0x10;
+        }
+    }
+}
 
-    for &start in active {
+// =========================================================================
+// Iterative Tarjan SCC (from original FairnessLayer — no stack overflow)
+// =========================================================================
+
+fn tarjan_scc_iterative(
+    node_count: usize,
+    edges: &[Vec<u16>],
+) -> Vec<Vec<u16>> {
+    let mut dfn = vec![0i32; node_count];
+    let mut low = vec![0i32; node_count];
+    let mut on_stack = vec![false; node_count];
+    let mut stack: Vec<u16> = Vec::with_capacity(node_count);
+    let mut sccs: Vec<Vec<u16>> = Vec::new();
+    let mut index_counter: i32 = 0;
+
+    for start in 0..node_count {
         if dfn[start] != 0 {
             continue;
         }
+        let mut dfs_stack: Vec<(u16, usize)> = Vec::new();
+        let u = start as u16;
+        index_counter += 1;
+        dfn[start] = index_counter;
+        low[start] = index_counter;
+        stack.push(u);
+        on_stack[start] = true;
+        dfs_stack.push((u, 0));
 
-        // Start DFS from `start`
-        dfs_stack.push((start, 0));
-        while let Some((u, mut i)) = dfs_stack.pop() {
-            if i == 0 {
-                // First time visiting u
-                index_counter += 1;
-                dfn[u] = index_counter;
-                low[u] = index_counter;
-                stack.push(u);
-                on_stack[u] = true;
-            }
-
-            // Process children
-            if i < adj[u].len() {
-                let v = adj[u][i];
-                i += 1;
-                dfs_stack.push((u, i)); // resume u after this child
-
-                if dfn[v] == 0 {
-                    // v not visited -> push it onto the DFS stack
-                    dfs_stack.push((v, 0));
-                } else if on_stack[v] && dfn[v] < low[u] {
-                    // back edge
-                    low[u] = low[u].min(dfn[v]);
+        while let Some(&mut (v, ref mut ni)) = dfs_stack.last_mut() {
+            let v_usize = v as usize;
+            if *ni < edges[v_usize].len() {
+                let w = edges[v_usize][*ni];
+                *ni += 1;
+                let w_usize = w as usize;
+                if dfn[w_usize] == 0 {
+                    index_counter += 1;
+                    dfn[w_usize] = index_counter;
+                    low[w_usize] = index_counter;
+                    stack.push(w);
+                    on_stack[w_usize] = true;
+                    dfs_stack.push((w, 0));
+                } else if on_stack[w_usize] && dfn[w_usize] < low[v_usize] {
+                    low[v_usize] = dfn[w_usize];
                 }
             } else {
-                // All children processed; check if u is root of an SCC
-                if low[u] == dfn[u] {
-                    let mut component = Vec::new();
+                if low[v_usize] == dfn[v_usize] {
+                    let mut scc: Vec<u16> = Vec::new();
                     loop {
                         let w = stack.pop().unwrap();
-                        on_stack[w] = false;
-                        scc_id[w] = sccs.len() as i32;
-                        component.push(w);
-                        if w == u {
+                        on_stack[w as usize] = false;
+                        scc.push(w);
+                        if w == v {
                             break;
                         }
                     }
-                    sccs.push(component);
+                    scc.sort_unstable();
+                    sccs.push(scc);
                 }
-                // Propagate low value to parent (if any)
-                if let Some((parent, _)) = dfs_stack.last_mut() {
-                    let p = *parent;
-                    if low[u] < low[p] {
-                        low[p] = low[p].min(low[u]);
+                dfs_stack.pop();
+                if let Some(&(parent, _)) = dfs_stack.last() {
+                    let v_low = low[v_usize];
+                    if v_low < low[parent as usize] {
+                        low[parent as usize] = v_low;
                     }
                 }
             }
         }
     }
-
-    (sccs, scc_id)
-}
-
-/// Topological sort of the SCC condensation graph.
-fn topo_sort_condensation(
-    sccs: &[Vec<usize>],
-    adj: &[Vec<usize>],
-    scc_id: &[i32],
-    active: &[usize],
-    is_non_blank: &[bool],
-) -> Vec<usize> {
-    let scc_n = sccs.len();
-    let mut gc: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
-    let mut indegree: Vec<usize> = vec![0; scc_n];
-
-    for &u in active {
-        let su = scc_id[u];
-        if su < 0 {
-            continue;
-        }
-        let su = su as usize;
-        for &v in &adj[u] {
-            if !is_non_blank[v] {
-                continue;
-            }
-            let sv = scc_id[v];
-            if sv < 0 || su == sv as usize {
-                continue;
-            }
-            gc[su].push(sv as usize);
-        }
-    }
-
-    for u in 0..scc_n {
-        gc[u].sort_unstable();
-        gc[u].dedup();
-        for &v in &gc[u] {
-            indegree[v] += 1;
-        }
-    }
-
-    let mut topo: Vec<usize> = Vec::with_capacity(scc_n);
-    let mut q: VecDeque<usize> = VecDeque::new();
-    for s in 0..scc_n {
-        if indegree[s] == 0 {
-            q.push_back(s);
-        }
-    }
-    while let Some(u) = q.pop_front() {
-        topo.push(u);
-        for &v in &gc[u] {
-            if indegree[v] > 0 {
-                indegree[v] -= 1;
-                if indegree[v] == 0 {
-                    q.push_back(v);
-                }
-            }
-        }
-    }
-
-    topo
-}
-
-/// Find a Hamiltonian cycle in a strongly connected tournament.
-fn find_hamiltonian_cycle(
-    nodes: &[usize],
-    has_edge: &impl Fn(usize, usize) -> bool,
-) -> Vec<usize> {
-    if nodes.len() <= 1 {
-        return nodes.to_vec();
-    }
-    if nodes.len() == 2 {
-        return if has_edge(nodes[0], nodes[1]) {
-            vec![nodes[0], nodes[1]]
-        } else {
-            vec![nodes[1], nodes[0]]
-        };
-    }
-
-    let mut cycle: Vec<usize> = if has_edge(nodes[0], nodes[1]) {
-        vec![nodes[0], nodes[1]]
-    } else {
-        vec![nodes[1], nodes[0]]
-    };
-
-    for &node in &nodes[2..] {
-        let m = cycle.len();
-        let mut inserted = false;
-        for j in 0..m {
-            let next = (j + 1) % m;
-            if has_edge(cycle[j], node) && has_edge(node, cycle[next]) {
-                cycle.insert(j + 1, node);
-                inserted = true;
-                break;
-            }
-        }
-        if !inserted {
-            // Fallback — shouldn't happen for SC tournament.
-            cycle.push(node);
-        }
-    }
-
-    cycle
-}
-
-/// Order transactions within an SCC using Hamiltonian cycle.
-/// For the final SCC, rotates so a solid tx is last.
-fn order_scc(
-    comp: &[usize],
-    is_final_scc: bool,
-    is_solid: &[bool],
-    has_edge: &impl Fn(usize, usize) -> bool,
-) -> Vec<usize> {
-    if comp.len() <= 1 {
-        return comp.to_vec();
-    }
-
-    let mut cycle = find_hamiltonian_cycle(comp, has_edge);
-
-    if is_final_scc {
-        // Rotate so a solid tx is LAST (pick smallest-index solid tx, deterministic).
-        if let Some(solid_pos) = cycle
-            .iter()
-            .enumerate()
-            .filter(|(_, &tx)| is_solid[tx])
-            .min_by_key(|(_, &tx)| tx)
-            .map(|(pos, _)| pos)
-        {
-            let start = (solid_pos + 1) % cycle.len();
-            let mut rotated = Vec::with_capacity(cycle.len());
-            rotated.extend_from_slice(&cycle[start..]);
-            rotated.extend_from_slice(&cycle[..start]);
-            cycle = rotated;
-        }
-    }
-
-    cycle
+    sccs.reverse();
+    sccs
 }
 
 // =========================================================================
-// Graph construction result
+// Topological sort of SCCs
+// =========================================================================
+
+fn topological_sort_sccs(
+    sccs: &[Vec<u16>],
+    edges: &[Vec<u16>],
+    node_count: usize,
+) -> Vec<usize> {
+    let mut node_to_scc = vec![0usize; node_count];
+    for (scc_idx, scc) in sccs.iter().enumerate() {
+        for &node in scc {
+            node_to_scc[node as usize] = scc_idx;
+        }
+    }
+
+    let scc_n = sccs.len();
+    let mut in_degree = vec![0usize; scc_n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); scc_n];
+    let mut seen: Vec<HashSet<usize>> = vec![HashSet::new(); scc_n];
+
+    for u in 0..node_count {
+        let su = node_to_scc[u];
+        for &v16 in &edges[u] {
+            let sv = node_to_scc[v16 as usize];
+            if su != sv && seen[su].insert(sv) {
+                adj[su].push(sv);
+                in_degree[sv] += 1;
+            }
+        }
+    }
+
+    let mut ready: VecDeque<usize> = VecDeque::new();
+    let mut initial: Vec<usize> = (0..scc_n).filter(|&i| in_degree[i] == 0).collect();
+    initial.sort_unstable();
+    for s in initial {
+        ready.push_back(s);
+    }
+
+    let mut result: Vec<usize> = Vec::with_capacity(scc_n);
+    while let Some(s) = ready.pop_front() {
+        result.push(s);
+        let mut new_ready: Vec<usize> = Vec::new();
+        for &v in &adj[s] {
+            in_degree[v] -= 1;
+            if in_degree[v] == 0 {
+                new_ready.push(v);
+            }
+        }
+        new_ready.sort_unstable();
+        for v in new_ready {
+            ready.push_back(v);
+        }
+    }
+    result
+}
+
+// =========================================================================
+// Hamiltonian path (from original FairnessLayer)
+// =========================================================================
+
+fn hamiltonian_path(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
+    if scc.len() <= 1 {
+        return scc.to_vec();
+    }
+
+    let has_edge = |u: u16, v: u16| -> bool { edges[u as usize].contains(&v) };
+    let mut sorted = scc.to_vec();
+    sorted.sort_unstable();
+
+    let mut path: VecDeque<u16> = VecDeque::new();
+    path.push_back(sorted[0]);
+
+    for &v in &sorted[1..] {
+        if has_edge(v, *path.front().unwrap()) {
+            path.push_front(v);
+        } else if has_edge(*path.back().unwrap(), v) {
+            path.push_back(v);
+        } else {
+            let mut inserted = false;
+            for i in 0..path.len() - 1 {
+                if has_edge(path[i], v) && has_edge(v, path[i + 1]) {
+                    path.insert(i + 1, v);
+                    inserted = true;
+                    break;
+                }
+            }
+            if !inserted {
+                path.push_back(v);
+            }
+        }
+    }
+    path.into_iter().collect()
+}
+
+// =========================================================================
+// Graph construction result (sent from rayon → async loop)
 // =========================================================================
 
 enum GraphResult {
-    /// No non-blank txs or no solid anchor — nothing to finalize.
-    Empty,
-    /// Graph is a tournament (no missing edges). Contains finalized local indices.
-    Finalized(Vec<usize>),
-    /// Graph has missing edges — needs FairUpdate votes.
+    Empty {
+        sub_dag_id: u64,
+    },
+    Finalized {
+        sub_dag_id: u64,
+        tx_order: Vec<TxDigest>,
+    },
     NeedsFairUpdate {
-        /// All non-blank vertex indices from first SCC through anchor.
-        vertex_indices: Vec<usize>,
-        /// Existing directed edges (from, to) in local index space.
-        edges: Vec<(usize, usize)>,
-        /// Missing edge pairs, packed as pair_key (min << 16 | max).
+        sub_dag_id: u64,
+        vertex_indices: Vec<u16>,
+        existing_edges: Vec<(u16, u16)>,
         missing_edges: Vec<u32>,
-        /// Deduplicated vertices involved in missing edges.
         missing_edge_vertices: Vec<u16>,
-        /// Solid classification per local index (up to k).
+        index_to_digest: Vec<TxDigest>,
         is_solid: Vec<bool>,
     },
 }
 
-/// Build a dependency graph from local orderings extracted from a committed subdag.
-///
-/// `indices_sets`: one entry per replica-vertex, each a sequence of local tx indices
-///                 ordered by OI (lower OI = earlier position).
-/// `k`: total number of unique tx digests (size of local index space).
-/// `non_blank_threshold`: minimum support for a tx to be non-blank.
-/// `solid_threshold`: minimum support for a tx to be solid.
-fn build_and_analyze_graph(
-    indices_sets: &[Vec<usize>],
+struct FairUpdateResult {
+    sub_dag_id: u64,
+    tx_order: Vec<TxDigest>,
+}
+
+// =========================================================================
+// Stateless graph construction (runs on rayon / spawn_blocking)
+// =========================================================================
+
+fn build_graph(
+    sub_dag_id: u64,
+    indices_sets: Vec<Vec<usize>>,
     k: usize,
+    index_to_digest: Vec<TxDigest>,
     non_blank_threshold: u8,
     solid_threshold: u8,
 ) -> GraphResult {
+    let start = Instant::now();
+
     if k == 0 || indices_sets.is_empty() {
-        return GraphResult::Empty;
+        return GraphResult::Empty { sub_dag_id };
     }
 
-    // ─── Step 1: Compute support per tx, classify ────────────────────────
+    let t_edge = non_blank_threshold;
+
+    // ─── Step 1: Compute support, classify ───────────────────────────────
     let mut support = vec![0u8; k];
-    for order in indices_sets {
+    for order in &indices_sets {
         for &tx in order {
             support[tx] = support[tx].saturating_add(1);
         }
@@ -419,14 +339,19 @@ fn build_and_analyze_graph(
 
     let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
     if active.is_empty() {
-        return GraphResult::Empty;
+        return GraphResult::Empty { sub_dag_id };
     }
 
-    // ─── Step 2: Compute pairwise weights ────────────────────────────────
-    // weight[i * k + j] = number of replicas where tx i appears before tx j.
-    let mut weight = vec![0u16; k * k];
+    // ─── Step 2: Nibble-packed pairwise weights ──────────────────────────
+    let nibble_bytes = (k * k + 1) / 2;
+    let mut weight = vec![0u8; nibble_bytes];
 
-    for order in indices_sets {
+    #[inline(always)]
+    fn w_idx(i: usize, j: usize, k: usize) -> usize {
+        i * k + j
+    }
+
+    for order in &indices_sets {
         let len = order.len();
         for from_pos in 0..len {
             let from = order[from_pos];
@@ -438,83 +363,94 @@ fn build_and_analyze_graph(
                 if !is_non_blank[to] {
                     continue;
                 }
-                weight[from * k + to] += 1;
+                inc_weight(&mut weight, w_idx(from, to, k));
             }
         }
     }
 
-    // ─── Step 3: Add edges ───────────────────────────────────────────────
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); k];
-    let t_edge = non_blank_threshold as u16;
+    // ─── Step 3: Build edges + dense remapping ───────────────────────────
+    // Remap active nodes to dense 0..active_count for SCC/edges.
+    let active_count = active.len();
+    let mut orig_to_dense = vec![u16::MAX; k];
+    let mut dense_to_orig: Vec<usize> = Vec::with_capacity(active_count);
+    for (di, &ai) in active.iter().enumerate() {
+        orig_to_dense[ai] = di as u16;
+        dense_to_orig.push(ai);
+    }
 
-    for &u in &active {
-        for &v in &active {
-            if u >= v {
-                continue;
-            }
-            let kuv = weight[u * k + v];
-            let kvu = weight[v * k + u];
+    let mut edges: Vec<Vec<u16>> =
+        (0..active_count).map(|_| Vec::with_capacity(16)).collect();
+
+    for i in 0..active_count {
+        let u = dense_to_orig[i];
+        for j in (i + 1)..active_count {
+            let v = dense_to_orig[j];
+            let kuv = get_weight(&weight, w_idx(u, v, k));
+            let kvu = get_weight(&weight, w_idx(v, u, k));
 
             if kuv < t_edge && kvu < t_edge {
-                continue; // Missing edge.
+                continue;
             }
 
             if kuv >= kvu {
-                adj[u].push(v);
+                edges[i].push(j as u16);
             } else {
-                adj[v].push(u);
+                edges[j].push(i as u16);
             }
         }
     }
 
-    // ─── Step 4: SCC decomposition + topo sort ───────────────────────────
-    let (sccs, scc_id) = tarjan_scc_iterative(&adj, &active, k);
+    let t3 = start.elapsed().as_nanos();
+
+    // ─── Step 4: SCC + topo sort ─────────────────────────────────────────
+    let sccs = tarjan_scc_iterative(active_count, &edges);
     if sccs.is_empty() {
-        return GraphResult::Empty;
+        return GraphResult::Empty { sub_dag_id };
     }
 
-    let topo = topo_sort_condensation(&sccs, &adj, &scc_id, &active, &is_non_blank);
+    let topo = topological_sort_sccs(&sccs, &edges, active_count);
 
-    // ─── Step 5: Find anchor (last SCC containing a solid tx) ────────────
+    // ─── Step 5: Find anchor ─────────────────────────────────────────────
     let mut anchor_idx: Option<usize> = None;
     for (idx, &scc_index) in topo.iter().enumerate() {
         let comp = &sccs[scc_index];
-        if comp.iter().any(|&tx| is_solid[tx]) {
+        if comp
+            .iter()
+            .any(|&di| is_solid[dense_to_orig[di as usize]])
+        {
             anchor_idx = Some(idx);
         }
     }
 
     let anchor = match anchor_idx {
         Some(a) => a,
-        None => return GraphResult::Empty,
+        None => return GraphResult::Empty { sub_dag_id },
     };
 
-    // ─── Step 6: Collect all vertices from first SCC through anchor ──────
-    let mut graph_vertices: Vec<usize> = Vec::new();
-    let mut in_graph = vec![false; k];
+    // ─── Step 6: Collect graph vertices + find missing edges ─────────────
+    let mut in_graph = vec![false; active_count];
     for topo_pos in 0..=anchor {
         let comp = &sccs[topo[topo_pos]];
-        for &tx in comp {
-            graph_vertices.push(tx);
-            in_graph[tx] = true;
+        for &di in comp {
+            in_graph[di as usize] = true;
         }
     }
 
-    // ─── Step 7: Find missing edges among graph vertices ─────────────────
-    // Only shaded pairs can have missing edges.
-    let shaded_in_graph: Vec<usize> = graph_vertices
-        .iter()
-        .copied()
-        .filter(|&u| !is_solid[u])
+    let shaded_in_graph: Vec<u16> = (0..active_count as u16)
+        .filter(|&di| {
+            in_graph[di as usize] && !is_solid[dense_to_orig[di as usize]]
+        })
         .collect();
 
     let mut missing_edges: Vec<u32> = Vec::new();
     for i in 0..shaded_in_graph.len() {
         let u = shaded_in_graph[i];
+        let u_orig = dense_to_orig[u as usize];
         for j in (i + 1)..shaded_in_graph.len() {
             let v = shaded_in_graph[j];
-            let kuv = weight[u * k + v];
-            let kvu = weight[v * k + u];
+            let v_orig = dense_to_orig[v as usize];
+            let kuv = get_weight(&weight, w_idx(u_orig, v_orig, k));
+            let kvu = get_weight(&weight, w_idx(v_orig, u_orig, k));
             if kuv < t_edge && kvu < t_edge {
                 let (a, b) = if u < v { (u, v) } else { (v, u) };
                 missing_edges.push(((a as u32) << 16) | (b as u32));
@@ -522,59 +458,205 @@ fn build_and_analyze_graph(
         }
     }
 
-    // ─── Step 8: Finalize or park ────────────────────────────────────────
-    if missing_edges.is_empty() {
-        // Tournament — finalize the entire graph.
-        let has_edge_fn = |u: usize, v: usize| -> bool {
-            let kuv = weight[u * k + v];
-            let kvu = weight[v * k + u];
-            if kuv < t_edge && kvu < t_edge {
-                return false;
-            }
-            kuv >= kvu
-        };
+    let t6 = start.elapsed().as_nanos();
 
-        let mut finalized: Vec<usize> = Vec::new();
+    // ─── Step 7: Finalize or park ────────────────────────────────────────
+    if missing_edges.is_empty() {
+        let mut finalized: Vec<TxDigest> = Vec::new();
         for (idx, &scc_index) in topo.iter().enumerate() {
             if idx > anchor {
                 break;
             }
             let comp = &sccs[scc_index];
-            let is_final = idx == anchor;
-            let ordered = order_scc(comp, is_final, &is_solid, &has_edge_fn);
-            finalized.extend(ordered);
+            let path = hamiltonian_path(comp, &edges);
+            for &di in &path {
+                finalized.push(index_to_digest[dense_to_orig[di as usize]]);
+            }
         }
 
-        GraphResult::Finalized(finalized)
+        info!(
+            "FAIRDAG_TIMING: sub_dag_id={} FINALIZED: k={} active={} txs={} \
+             edges={}ns scc+finalize={}ns total={}ns",
+            sub_dag_id, k, active_count, finalized.len(),
+            t3, t6, start.elapsed().as_nanos()
+        );
+
+        GraphResult::Finalized {
+            sub_dag_id,
+            tx_order: finalized,
+        }
     } else {
-        // Collect existing directed edges within the graph.
-        let mut edge_list: Vec<(usize, usize)> = Vec::new();
-        for &u in &graph_vertices {
-            for &v in &adj[u] {
-                if in_graph[v] {
-                    edge_list.push((u, v));
+        // Collect existing edges and vertex info for parking.
+        let mut vertex_indices: Vec<u16> = Vec::new();
+        let mut existing_edges_list: Vec<(u16, u16)> = Vec::new();
+        for topo_pos in 0..=anchor {
+            let comp = &sccs[topo[topo_pos]];
+            for &di in comp {
+                vertex_indices.push(di);
+            }
+        }
+        for &di in &vertex_indices {
+            for &dv in &edges[di as usize] {
+                if in_graph[dv as usize] {
+                    existing_edges_list.push((di, dv));
                 }
             }
         }
 
-        // Deduplicate vertices involved in missing edges.
         let mut missing_edge_vertices: Vec<u16> = Vec::new();
         for &packed in &missing_edges {
-            let u = (packed >> 16) as u16;
-            let v = (packed & 0xFFFF) as u16;
-            missing_edge_vertices.push(u);
-            missing_edge_vertices.push(v);
+            missing_edge_vertices.push((packed >> 16) as u16);
+            missing_edge_vertices.push((packed & 0xFFFF) as u16);
         }
         missing_edge_vertices.sort_unstable();
         missing_edge_vertices.dedup();
 
+        // Map is_solid to dense space.
+        let is_solid_dense: Vec<bool> = (0..active_count)
+            .map(|di| is_solid[dense_to_orig[di]])
+            .collect();
+
+        // Map index_to_digest through dense mapping.
+        let dense_to_digest: Vec<TxDigest> = (0..active_count)
+            .map(|di| index_to_digest[dense_to_orig[di]])
+            .collect();
+
+        info!(
+            "FAIRDAG_TIMING: sub_dag_id={} PARKED: k={} active={} vertices={} \
+             existing_edges={} missing={} total={}ns",
+            sub_dag_id, k, active_count, vertex_indices.len(),
+            existing_edges_list.len(), missing_edges.len(), start.elapsed().as_nanos()
+        );
+
         GraphResult::NeedsFairUpdate {
-            vertex_indices: graph_vertices,
-            edges: edge_list,
+            sub_dag_id,
+            vertex_indices,
+            existing_edges: existing_edges_list,
             missing_edges,
             missing_edge_vertices,
-            is_solid,
+            index_to_digest: dense_to_digest,
+            is_solid: is_solid_dense,
         }
+    }
+}
+
+// =========================================================================
+// FairUpdate application (runs on rayon / spawn_blocking)
+// =========================================================================
+
+fn apply_fair_update(
+    sub_dag_id: u64,
+    vertex_indices: Vec<u16>,
+    existing_edges: Vec<(u16, u16)>,
+    missing_edges: Vec<u32>,
+    index_to_digest: Vec<TxDigest>,
+    is_solid: Vec<bool>,
+    votes: HashMap<PublicKey, Vec<u32>>,
+    non_blank_threshold: u8,
+    solid_threshold: u8,
+) -> FairUpdateResult {
+    let start = Instant::now();
+
+    let k = index_to_digest.len();
+
+    let mut edge_set: HashSet<(u16, u16)> = existing_edges.into_iter().collect();
+
+    let mut vote_weight: HashMap<(u16, u16), u16> = HashMap::new();
+    let mut tx_author_count: HashMap<u16, HashSet<usize>> = HashMap::new();
+
+    for (author_idx, (_author, directed_edges)) in votes.iter().enumerate() {
+        for &packed in directed_edges {
+            let from = (packed >> 16) as u16;
+            let to = (packed & 0xFFFF) as u16;
+            *vote_weight.entry((from, to)).or_insert(0) += 1;
+            tx_author_count
+                .entry(from)
+                .or_default()
+                .insert(author_idx);
+            tx_author_count
+                .entry(to)
+                .or_default()
+                .insert(author_idx);
+        }
+    }
+
+    let t_edge = non_blank_threshold as u16;
+    let t_solid = solid_threshold as u16;
+    let mut new_edges_count = 0;
+
+    for &packed in &missing_edges {
+        let u = (packed >> 16) as u16;
+        let v = (packed & 0xFFFF) as u16;
+
+        if edge_set.contains(&(u, v)) || edge_set.contains(&(v, u)) {
+            continue;
+        }
+
+        let kuv = vote_weight.get(&(u, v)).copied().unwrap_or(0);
+        let kvu = vote_weight.get(&(v, u)).copied().unwrap_or(0);
+
+        let u_in_enough = tx_author_count
+            .get(&u)
+            .map(|s| s.len() as u16 >= t_solid)
+            .unwrap_or(false);
+        let v_in_enough = tx_author_count
+            .get(&v)
+            .map(|s| s.len() as u16 >= t_solid)
+            .unwrap_or(false);
+
+        if kuv >= kvu {
+            if u_in_enough && kuv >= t_edge {
+                edge_set.insert((u, v));
+                new_edges_count += 1;
+            }
+        } else {
+            if v_in_enough && kvu >= t_edge {
+                edge_set.insert((v, u));
+                new_edges_count += 1;
+            }
+        }
+    }
+
+    // Build adjacency for SCC.
+    let active_count = vertex_indices.len();
+    let mut remap = vec![u16::MAX; k];
+    let mut unmap: Vec<u16> = Vec::with_capacity(active_count);
+    for (i, &v) in vertex_indices.iter().enumerate() {
+        remap[v as usize] = i as u16;
+        unmap.push(v);
+    }
+
+    let mut scc_edges: Vec<Vec<u16>> =
+        (0..active_count).map(|_| Vec::with_capacity(16)).collect();
+    for &(u, v) in &edge_set {
+        let ru = remap[u as usize];
+        let rv = remap[v as usize];
+        if ru != u16::MAX && rv != u16::MAX {
+            scc_edges[ru as usize].push(rv);
+        }
+    }
+
+    let sccs = tarjan_scc_iterative(active_count, &scc_edges);
+    let topo = topological_sort_sccs(&sccs, &scc_edges, active_count);
+
+    let mut finalized: Vec<TxDigest> = Vec::new();
+    for &scc_index in &topo {
+        let comp = &sccs[scc_index];
+        let path = hamiltonian_path(comp, &scc_edges);
+        for &ri in &path {
+            let orig_v = unmap[ri as usize];
+            finalized.push(index_to_digest[orig_v as usize]);
+        }
+    }
+
+    info!(
+        "FAIRDAG_TIMING: sub_dag_id={} FairUpdate: new_edges={} finalized={} {}ms",
+        sub_dag_id, new_edges_count, finalized.len(), start.elapsed().as_millis()
+    );
+
+    FairUpdateResult {
+        sub_dag_id,
+        tx_order: finalized,
     }
 }
 
@@ -583,15 +665,10 @@ fn build_and_analyze_graph(
 // =========================================================================
 
 struct ParkedGraph {
-    /// All non-blank vertex indices (local index space) from first SCC through anchor.
-    vertex_indices: Vec<usize>,
-    /// Existing directed edges (from, to) in local index space.
-    edges: Vec<(usize, usize)>,
-    /// Missing edge pairs, packed as (min << 16 | max).
+    vertex_indices: Vec<u16>,
+    existing_edges: Vec<(u16, u16)>,
     missing_edges: Vec<u32>,
-    /// Local index → TxDigest mapping for the entire subdag.
     index_to_digest: Vec<TxDigest>,
-    /// Solid classification per local index.
     is_solid: Vec<bool>,
 }
 
@@ -603,7 +680,6 @@ pub struct FairDagProcessor {
     store: Store,
     sorted_keys: Vec<PublicKey>,
 
-    // Thresholds (computed from committee config).
     n: usize,
     f: usize,
     non_blank_threshold: u8,
@@ -611,23 +687,21 @@ pub struct FairDagProcessor {
 
     rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
 
-    /// Channel to notify BatchMaker of missing edges.
     tx_fair_propose: Sender<FairProposeMessage>,
 
-    /// Parked graphs awaiting FairUpdate votes, keyed by sub_dag_id.
-    parked_graphs: HashMap<u64, ParkedGraph>,
+    /// Channel: spawn_blocking graph-build tasks → async loop.
+    rx_graph_results: tokio::sync::mpsc::Receiver<GraphResult>,
+    tx_graph_results: tokio::sync::mpsc::Sender<GraphResult>,
 
-    /// Pending FairUpdate votes: sub_dag_id → (replica PublicKey → directed edges).
+    /// Channel: spawn_blocking FairUpdate tasks → async loop.
+    rx_update_results: tokio::sync::mpsc::Receiver<FairUpdateResult>,
+    tx_update_results: tokio::sync::mpsc::Sender<FairUpdateResult>,
+
+    parked_graphs: HashMap<u64, ParkedGraph>,
     pending_votes: HashMap<u64, HashMap<PublicKey, Vec<u32>>>,
 
-    /// Monotonically increasing sub-dag counter (1-indexed).
     sub_dag_count: u64,
-
-    /// Next sub_dag_id to output in sequential order.
     next_to_finalize: u64,
-
-    /// Results ready to finalize, keyed by sub_dag_id.
-    /// Value is the ordered list of TxDigests.
     ready_to_finalize: BTreeMap<u64, Vec<TxDigest>>,
 }
 
@@ -656,7 +730,9 @@ impl FairDagProcessor {
             n, f, gamma, non_blank_threshold, solid_threshold
         );
 
-        // Spawn with panic propagation.
+        let (tx_graph_results, rx_graph_results) = tokio::sync::mpsc::channel(1024);
+        let (tx_update_results, rx_update_results) = tokio::sync::mpsc::channel(1024);
+
         let handle = tokio::spawn(async move {
             Self {
                 store,
@@ -667,10 +743,14 @@ impl FairDagProcessor {
                 solid_threshold,
                 rx_committed_subdags,
                 tx_fair_propose,
+                rx_graph_results,
+                tx_graph_results,
+                rx_update_results,
+                tx_update_results,
                 parked_graphs: HashMap::new(),
                 pending_votes: HashMap::new(),
                 sub_dag_count: 0,
-                next_to_finalize: 1, // 1-indexed
+                next_to_finalize: 1,
                 ready_to_finalize: BTreeMap::new(),
             }
             .run()
@@ -686,99 +766,160 @@ impl FairDagProcessor {
     }
 
     // =====================================================================
-    // Main loop
+    // Main async loop — never blocks on CPU work
     // =====================================================================
 
     async fn run(&mut self) {
-        while let Some((leader_round, certificates)) = self.rx_committed_subdags.recv().await {
-            let batch_start = Instant::now();
+        loop {
+            tokio::select! {
+                // ─────────────────────────────────────────────────────────
+                // Arm 1: Receive committed subdag
+                // → Async extraction (store reads)
+                // → Spawn graph build on blocking thread
+                // ─────────────────────────────────────────────────────────
+                Some((leader_round, certificates)) = self.rx_committed_subdags.recv() => {
+                    self.sub_dag_count += 1;
+                    let sub_dag_id = self.sub_dag_count;
+                    let extract_start = Instant::now();
 
-            // Drain all queued subdags into a batch.
-            let mut batch_raw: Vec<(Round, Vec<Certificate>)> =
-                vec![(leader_round, certificates)];
-            while let Ok((r, c)) = self.rx_committed_subdags.try_recv() {
-                batch_raw.push((r, c));
-            }
+                    let (indices_sets, index_to_digest, extracted_votes) =
+                        self.extract_subdag_and_votes(leader_round, &certificates).await;
 
-            let batch_size = batch_raw.len();
-            info!(
-                "FAIRDAG_TIMING: processing {} subdags in batch",
-                batch_size
-            );
+                    let k = index_to_digest.len();
+                    info!(
+                        "FAIRDAG_TIMING: sub_dag_id={} extract: {}ms k={} replicas={} votes={}",
+                        sub_dag_id, extract_start.elapsed().as_millis(),
+                        k, indices_sets.len(), extracted_votes.len()
+                    );
 
-            for (round, certs) in batch_raw {
-                self.sub_dag_count += 1;
-                let sub_dag_id = self.sub_dag_count;
-                let sd_start = Instant::now();
-
-                // Extract ordering entries + FairUpdate votes from committed batches.
-                let (indices_sets, index_to_digest, extracted_votes) =
-                    self.extract_subdag_and_votes(round, &certs).await;
-
-                let k = index_to_digest.len();
-                let extract_ms = sd_start.elapsed().as_millis();
-
-                info!(
-                    "FAIRDAG_TIMING: sub_dag_id={} extract done: {}ms, k={}, replicas={}, votes_found={}",
-                    sub_dag_id, extract_ms, k, indices_sets.len(), extracted_votes.len()
-                );
-
-                // Aggregate extracted votes into pending_votes.
-                for (author, vote) in &extracted_votes {
-                    let decompressed =
-                        unpack_and_decompress_edges(&vote.directed_edges_compressed, vote.edge_count);
-                    if !decompressed.is_empty() {
-                        debug!(
-                            "FairUpdate: extracted {} votes for sub_dag_id={} from {:?}",
-                            decompressed.len(),
-                            vote.sub_dag_id,
-                            author
+                    // Aggregate extracted FairUpdate votes.
+                    for (author, vote) in extracted_votes {
+                        let decompressed = unpack_and_decompress_edges(
+                            &vote.directed_edges_compressed,
+                            vote.edge_count,
                         );
-                        self.pending_votes
-                            .entry(vote.sub_dag_id)
-                            .or_default()
-                            .insert(*author, decompressed);
+                        if !decompressed.is_empty() {
+                            self.pending_votes
+                                .entry(vote.sub_dag_id)
+                                .or_default()
+                                .insert(author, decompressed);
+                        }
                     }
-                }
 
-                // Check if any parked graphs now have quorum.
-                self.try_resolve_parked_graphs().await;
+                    // Check if any parked graphs now have quorum.
+                    self.try_resolve_parked_graphs().await;
 
-                // Build dependency graph for this subdag.
-                self.process_new_subdag(sub_dag_id, &indices_sets, k, index_to_digest)
-                    .await;
+                    // Spawn graph construction on blocking thread.
+                    let tx = self.tx_graph_results.clone();
+                    let nbt = self.non_blank_threshold;
+                    let st = self.solid_threshold;
 
-                // Output finalized results in sequential order.
-                self.try_finalize_sequential();
+                    tokio::task::spawn_blocking(move || {
+                        let result = build_graph(
+                            sub_dag_id,
+                            indices_sets,
+                            k,
+                            index_to_digest,
+                            nbt,
+                            st,
+                        );
+                        let _ = tx.blocking_send(result);
+                    });
+                },
+
+                // ─────────────────────────────────────────────────────────
+                // Arm 2: Graph construction result from blocking thread
+                // ─────────────────────────────────────────────────────────
+                Some(result) = self.rx_graph_results.recv() => {
+                    match result {
+                        GraphResult::Empty { sub_dag_id } => {
+                            debug!("sub_dag_id={}: empty graph", sub_dag_id);
+                            self.ready_to_finalize.insert(sub_dag_id, vec![]);
+                        }
+                        GraphResult::Finalized { sub_dag_id, tx_order } => {
+                            info!(
+                                "sub_dag_id={}: finalized immediately, {} txs",
+                                sub_dag_id, tx_order.len()
+                            );
+                            self.ready_to_finalize.insert(sub_dag_id, tx_order);
+                        }
+                        GraphResult::NeedsFairUpdate {
+                            sub_dag_id,
+                            vertex_indices,
+                            existing_edges,
+                            missing_edges,
+                            missing_edge_vertices,
+                            index_to_digest,
+                            is_solid,
+                        } => {
+                            info!(
+                                "sub_dag_id={}: parking, {} vertices, {} missing edges",
+                                sub_dag_id, vertex_indices.len(), missing_edges.len()
+                            );
+
+                            // Notify BatchMaker: vertex→digest for missing edge vertices.
+                            let vertices_with_digests: Vec<(u16, u64)> = missing_edge_vertices
+                                .iter()
+                                .map(|&v| (v, index_to_digest[v as usize]))
+                                .collect();
+
+                            self.parked_graphs.insert(
+                                sub_dag_id,
+                                ParkedGraph {
+                                    vertex_indices,
+                                    existing_edges,
+                                    missing_edges: missing_edges.clone(),
+                                    index_to_digest,
+                                    is_solid,
+                                },
+                            );
+
+                            let _ = self
+                                .tx_fair_propose
+                                .send((sub_dag_id, vertices_with_digests, missing_edges))
+                                .await;
+                        }
+                    }
+
+                    self.try_finalize_sequential();
+                },
+
+                // ─────────────────────────────────────────────────────────
+                // Arm 3: FairUpdate result from blocking thread
+                // ─────────────────────────────────────────────────────────
+                Some(result) = self.rx_update_results.recv() => {
+                    info!(
+                        "sub_dag_id={}: FairUpdate complete, {} txs",
+                        result.sub_dag_id, result.tx_order.len()
+                    );
+                    self.ready_to_finalize
+                        .insert(result.sub_dag_id, result.tx_order);
+
+                    // Cleanup signal to BatchMaker.
+                    let _ = self
+                        .tx_fair_propose
+                        .send((result.sub_dag_id, vec![], vec![]))
+                        .await;
+
+                    self.try_finalize_sequential();
+                },
             }
-
-            info!(
-                "FAIRDAG_TIMING: batch done in {}ms, next_to_finalize={}, parked={}",
-                batch_start.elapsed().as_millis(),
-                self.next_to_finalize,
-                self.parked_graphs.len()
-            );
         }
     }
 
     // =====================================================================
-    // Subdag extraction
+    // Subdag extraction (async — store reads)
     // =====================================================================
 
-    /// Extract per-replica ordering sequences and FairUpdate votes from
-    /// committed certificates/batches.
-    ///
-    /// Returns:
-    ///   - indices_sets: one ordered list of local tx indices per replica-vertex
-    ///   - index_to_digest: local index → TxDigest
-    ///   - extracted_votes: (author, FairUpdateVote) from embedded vote payloads
     async fn extract_subdag_and_votes(
         &self,
         _leader_round: Round,
         certificates: &[Certificate],
-    ) -> (Vec<Vec<usize>>, Vec<TxDigest>, Vec<(PublicKey, FairUpdateVote)>) {
-        // Group ordering entries by replica, merge across rounds.
-        // Key: replica_index, Value: Vec<(tx_digest, oi)>
+    ) -> (
+        Vec<Vec<usize>>,
+        Vec<TxDigest>,
+        Vec<(PublicKey, FairUpdateVote)>,
+    ) {
         let mut per_replica: HashMap<usize, Vec<(TxDigest, u64)>> = HashMap::new();
         let mut extracted_votes: Vec<(PublicKey, FairUpdateVote)> = Vec::new();
 
@@ -801,13 +942,15 @@ impl FairDagProcessor {
                                     let tx_id = extract_tx_digest(&tx_bytes);
                                     entries.push((tx_id, oi));
                                 }
-                                // Extract FairUpdate votes.
                                 for vote in votes {
                                     extracted_votes.push((author, vote));
                                 }
                             }
                             Ok(_) => {
-                                warn!("Unexpected WorkerMessage type for batch {:?}", batch_digest);
+                                warn!(
+                                    "Unexpected WorkerMessage type for batch {:?}",
+                                    batch_digest
+                                );
                             }
                             Err(e) => {
                                 error!("Deser fail batch {:?}: {}", batch_digest, e);
@@ -824,7 +967,7 @@ impl FairDagProcessor {
             }
         }
 
-        // Deduplicate per replica: sort by OI, keep first occurrence of each digest.
+        // Dedup per replica: sort by OI, keep first occurrence.
         for entries in per_replica.values_mut() {
             entries.sort_by_key(|&(_, oi)| oi);
             let mut seen = HashSet::new();
@@ -835,7 +978,6 @@ impl FairDagProcessor {
         let mut digest_to_index: HashMap<TxDigest, usize> = HashMap::new();
         let mut index_to_digest: Vec<TxDigest> = Vec::new();
 
-        // Sort replicas for deterministic ordering.
         let mut replica_indices: Vec<usize> = per_replica.keys().copied().collect();
         replica_indices.sort_unstable();
 
@@ -863,103 +1005,12 @@ impl FairDagProcessor {
     }
 
     // =====================================================================
-    // New subdag processing
-    // =====================================================================
-
-    async fn process_new_subdag(
-        &mut self,
-        sub_dag_id: u64,
-        indices_sets: &[Vec<usize>],
-        k: usize,
-        index_to_digest: Vec<TxDigest>,
-    ) {
-        let start = Instant::now();
-
-        let result = build_and_analyze_graph(
-            indices_sets,
-            k,
-            self.non_blank_threshold,
-            self.solid_threshold,
-        );
-
-        match result {
-            GraphResult::Empty => {
-                info!(
-                    "sub_dag_id={}: empty graph (no non-blank or no solid anchor), {}ms",
-                    sub_dag_id,
-                    start.elapsed().as_millis()
-                );
-                // Mark as ready with empty result.
-                self.ready_to_finalize.insert(sub_dag_id, vec![]);
-            }
-            GraphResult::Finalized(local_order) => {
-                let tx_order: Vec<TxDigest> =
-                    local_order.iter().map(|&i| index_to_digest[i]).collect();
-                info!(
-                    "sub_dag_id={}: finalized immediately, {} txs, {}ms",
-                    sub_dag_id,
-                    tx_order.len(),
-                    start.elapsed().as_millis()
-                );
-                self.ready_to_finalize.insert(sub_dag_id, tx_order);
-            }
-            GraphResult::NeedsFairUpdate {
-                vertex_indices,
-                edges,
-                missing_edges,
-                missing_edge_vertices,
-                is_solid,
-            } => {
-                info!(
-                    "sub_dag_id={}: parking graph, {} vertices, {} edges, {} missing, {}ms",
-                    sub_dag_id,
-                    vertex_indices.len(),
-                    edges.len(),
-                    missing_edges.len(),
-                    start.elapsed().as_millis()
-                );
-
-                // Build the notification for BatchMaker.
-                let vertices_with_digests: Vec<(u16, u64)> = missing_edge_vertices
-                    .iter()
-                    .map(|&v| (v, index_to_digest[v as usize]))
-                    .collect();
-
-                // Park the graph.
-                self.parked_graphs.insert(
-                    sub_dag_id,
-                    ParkedGraph {
-                        vertex_indices,
-                        edges,
-                        missing_edges: missing_edges.clone(),
-                        index_to_digest,
-                        is_solid,
-                    },
-                );
-
-                // Notify BatchMaker.
-                if let Err(e) = self
-                    .tx_fair_propose
-                    .send((sub_dag_id, vertices_with_digests, missing_edges))
-                    .await
-                {
-                    error!(
-                        "sub_dag_id={}: failed to send FairPropose to BatchMaker: {}",
-                        sub_dag_id, e
-                    );
-                }
-            }
-        }
-    }
-
-    // =====================================================================
-    // FairUpdate: resolve parked graphs
+    // FairUpdate: check + resolve parked graphs
     // =====================================================================
 
     async fn try_resolve_parked_graphs(&mut self) {
         let quorum = self.n - self.f;
 
-        // Find parked graphs that now have enough votes.
         let ready_ids: Vec<u64> = self
             .parked_graphs
             .keys()
@@ -973,172 +1024,45 @@ impl FairDagProcessor {
             .collect();
 
         for sub_dag_id in ready_ids {
-            self.apply_fair_update(sub_dag_id).await;
-        }
-    }
-
-    async fn apply_fair_update(&mut self, sub_dag_id: u64) {
-        let start = Instant::now();
-
-        let parked = match self.parked_graphs.remove(&sub_dag_id) {
-            Some(p) => p,
-            None => return,
-        };
-
-        let votes = match self.pending_votes.remove(&sub_dag_id) {
-            Some(v) => v,
-            None => {
-                // Shouldn't happen if we checked quorum, but be safe.
-                self.parked_graphs.insert(sub_dag_id, parked);
-                return;
-            }
-        };
-
-        info!(
-            "sub_dag_id={}: applying FairUpdate with {} replica votes, {} missing edges",
-            sub_dag_id,
-            votes.len(),
-            parked.missing_edges.len()
-        );
-
-        let k = parked.index_to_digest.len();
-
-        // Build edge set from existing edges.
-        let mut edge_set: HashSet<(usize, usize)> = parked.edges.iter().copied().collect();
-
-        // Tally directed votes per missing edge pair.
-        // Also track how many replicas voted on edges involving each vertex
-        // (the "tx ∈_{n-2f} L_updates" condition).
-        let mut vote_weight: HashMap<(usize, usize), u16> = HashMap::new();
-        let mut tx_author_count: HashMap<usize, HashSet<usize>> = HashMap::new();
-
-        for (author_idx, (_author, directed_edges)) in votes.iter().enumerate() {
-            for &packed in directed_edges {
-                let from = (packed >> 16) as usize;
-                let to = (packed & 0xFFFF) as usize;
-                *vote_weight.entry((from, to)).or_insert(0) += 1;
-                tx_author_count
-                    .entry(from)
-                    .or_default()
-                    .insert(author_idx);
-                tx_author_count
-                    .entry(to)
-                    .or_default()
-                    .insert(author_idx);
-            }
-        }
-
-        let t_edge = self.non_blank_threshold as u16;
-        let t_solid = self.solid_threshold as u16;
-        let mut new_edges_count = 0;
-
-        for &packed in &parked.missing_edges {
-            let u = (packed >> 16) as usize;
-            let v = (packed & 0xFFFF) as usize;
-
-            // Skip if edge was already resolved somehow.
-            if edge_set.contains(&(u, v)) || edge_set.contains(&(v, u)) {
-                continue;
-            }
-
-            let kuv = vote_weight.get(&(u, v)).copied().unwrap_or(0);
-            let kvu = vote_weight.get(&(v, u)).copied().unwrap_or(0);
-
-            let u_in_enough = tx_author_count
-                .get(&u)
-                .map(|s| s.len() as u16 >= t_solid)
-                .unwrap_or(false);
-            let v_in_enough = tx_author_count
-                .get(&v)
-                .map(|s| s.len() as u16 >= t_solid)
-                .unwrap_or(false);
-
-            // Per FairUpdate: direction with higher weight wins,
-            // but source must be in enough updates and weight must meet threshold.
-            if kuv >= kvu {
-                if u_in_enough && kuv >= t_edge {
-                    edge_set.insert((u, v));
-                    new_edges_count += 1;
-                }
-            } else {
-                if v_in_enough && kvu >= t_edge {
-                    edge_set.insert((v, u));
-                    new_edges_count += 1;
-                }
-            }
-        }
-
-        info!(
-            "sub_dag_id={}: FairUpdate added {} new edges, total edges={}, {}ms",
-            sub_dag_id,
-            new_edges_count,
-            edge_set.len(),
-            start.elapsed().as_millis()
-        );
-
-        // Build adjacency from edge_set for SCC/finalization.
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); k];
-        for &(u, v) in &edge_set {
-            adj[u].push(v);
-        }
-
-        let is_non_blank: Vec<bool> = {
-            let mut nb = vec![false; k];
-            for &v in &parked.vertex_indices {
-                nb[v] = true;
-            }
-            nb
-        };
-
-        // SCC decomposition on the updated graph.
-        let (sccs, scc_id) =
-            tarjan_scc_iterative(&adj, &parked.vertex_indices, k);
-
-        let topo = topo_sort_condensation(
-            &sccs,
-            &adj,
-            &scc_id,
-            &parked.vertex_indices,
-            &is_non_blank,
-        );
-
-        // Finalize via Hamiltonian path per SCC.
-        let has_edge_fn = |u: usize, v: usize| -> bool { edge_set.contains(&(u, v)) };
-
-        let mut finalized_indices: Vec<usize> = Vec::new();
-        for (idx, &scc_index) in topo.iter().enumerate() {
-            let comp = &sccs[scc_index];
-            // Determine if this is the "last" SCC for rotation purposes.
-            // Use: last SCC in topo order that contains a solid tx.
-            let is_final = {
-                let mut last_solid = 0;
-                for (j, &si) in topo.iter().enumerate() {
-                    if sccs[si].iter().any(|&tx| parked.is_solid[tx]) {
-                        last_solid = j;
-                    }
-                }
-                idx == last_solid
+            let parked = match self.parked_graphs.remove(&sub_dag_id) {
+                Some(p) => p,
+                None => continue,
             };
-            let ordered = order_scc(comp, is_final, &parked.is_solid, &has_edge_fn);
-            finalized_indices.extend(ordered);
+            let votes = match self.pending_votes.remove(&sub_dag_id) {
+                Some(v) => v,
+                None => {
+                    self.parked_graphs.insert(sub_dag_id, parked);
+                    continue;
+                }
+            };
+
+            info!(
+                "sub_dag_id={}: spawning FairUpdate, {} votes, {} missing edges",
+                sub_dag_id,
+                votes.len(),
+                parked.missing_edges.len()
+            );
+
+            // Spawn on blocking thread.
+            let tx = self.tx_update_results.clone();
+            let nbt = self.non_blank_threshold;
+            let st = self.solid_threshold;
+
+            tokio::task::spawn_blocking(move || {
+                let result = apply_fair_update(
+                    sub_dag_id,
+                    parked.vertex_indices,
+                    parked.existing_edges,
+                    parked.missing_edges,
+                    parked.index_to_digest,
+                    parked.is_solid,
+                    votes,
+                    nbt,
+                    st,
+                );
+                let _ = tx.blocking_send(result);
+            });
         }
-
-        let tx_order: Vec<TxDigest> = finalized_indices
-            .iter()
-            .map(|&i| parked.index_to_digest[i])
-            .collect();
-
-        info!(
-            "sub_dag_id={}: FairUpdate+Finalize complete, {} txs, {}ms",
-            sub_dag_id,
-            tx_order.len(),
-            start.elapsed().as_millis()
-        );
-
-        self.ready_to_finalize.insert(sub_dag_id, tx_order);
-
-        // Send cleanup signal to BatchMaker.
-        let _ = self.tx_fair_propose.send((sub_dag_id, vec![], vec![])).await;
     }
 
     // =====================================================================
@@ -1156,12 +1080,12 @@ impl FairDagProcessor {
                         tx_order.len()
                     );
                     for tx_id in &tx_order {
+                        // This log line is parsed by logs.py — DO NOT CHANGE FORMAT.
                         info!("FairDAG-RL ordered transaction: {}", tx_id);
                     }
                 } else {
                     debug!("FairDAG: sub_dag_id={} finalized (empty)", id);
                 }
-
                 self.next_to_finalize += 1;
             } else {
                 break;
