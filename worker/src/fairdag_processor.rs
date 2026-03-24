@@ -86,7 +86,7 @@ pub struct FairDagProcessor {
 
 impl FairDagProcessor {
     pub fn spawn(
-        committee: Committee,
+        mut committee: Committee,
         store: Store,
         rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
         fault_threshold: u64,
