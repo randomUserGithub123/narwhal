@@ -148,6 +148,79 @@ fn tarjan_scc(adj: &[Vec<usize>], active: &[usize], k: usize) -> (Vec<Vec<usize>
     (sccs, scc_id)
 }
 
+fn tarjan_scc_iterative(
+    adj: &[Vec<usize>],
+    active: &[usize],
+    k: usize,
+) -> (Vec<Vec<usize>>, Vec<i32>) {
+    let mut dfn = vec![0i32; k];
+    let mut low = vec![0i32; k];
+    let mut on_stack = vec![false; k];
+    let mut scc_id = vec![-1i32; k];
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    let mut index_counter = 0;
+    let mut stack: Vec<usize> = Vec::new();   // Tarjan stack (SCCs)
+    let mut dfs_stack: Vec<(usize, usize)> = Vec::new(); // (node, next_child_index)
+
+    for &start in active {
+        if dfn[start] != 0 {
+            continue;
+        }
+
+        // Start DFS from `start`
+        dfs_stack.push((start, 0));
+        while let Some((u, mut i)) = dfs_stack.pop() {
+            if i == 0 {
+                // First time visiting u
+                index_counter += 1;
+                dfn[u] = index_counter;
+                low[u] = index_counter;
+                stack.push(u);
+                on_stack[u] = true;
+            }
+
+            // Process children
+            if i < adj[u].len() {
+                let v = adj[u][i];
+                i += 1;
+                dfs_stack.push((u, i)); // resume u after this child
+
+                if dfn[v] == 0 {
+                    // v not visited -> push it onto the DFS stack
+                    dfs_stack.push((v, 0));
+                } else if on_stack[v] && dfn[v] < low[u] {
+                    // back edge
+                    low[u] = low[u].min(dfn[v]);
+                }
+            } else {
+                // All children processed; check if u is root of an SCC
+                if low[u] == dfn[u] {
+                    let mut component = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on_stack[w] = false;
+                        scc_id[w] = sccs.len() as i32;
+                        component.push(w);
+                        if w == u {
+                            break;
+                        }
+                    }
+                    sccs.push(component);
+                }
+                // Propagate low value to parent (if any)
+                if let Some((parent, _)) = dfs_stack.last_mut() {
+                    let p = *parent;
+                    if low[u] < low[p] {
+                        low[p] = low[p].min(low[u]);
+                    }
+                }
+            }
+        }
+    }
+
+    (sccs, scc_id)
+}
+
 /// Topological sort of the SCC condensation graph.
 fn topo_sort_condensation(
     sccs: &[Vec<usize>],
@@ -395,7 +468,7 @@ fn build_and_analyze_graph(
     }
 
     // ─── Step 4: SCC decomposition + topo sort ───────────────────────────
-    let (sccs, scc_id) = tarjan_scc(&adj, &active, k);
+    let (sccs, scc_id) = tarjan_scc_iterative(&adj, &active, k);
     if sccs.is_empty() {
         return GraphResult::Empty;
     }
@@ -1019,7 +1092,7 @@ impl FairDagProcessor {
 
         // SCC decomposition on the updated graph.
         let (sccs, scc_id) =
-            tarjan_scc(&adj, &parked.vertex_indices, k);
+            tarjan_scc_iterative(&adj, &parked.vertex_indices, k);
 
         let topo = topo_sort_condensation(
             &sccs,
