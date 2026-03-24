@@ -1,14 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Modified for FairDAG-RL: uses shared LocalOrderTracker to assign ordering
-// indicators based on first-arrival time (regardless of source).
+// Modified for FairDAG-RL v6: explicit missing-edge updates with lz4 compression.
 //
-// FairDAG-RL v5: Explicit missing-edge updates.
-//   - Receives MissingEdgeRequests from FairDagProcessor
-//   - Waits until all requested tx digests have local OIs
-//   - Appends EdgeUpdatePayload to the next sealed batch
+// When the FairDagProcessor identifies missing edges in a graph, it sends a
+// MissingEdgeRequest to this BatchMaker. Once all requested tx digests have
+// local OIs (via the shared LocalOrderTracker), a MissingEdgeUpdate is built
+// and piggybacked on the next sealed batch as an lz4-compressed trailer.
 use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker};
 use crate::quorum_waiter::QuorumWaiterMessage;
-use crate::worker::{EdgeUpdatePayload, SealedBatch, WorkerMessage};
+use crate::worker::{MissingEdgeUpdate, WorkerMessage};
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
@@ -17,7 +16,8 @@ use crypto::PublicKey;
 use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
-use log::{debug, warn};
+use log::debug;
+use lz4_flex::compress_prepend_size;
 use network::ReliableSender;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
@@ -32,15 +32,13 @@ pub mod batch_maker_tests;
 pub type Transaction = Vec<u8>;
 
 /// FairDAG-RL: A batch entry is a transaction paired with its ordering indicator.
-pub type BatchEntry = (Transaction, u64); // (raw_tx, ordering_indicator)
+pub type BatchEntry = (Transaction, u64);
 
 /// A batch is a sequence of (transaction, ordering_indicator) pairs.
 pub type Batch = Vec<BatchEntry>;
 
-/// A request from FairDagProcessor telling this worker which transactions
-/// are involved in missing edges for a graph at a given leader round.
-/// The BatchMaker waits until ALL tx_digests have local OIs, then includes
-/// an EdgeUpdatePayload in the next sealed batch.
+/// A request from FairDagProcessor: which tx digests need local OIs
+/// for missing edges in a graph at the given leader round.
 #[derive(Debug, Clone)]
 pub struct MissingEdgeRequest {
     pub leader_round: u64,
@@ -49,38 +47,26 @@ pub struct MissingEdgeRequest {
 
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
-    /// The preferred batch size (in bytes).
     batch_size: usize,
-    /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
-    /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
-    /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
-    /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
-    /// Holds the current batch entries.
     current_batch: Batch,
-    /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
-    /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
 
-    // =========================================================================
-    // FairDAG-RL: shared local order tracker
-    // =========================================================================
-    /// Shared tracker that records the local arrival order of transactions.
+    /// Shared tracker for local arrival order.
     tracker: LocalOrderTracker,
 
-    // =========================================================================
-    // FairDAG-RL v5: explicit missing-edge update handling
-    // =========================================================================
     /// Channel to receive missing-edge requests from FairDagProcessor.
     rx_missing_edges: Receiver<MissingEdgeRequest>,
-    /// Pending missing-edge requests that are waiting for all tx OIs to be available.
+
+    /// Pending requests waiting for all tx OIs.
     pending_edge_requests: Vec<MissingEdgeRequest>,
-    /// Edge update payloads ready to be included in the next sealed batch.
-    ready_edge_updates: Vec<EdgeUpdatePayload>,
+
+    /// Ready-to-send MissingEdgeUpdate payloads.
+    ready_edge_updates: Vec<MissingEdgeUpdate>,
 }
 
 impl BatchMaker {
@@ -113,8 +99,7 @@ impl BatchMaker {
         });
     }
 
-    /// Check all pending missing-edge requests. If all tx digests in a request
-    /// now have local OIs, move the request to ready_edge_updates.
+    /// Check pending missing-edge requests; promote to ready when all OIs available.
     fn check_pending_edge_requests(&mut self) {
         let mut still_pending = Vec::new();
 
@@ -123,16 +108,14 @@ impl BatchMaker {
                 Some(orderings) => {
                     debug!(
                         "FairDAG BatchMaker: edge update ready for round {} ({} txs)",
-                        req.leader_round,
-                        orderings.len()
+                        req.leader_round, orderings.len()
                     );
-                    self.ready_edge_updates.push(EdgeUpdatePayload {
+                    self.ready_edge_updates.push(MissingEdgeUpdate {
                         leader_round: req.leader_round,
                         orderings,
                     });
                 }
                 None => {
-                    // Not all txs seen yet — keep waiting.
                     still_pending.push(req);
                 }
             }
@@ -141,16 +124,13 @@ impl BatchMaker {
         self.pending_edge_requests = still_pending;
     }
 
-    /// Main loop receiving incoming transactions and creating batches.
     async fn run(&mut self) {
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
 
         loop {
             tokio::select! {
-                // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    // FairDAG-RL: record this tx in the shared tracker.
                     let tx_digest = extract_tx_digest(&transaction);
                     let oi = self.tracker.record(tx_digest);
 
@@ -162,7 +142,7 @@ impl BatchMaker {
                     self.current_batch_size += transaction.len();
                     self.current_batch.push((transaction, oi));
 
-                    // Each new tx might unblock a pending edge request.
+                    // Each new tx might unblock a pending request.
                     if !self.pending_edge_requests.is_empty() {
                         self.check_pending_edge_requests();
                     }
@@ -173,35 +153,31 @@ impl BatchMaker {
                     }
                 },
 
-                // Receive missing-edge requests from FairDagProcessor.
                 Some(req) = self.rx_missing_edges.recv() => {
                     debug!(
-                        "FairDAG BatchMaker: received MissingEdgeRequest for round {} with {} txs",
+                        "FairDAG BatchMaker: received MissingEdgeRequest for round {} ({} txs)",
                         req.leader_round, req.tx_digests.len()
                     );
 
-                    // Check if we can resolve it immediately.
+                    // Try immediate resolution.
                     match self.tracker.batch_lookup_all(&req.tx_digests) {
                         Some(orderings) => {
                             debug!(
-                                "FairDAG BatchMaker: immediately resolved edge update for round {}",
+                                "FairDAG BatchMaker: immediately resolved for round {}",
                                 req.leader_round
                             );
-                            self.ready_edge_updates.push(EdgeUpdatePayload {
+                            self.ready_edge_updates.push(MissingEdgeUpdate {
                                 leader_round: req.leader_round,
                                 orderings,
                             });
                         }
                         None => {
-                            // Some txs not yet seen — park it.
                             self.pending_edge_requests.push(req);
                         }
                     }
                 },
 
-                // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    // Also check pending edge requests on timer tick.
                     if !self.pending_edge_requests.is_empty() {
                         self.check_pending_edge_requests();
                     }
@@ -213,12 +189,11 @@ impl BatchMaker {
                 }
             }
 
-            // Give the chance to schedule other tasks.
             tokio::task::yield_now().await;
         }
     }
 
-    /// Seal and broadcast the current batch.
+    /// Seal and broadcast the current batch with lz4-compressed edge updates.
     async fn seal(&mut self) {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
@@ -231,25 +206,39 @@ impl BatchMaker {
             .filter_map(|(tx, _)| tx[1..9].try_into().ok())
             .collect();
 
-        let edge_update_count = self.ready_edge_updates.len();
+        let update_count = self.ready_edge_updates.len();
 
         debug!(
             "FairDAG BatchMaker: sealing batch with {} entries, {} edge updates, OI range [{}, {}]",
             self.current_batch.len(),
-            edge_update_count,
+            update_count,
             self.current_batch.first().map(|(_, oi)| *oi).unwrap_or(0),
             self.current_batch.last().map(|(_, oi)| *oi).unwrap_or(0),
         );
 
         self.current_batch_size = 0;
         let entries: Batch = self.current_batch.drain(..).collect();
-        let edge_updates: Vec<EdgeUpdatePayload> = self.ready_edge_updates.drain(..).collect();
+        let updates: Vec<MissingEdgeUpdate> = self.ready_edge_updates.drain(..).collect();
 
-        let sealed = SealedBatch {
-            entries,
-            edge_updates,
+        // Serialize and lz4-compress the edge updates.
+        let compressed_updates: Vec<u8> = if updates.is_empty() {
+            Vec::new()
+        } else {
+            let serialized_updates = bincode::serialize(&updates)
+                .expect("Failed to serialize MissingEdgeUpdate list");
+            compress_prepend_size(&serialized_updates)
         };
-        let message = WorkerMessage::Batch(sealed);
+
+        debug!(
+            "FairDAG BatchMaker: compressed {} updates: {} → {} bytes",
+            update_count,
+            if updates.is_empty() { 0 } else {
+                bincode::serialize(&updates).map(|v| v.len()).unwrap_or(0)
+            },
+            compressed_updates.len(),
+        );
+
+        let message = WorkerMessage::Batch(entries, compressed_updates);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]
@@ -269,12 +258,10 @@ impl BatchMaker {
             info!("Batch {:?} contains {} B", digest, size);
         }
 
-        // Broadcast the batch through the network.
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
         let bytes = Bytes::from(serialized.clone());
         let handlers = self.network.broadcast(addresses, bytes).await;
 
-        // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
                 batch: serialized,

@@ -7,9 +7,8 @@
 // from a client or indirectly via another worker's batch.
 //
 // This struct is shared (via Arc) between:
-//   - BatchMaker: records client transactions, retrieves OI for sealing batches
+//   - BatchMaker: records client transactions, checks OIs for edge update requests
 //   - WorkerReceiverHandler: records transactions arriving in other workers' batches
-//   - BatchMaker (edge updates): looks up OIs for missing-edge requests
 //
 // Uses std::sync::Mutex (not tokio::sync::Mutex) because the critical section
 // is just a HashMap lookup + counter increment — no async work inside the lock.
@@ -49,10 +48,8 @@ impl LocalOrderTracker {
     pub fn record(&self, tx_digest: TxDigest) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         if let Some(&oi) = inner.seen.get(&tx_digest) {
-            // Already seen — return the previously assigned OI.
             oi
         } else {
-            // First time seeing this tx — assign next OI.
             inner.counter += 1;
             let oi = inner.counter;
             inner.seen.insert(tx_digest, oi);
@@ -72,35 +69,19 @@ impl LocalOrderTracker {
         inner.counter
     }
 
-    /// Batch lookup: returns (tx_digest, oi) for every digest that has been seen.
-    /// Returns None if ANY of the requested digests has not been seen yet.
-    /// This is used by BatchMaker to check whether all txs in a MissingEdgeRequest
-    /// have local OIs before including an edge update in the next batch.
+    /// Batch lookup: returns (tx_digest, oi) for every digest ONLY if ALL have
+    /// been seen. Returns None if any requested digest has not been observed yet.
+    /// Used by BatchMaker to check readiness of a MissingEdgeRequest.
     pub fn batch_lookup_all(&self, digests: &[TxDigest]) -> Option<Vec<(TxDigest, u64)>> {
         let inner = self.inner.lock().unwrap();
         let mut result = Vec::with_capacity(digests.len());
         for &d in digests {
             match inner.seen.get(&d) {
                 Some(&oi) => result.push((d, oi)),
-                None => return None, // not all txs seen yet
+                None => return None,
             }
         }
         Some(result)
-    }
-
-    /// Batch lookup: returns (tx_digest, oi) for every digest that has been seen,
-    /// skipping those not yet seen. Also returns whether ALL were found.
-    pub fn batch_lookup_available(&self, digests: &[TxDigest]) -> (Vec<(TxDigest, u64)>, bool) {
-        let inner = self.inner.lock().unwrap();
-        let mut result = Vec::with_capacity(digests.len());
-        let mut all_found = true;
-        for &d in digests {
-            match inner.seen.get(&d) {
-                Some(&oi) => result.push((d, oi)),
-                None => { all_found = false; }
-            }
-        }
-        (result, all_found)
     }
 }
 
