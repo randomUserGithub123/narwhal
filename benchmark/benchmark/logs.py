@@ -271,6 +271,7 @@ class LogParser:
         ip = search(r"booted on (\d+.\d+.\d+.\d+)", log).group(1)
 
         # FairDAG-RL: parse fair ordering output from worker logs.
+        # Matches: "FairDAG-RL ordered transaction: 12345"
         tmp = findall(
             r"\[(.*Z) .* FairDAG-RL ordered transaction: (\d+)",
             log,
@@ -278,20 +279,39 @@ class LogParser:
         fair_ordered_txs = {int(tx_id): _to_posix(t) for t, tx_id in tmp}
 
         # FairDAG-RL: graph finalization stats.
-        tmp = findall(
+        # Matches BOTH old format (FairnessLayer) and new format (FairDagProcessor).
+        #
+        # Old: "FairnessLayer: finalized 42 transactions from graph 3 (round 7). Total ordered: 100"
+        # New: "FairDAG: FINALIZED sub_dag_id=3, 42 transactions"
+        fair_graph_stats = []
+
+        # Try old format first.
+        tmp_old = findall(
             r"\[(.*Z) .* FairnessLayer: finalized (\d+) transactions from graph (\d+) \(round (\d+)\)\. Total ordered: (\d+)",
             log,
         )
-        fair_graph_stats = [
-            {
+        for t, num_txs, graph_idx, round_num, total in tmp_old:
+            fair_graph_stats.append({
                 'timestamp': _to_posix(t),
                 'num_txs': int(num_txs),
                 'graph_idx': int(graph_idx),
                 'round': int(round_num),
                 'total_ordered': int(total),
-            }
-            for t, num_txs, graph_idx, round_num, total in tmp
-        ]
+            })
+
+        # New format (explicit FairUpdate / Themis-style).
+        tmp_new = findall(
+            r"\[(.*Z) .* FairDAG: FINALIZED sub_dag_id=(\d+), (\d+) transactions",
+            log,
+        )
+        for t, sub_dag_id, num_txs in tmp_new:
+            fair_graph_stats.append({
+                'timestamp': _to_posix(t),
+                'num_txs': int(num_txs),
+                'graph_idx': int(sub_dag_id),
+                'round': 0,           # not available in new format
+                'total_ordered': 0,    # computed in summary instead
+            })
 
         return sizes, samples, ip, fair_ordered_txs, fair_graph_stats
 
@@ -455,17 +475,28 @@ class LogParser:
         Summarize graph finalization events:
             - Number of graphs finalized
             - Mean txs per graph
-            - Total txs fair-ordered
+            - Total txs fair-ordered (sum of all finalization events)
+
+        Handles both old format (has total_ordered running counter) and
+        new format (total_ordered=0, computed from sum of num_txs).
         """
         if not self.fair_graph_stats:
             return 0, 0, 0
 
         num_graphs = len(self.fair_graph_stats)
         txs_per_graph = [s['num_txs'] for s in self.fair_graph_stats]
-        total_ordered = max(
+        avg_txs = mean(txs_per_graph) if txs_per_graph else 0
+
+        # Check if any entry has a nonzero total_ordered (old format).
+        max_total = max(
             (s['total_ordered'] for s in self.fair_graph_stats), default=0
         )
-        avg_txs = mean(txs_per_graph) if txs_per_graph else 0
+        if max_total > 0:
+            # Old format: use the running total.
+            total_ordered = max_total
+        else:
+            # New format: sum up all finalization events.
+            total_ordered = sum(txs_per_graph)
 
         return num_graphs, avg_txs, total_ordered
 
