@@ -1,10 +1,11 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-// Modified for FairDAG-RL (v4).
+// Modified for FairDAG-RL with explicit FairUpdate (Themis-style).
 //
-// Changes from plain Narwhal:
-//   1. SharedLocalOrderTracker for OI assignment (v3)
-//   2. WorkerMessage::Batch carries (tx, oi) pairs (v3)
-//   3. PrimaryReceiverHandler dispatches ExecuteSubdag to FairDagProcessor (v4)
+// Changes from previous FairDAG-RL:
+//   1. WorkerMessage::Batch now carries Vec<FairUpdateVote> alongside batch entries
+//   2. FairProposeMessage type for FairDagProcessor → BatchMaker communication
+//   3. Worker::spawn wires tx_fair_propose channel between FairDagProcessor and BatchMaker
+//   4. WorkerReceiverHandler handles the new Batch format (ignores votes for tracking)
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::fairdag_processor::FairDagProcessor;
 use crate::helper::Helper;
@@ -36,13 +37,47 @@ pub const CHANNEL_CAPACITY: usize = 10_000;
 /// Indicates a serialized `WorkerPrimaryMessage` message.
 pub type SerializedBatchDigestMessage = Vec<u8>;
 
+// =========================================================================
+// FairUpdate types
+// =========================================================================
+
+/// A FairUpdate vote: a replica's directed-edge evidence for a parked graph.
+/// Embedded in batches and extracted by FairDagProcessor on commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FairUpdateVote {
+    /// The sub-dag whose parked graph these votes resolve.
+    pub sub_dag_id: u64,
+    /// Number of directed edges (for decompression).
+    pub edge_count: usize,
+    /// lz4-compressed, varint+delta encoded directed edges.
+    /// Each edge is packed as (from_vertex << 16 | to_vertex).
+    pub directed_edges_compressed: Vec<u8>,
+}
+
+/// Message from FairDagProcessor to BatchMaker requesting edge votes.
+///   - sub_dag_id: which parked graph needs votes
+///   - Vec<(vertex_index, tx_digest)>: vertices involved in missing edges
+///   - Vec<u32>: missing edge pairs, packed as (min(u,v) << 16 | max(u,v))
+///
+/// When vertices and edges are both empty, this is a cleanup signal.
+pub type FairProposeMessage = (u64, Vec<(u16, u64)>, Vec<u32>);
+
+// =========================================================================
+// Worker messages
+// =========================================================================
+
 /// The message exchanged between workers.
-/// FairDAG-RL: Batch carries Vec<(Transaction, u64)> — each tx with its OI.
+/// FairDAG-RL: Batch carries Vec<(Transaction, u64)> (each tx with its OI)
+/// plus Vec<FairUpdateVote> for explicit edge resolution.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Batch(Batch),
+    Batch(Batch, Vec<FairUpdateVote>),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
+
+// =========================================================================
+// Worker
+// =========================================================================
 
 pub struct Worker {
     /// The public key of this authority.
@@ -82,17 +117,25 @@ impl Worker {
         // FairDAG-RL: Channel for committed subdags → FairDagProcessor.
         let (tx_fairdag, rx_fairdag) = channel(CHANNEL_CAPACITY);
 
+        // FairDAG-RL (Themis-style): Channel for missing-edge notifications
+        // FairDagProcessor → BatchMaker.
+        let (tx_fair_propose, rx_fair_propose) = channel(CHANNEL_CAPACITY);
+
         worker.handle_primary_messages(tx_fairdag);
-        worker.handle_clients_transactions(tx_primary.clone(), tracker.clone());
+        worker.handle_clients_transactions(
+            tx_primary.clone(),
+            tracker.clone(),
+            rx_fair_propose,
+        );
         worker.handle_workers_messages(tx_primary, tracker);
 
-        // FairDAG-RL: Spawn the FairDagProcessor. It reads batches from the
-        // local store and runs the fairness layer.
+        // FairDAG-RL: Spawn the FairDagProcessor with the fair_propose sender.
         FairDagProcessor::spawn(
             worker.committee.clone(),
             worker.store.clone(),
             rx_fairdag,
             worker.parameters.fault_threshold,
+            tx_fair_propose,
         );
 
         PrimaryConnector::spawn(
@@ -159,6 +202,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tracker: LocalOrderTracker,
+        rx_fair_propose: tokio::sync::mpsc::Receiver<FairProposeMessage>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -175,7 +219,7 @@ impl Worker {
             TxReceiverHandler { tx_batch_maker },
         );
 
-        // FairDAG-RL: BatchMaker gets the shared tracker.
+        // FairDAG-RL: BatchMaker gets the shared tracker + fair_propose channel.
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
@@ -187,6 +231,7 @@ impl Worker {
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
             tracker,
+            rx_fair_propose,
         );
 
         QuorumWaiter::spawn(
@@ -280,6 +325,7 @@ impl MessageHandler for TxReceiverHandler {
 
 /// Handles incoming messages from other workers.
 /// FairDAG-RL: records indirect tx arrivals in the shared tracker.
+/// Ignores FairUpdateVote payloads (those are extracted by FairDagProcessor).
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
@@ -294,8 +340,9 @@ impl MessageHandler for WorkerReceiverHandler {
         let _ = writer.send(Bytes::from("Ack")).await;
 
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(ref batch_entries)) => {
-                // FairDAG-RL: Record indirect arrivals.
+            Ok(WorkerMessage::Batch(ref batch_entries, ref _votes)) => {
+                // FairDAG-RL: Record indirect arrivals (ignore votes — they
+                // will be extracted by FairDagProcessor when reading from store).
                 for (tx_bytes, _sender_oi) in batch_entries {
                     let tx_digest = extract_tx_digest(tx_bytes);
                     self.tracker.record(tx_digest);
