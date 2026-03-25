@@ -1,11 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 // Modified for FairDAG-RL with explicit FairUpdate (Themis-style).
 //
-// Changes:
-//   1. Receives indirect tx entries (digest, oi) from WorkerReceiverHandler
-//   2. Includes indirect entries in sealed batches
-//   3. Batch sealing uses entry count (direct + indirect) instead of byte size
-//   4. FairUpdate vote production via rx_fair_propose channel
+// Indirect tx inclusion rules:
+//   - Direct txs: ALWAYS included (full bytes + OI). Digest added to already_batched.
+//   - Indirect txs: included ONLY if tx_digest is NOT in already_batched.
+//     Once included, digest added to already_batched.
+//   - Result: each tx_digest appears in at most one outgoing batch from this worker.
+//   - Sealing threshold: bytes of direct txs only. Indirect entries ride along.
 use crate::local_order_tracker::LocalOrderTracker;
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::{FairProposeMessage, FairUpdateVote, IndirectTxEntry, WorkerMessage};
@@ -32,14 +33,9 @@ use tokio::time::{sleep, Duration, Instant};
 pub mod batch_maker_tests;
 
 pub type Transaction = Vec<u8>;
-
-/// FairDAG-RL: A batch entry is a transaction paired with its ordering indicator.
-pub type BatchEntry = (Transaction, u64); // (raw_tx, ordering_indicator)
-
-/// A batch is a sequence of (transaction, ordering_indicator) pairs.
+pub type BatchEntry = (Transaction, u64);
 pub type Batch = Vec<BatchEntry>;
 
-/// TxDigest as used by LocalOrderTracker (u64).
 type TxDigest = u64;
 
 // =========================================================================
@@ -84,10 +80,8 @@ struct PendingFairProposal {
 // BatchMaker
 // =========================================================================
 
-/// Assemble clients transactions into batches.
 pub struct BatchMaker {
     /// The preferred batch size (in bytes of direct transactions).
-    /// Indirect entries ride along but do not count toward this threshold.
     batch_size: usize,
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
@@ -99,18 +93,20 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch of direct entries.
     current_batch: Batch,
-    /// Holds indirect entries (digest, oi) received from other workers.
+    /// Holds indirect entries (digest, oi) for the current batch.
     current_indirect: Vec<IndirectTxEntry>,
-    /// Tracks digests already in current_indirect to avoid duplicates.
-    current_indirect_seen: HashSet<TxDigest>,
-    /// Holds the size of the current batch (in bytes, direct txs only).
-    /// Indirect entries ride along but do NOT contribute to sealing threshold.
+    /// Current batch size in bytes (direct txs only).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
 
     // FairDAG-RL: shared local order tracker
     tracker: LocalOrderTracker,
+
+    /// Persistent dedup set: tx_digests that have already appeared in any
+    /// previous or current batch from this worker (direct or indirect).
+    /// Ensures each tx_digest appears in at most one outgoing batch.
+    already_batched: HashSet<TxDigest>,
 
     // FairDAG-RL: FairUpdate vote production
     rx_fair_propose: Receiver<FairProposeMessage>,
@@ -141,10 +137,10 @@ impl BatchMaker {
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_indirect: Vec::with_capacity(1024),
-                current_indirect_seen: HashSet::with_capacity(1024),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 tracker,
+                already_batched: HashSet::new(),
                 rx_fair_propose,
                 pending_fair_proposals: HashMap::new(),
                 ready_fair_proposals: Vec::new(),
@@ -155,7 +151,6 @@ impl BatchMaker {
         });
     }
 
-    /// Vote on edge direction based on local OI comparison.
     fn vote_edge_direction(
         &self,
         u_vertex: u16,
@@ -197,7 +192,6 @@ impl BatchMaker {
         ((from as u32) << 16) | (to as u32)
     }
 
-    /// Check if a newly-arrived tx digest resolves any pending proposals.
     fn check_pending_proposals(&mut self, tx_digest: TxDigest) {
         let mut new_ready: Vec<(u64, Vec<u32>)> = Vec::new();
 
@@ -205,11 +199,6 @@ impl BatchMaker {
             if !proposal.missing_digests.remove(&tx_digest) {
                 continue;
             }
-
-            debug!(
-                "FairUpdate: sub_dag_id={}, resolved digest {}, remaining missing: {}",
-                sub_dag_id, tx_digest, proposal.missing_digests.len()
-            );
 
             let tracker = &self.tracker;
             let vertex_to_digest = &proposal.vertex_to_digest;
@@ -261,11 +250,6 @@ impl BatchMaker {
             });
 
             if !newly_voted.is_empty() {
-                debug!(
-                    "FairUpdate: sub_dag_id={}, {} newly voted edges",
-                    sub_dag_id,
-                    newly_voted.len()
-                );
                 new_ready.push((*sub_dag_id, newly_voted));
             }
         }
@@ -275,7 +259,6 @@ impl BatchMaker {
             .retain(|_, p| !p.pending_edges.is_empty());
     }
 
-    /// Handle a FairPropose message from FairDagProcessor.
     fn handle_fair_propose(
         &mut self,
         sub_dag_id: u64,
@@ -287,11 +270,6 @@ impl BatchMaker {
             self.pending_fair_proposals.remove(&sub_dag_id);
             return;
         }
-
-        debug!(
-            "FairUpdate: sub_dag_id={}, vertices={}, missing_edges={}",
-            sub_dag_id, vertices.len(), missing_edges.len()
-        );
 
         let mut vertex_to_digest: HashMap<u16, TxDigest> = HashMap::new();
         let mut missing_digests: HashSet<TxDigest> = HashSet::new();
@@ -355,20 +333,16 @@ impl BatchMaker {
 
         loop {
             tokio::select! {
-                // Direct client transactions.
+                // Direct client transactions — always included, drive sealing.
                 Some(transaction) = self.rx_transaction.recv() => {
                     let tx_digest = crate::local_order_tracker::extract_tx_digest(&transaction);
                     let oi = self.tracker.record(tx_digest);
 
-                    debug!(
-                        "FairDAG BatchMaker: direct tx {} → OI {}",
-                        tx_digest, oi
-                    );
-
                     self.current_batch_size += transaction.len();
                     self.current_batch.push((transaction, oi));
+                    // Mark as batched so indirect path won't duplicate it.
+                    self.already_batched.insert(tx_digest);
 
-                    // Check if any pending FairUpdate proposals can now be resolved.
                     self.check_pending_proposals(tx_digest);
 
                     if self.current_batch_size >= self.batch_size {
@@ -377,16 +351,17 @@ impl BatchMaker {
                     }
                 },
 
-                // Indirect tx arrivals from WorkerReceiverHandler.
-                // These accumulate and ride along when a batch seals,
-                // but do NOT trigger sealing themselves.
+                // Indirect tx arrivals — ride along, do NOT trigger sealing.
+                // Only included if this tx_digest has never appeared in any
+                // previous or current batch from this worker.
                 Some((tx_digest, local_oi)) = self.rx_indirect.recv() => {
-                    if self.current_indirect_seen.insert(tx_digest) {
+                    if !self.already_batched.contains(&tx_digest) {
+                        self.already_batched.insert(tx_digest);
                         self.current_indirect.push((tx_digest, local_oi));
-
-                        // Check if any pending FairUpdate proposals can now be resolved.
-                        self.check_pending_proposals(tx_digest);
                     }
+                    // Always check pending proposals — even if we skip inclusion,
+                    // the tx is in the tracker and may resolve a pending edge.
+                    self.check_pending_proposals(tx_digest);
                 },
 
                 // Missing-edge notifications from FairDagProcessor.
@@ -396,7 +371,10 @@ impl BatchMaker {
 
                 // Timer: seal even if batch is small.
                 () = &mut timer => {
-                    if !self.current_batch.is_empty() || !self.current_indirect.is_empty() || !self.ready_fair_proposals.is_empty() {
+                    if !self.current_batch.is_empty()
+                        || !self.current_indirect.is_empty()
+                        || !self.ready_fair_proposals.is_empty()
+                    {
                         self.seal().await;
                     }
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -421,7 +399,7 @@ impl BatchMaker {
             .collect();
 
         debug!(
-            "FairDAG BatchMaker: sealing batch with {} direct + {} indirect entries, {} vote batches",
+            "FairDAG BatchMaker: sealing {} direct + {} indirect, {} vote batches",
             self.current_batch.len(),
             self.current_indirect.len(),
             self.ready_fair_proposals.len(),
@@ -430,7 +408,6 @@ impl BatchMaker {
         self.current_batch_size = 0;
         let batch: Batch = self.current_batch.drain(..).collect();
         let indirect: Vec<IndirectTxEntry> = self.current_indirect.drain(..).collect();
-        self.current_indirect_seen.clear();
 
         // Collect ready FairUpdate votes.
         let votes: Vec<FairUpdateVote> = self
@@ -439,10 +416,6 @@ impl BatchMaker {
             .map(|(sub_dag_id, directed_edges)| {
                 let edge_count = directed_edges.len();
                 let directed_edges_compressed = pack_and_compress_edges(&directed_edges);
-                debug!(
-                    "FairUpdate: embedding {} votes for sub_dag_id={}, compressed {} → {} bytes",
-                    edge_count, sub_dag_id, edge_count * 4, directed_edges_compressed.len()
-                );
                 FairUpdateVote {
                     sub_dag_id,
                     edge_count,
@@ -471,12 +444,10 @@ impl BatchMaker {
             info!("Batch {:?} contains {} B", digest, size);
         }
 
-        // Broadcast the batch through the network.
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
         let bytes = Bytes::from(serialized.clone());
         let handlers = self.network.broadcast(addresses, bytes).await;
 
-        // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
                 batch: serialized,
