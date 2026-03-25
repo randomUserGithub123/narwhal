@@ -86,7 +86,8 @@ struct PendingFairProposal {
 
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
-    /// The preferred batch size (in entry count: direct + indirect).
+    /// The preferred batch size (in bytes of direct transactions).
+    /// Indirect entries ride along but do not count toward this threshold.
     batch_size: usize,
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
@@ -102,8 +103,9 @@ pub struct BatchMaker {
     current_indirect: Vec<IndirectTxEntry>,
     /// Tracks digests already in current_indirect to avoid duplicates.
     current_indirect_seen: HashSet<TxDigest>,
-    /// Holds the current entry count (direct + indirect).
-    current_entry_count: usize,
+    /// Holds the size of the current batch (in bytes, direct txs only).
+    /// Indirect entries ride along but do NOT contribute to sealing threshold.
+    current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
 
@@ -138,9 +140,9 @@ impl BatchMaker {
                 tx_message,
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
-                current_indirect: Vec::with_capacity(batch_size),
-                current_indirect_seen: HashSet::with_capacity(batch_size),
-                current_entry_count: 0,
+                current_indirect: Vec::with_capacity(1024),
+                current_indirect_seen: HashSet::with_capacity(1024),
+                current_batch_size: 0,
                 network: ReliableSender::new(),
                 tracker,
                 rx_fair_propose,
@@ -363,32 +365,27 @@ impl BatchMaker {
                         tx_digest, oi
                     );
 
+                    self.current_batch_size += transaction.len();
                     self.current_batch.push((transaction, oi));
-                    self.current_entry_count += 1;
 
                     // Check if any pending FairUpdate proposals can now be resolved.
                     self.check_pending_proposals(tx_digest);
 
-                    if self.current_entry_count >= self.batch_size {
+                    if self.current_batch_size >= self.batch_size {
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
                 },
 
                 // Indirect tx arrivals from WorkerReceiverHandler.
+                // These accumulate and ride along when a batch seals,
+                // but do NOT trigger sealing themselves.
                 Some((tx_digest, local_oi)) = self.rx_indirect.recv() => {
-                    // Deduplicate within current batch.
                     if self.current_indirect_seen.insert(tx_digest) {
                         self.current_indirect.push((tx_digest, local_oi));
-                        self.current_entry_count += 1;
 
                         // Check if any pending FairUpdate proposals can now be resolved.
                         self.check_pending_proposals(tx_digest);
-
-                        if self.current_entry_count >= self.batch_size {
-                            self.seal().await;
-                            timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
-                        }
                     }
                 },
 
@@ -399,7 +396,7 @@ impl BatchMaker {
 
                 // Timer: seal even if batch is small.
                 () = &mut timer => {
-                    if self.current_entry_count > 0 || !self.ready_fair_proposals.is_empty() {
+                    if !self.current_batch.is_empty() || !self.current_indirect.is_empty() || !self.ready_fair_proposals.is_empty() {
                         self.seal().await;
                     }
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -430,7 +427,7 @@ impl BatchMaker {
             self.ready_fair_proposals.len(),
         );
 
-        self.current_entry_count = 0;
+        self.current_batch_size = 0;
         let batch: Batch = self.current_batch.drain(..).collect();
         let indirect: Vec<IndirectTxEntry> = self.current_indirect.drain(..).collect();
         self.current_indirect_seen.clear();
