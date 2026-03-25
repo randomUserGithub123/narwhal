@@ -328,7 +328,8 @@ impl MessageHandler for WorkerReceiverHandler {
         let _ = writer.send(Bytes::from("Ack")).await;
 
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(ref direct_entries, ref indirect_entries, ref _votes)) => {
+            Ok(WorkerMessage::Batch(ref direct_entries, ref _indirect_entries, ref _votes)) => {
+                
                 // Direct entries: record in tracker + forward to BatchMaker.
                 for (tx_bytes, _sender_oi) in direct_entries {
                     let tx_digest = extract_tx_digest(tx_bytes);
@@ -336,11 +337,11 @@ impl MessageHandler for WorkerReceiverHandler {
                     let _ = self.tx_indirect.send((tx_digest, local_oi)).await;
                 }
 
-                // Indirect entries: record in tracker for OI only.
-                // Do NOT forward — prevents multi-hop amplification.
-                for &(tx_digest, _sender_oi) in indirect_entries {
-                    self.tracker.record(tx_digest);
-                }
+                // // Indirect entries: record in tracker for OI only.
+                // // Do NOT forward — prevents multi-hop amplification.
+                // for &(tx_digest, _sender_oi) in indirect_entries {
+                //     self.tracker.record(tx_digest);
+                // }
 
                 self.tx_processor
                     .send(serialized.to_vec())

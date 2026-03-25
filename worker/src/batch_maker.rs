@@ -81,7 +81,7 @@ struct PendingFairProposal {
 // =========================================================================
 
 pub struct BatchMaker {
-    /// The preferred batch size (in bytes of direct transactions).
+    /// The preferred batch size (in entry count: direct txs + indirect digests).
     batch_size: usize,
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
@@ -95,8 +95,8 @@ pub struct BatchMaker {
     current_batch: Batch,
     /// Holds indirect entries (digest, oi) for the current batch.
     current_indirect: Vec<IndirectTxEntry>,
-    /// Current batch size in bytes (direct txs only).
-    current_batch_size: usize,
+    /// Current entry count (direct + indirect) toward sealing threshold.
+    current_entry_count: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
 
@@ -137,7 +137,7 @@ impl BatchMaker {
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_indirect: Vec::with_capacity(1024),
-                current_batch_size: 0,
+                current_entry_count: 0,
                 network: ReliableSender::new(),
                 tracker,
                 already_batched: HashSet::new(),
@@ -338,26 +338,30 @@ impl BatchMaker {
                     let tx_digest = crate::local_order_tracker::extract_tx_digest(&transaction);
                     let oi = self.tracker.record(tx_digest);
 
-                    self.current_batch_size += transaction.len();
                     self.current_batch.push((transaction, oi));
+                    self.current_entry_count += 1;
                     // Mark as batched so indirect path won't duplicate it.
                     self.already_batched.insert(tx_digest);
 
                     self.check_pending_proposals(tx_digest);
 
-                    if self.current_batch_size >= self.batch_size {
+                    if self.current_entry_count >= self.batch_size {
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
                 },
 
-                // Indirect tx arrivals — ride along, do NOT trigger sealing.
-                // Only included if this tx_digest has never appeared in any
-                // previous or current batch from this worker.
+                // Indirect tx arrivals — included if not already batched, count toward sealing.
                 Some((tx_digest, local_oi)) = self.rx_indirect.recv() => {
                     if !self.already_batched.contains(&tx_digest) {
                         self.already_batched.insert(tx_digest);
                         self.current_indirect.push((tx_digest, local_oi));
+                        self.current_entry_count += 1;
+
+                        if self.current_entry_count >= self.batch_size {
+                            self.seal().await;
+                            timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                        }
                     }
                     // Always check pending proposals — even if we skip inclusion,
                     // the tx is in the tracker and may resolve a pending edge.
@@ -371,8 +375,7 @@ impl BatchMaker {
 
                 // Timer: seal even if batch is small.
                 () = &mut timer => {
-                    if !self.current_batch.is_empty()
-                        || !self.current_indirect.is_empty()
+                    if self.current_entry_count > 0
                         || !self.ready_fair_proposals.is_empty()
                     {
                         self.seal().await;
@@ -405,7 +408,7 @@ impl BatchMaker {
             self.ready_fair_proposals.len(),
         );
 
-        self.current_batch_size = 0;
+        self.current_entry_count = 0;
         let batch: Batch = self.current_batch.drain(..).collect();
         let indirect: Vec<IndirectTxEntry> = self.current_indirect.drain(..).collect();
 
