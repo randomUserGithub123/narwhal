@@ -2,14 +2,13 @@
 //
 // Architecture:
 //   - Async loop (run): receives subdags, does store reads, dispatches CPU work
-//   - Rayon threads: graph construction + FairUpdate (never block async runtime)
-//   - Channel: rayon tasks send results back to async loop
+//   - spawn_blocking: graph construction + FairUpdate (never block async runtime)
+//   - Channel: blocking tasks send results back to async loop
 //
 // Performance features (matching original FairDAG-RL FairnessLayer):
-//   - Nibble-packed weight matrix (4 bits per weight, max 15 — fits N≤15)
+//   - Nibble-packed weight matrix (4 bits per weight, max 15)
 //   - Iterative Tarjan SCC (no stack overflow)
 //   - Pre-sized adjacency lists
-//   - Rayon parallelism: multiple graphs can build concurrently
 
 use crate::local_order_tracker::extract_tx_digest;
 use crate::worker::{FairProposeMessage, FairUpdateVote, WorkerMessage};
@@ -23,7 +22,6 @@ use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-/// TxDigest matching local_order_tracker.rs.
 type TxDigest = u64;
 
 // =========================================================================
@@ -74,7 +72,7 @@ fn unpack_and_decompress_edges(compressed: &[u8], expected_count: usize) -> Vec<
 }
 
 // =========================================================================
-// Nibble-packed weight helpers (from original FairnessLayer)
+// Nibble-packed weight helpers
 // =========================================================================
 
 #[inline(always)]
@@ -104,7 +102,7 @@ fn inc_weight(packed: &mut [u8], idx: usize) {
 }
 
 // =========================================================================
-// Iterative Tarjan SCC (from original FairnessLayer — no stack overflow)
+// Iterative Tarjan SCC
 // =========================================================================
 
 fn tarjan_scc_iterative(
@@ -233,7 +231,7 @@ fn topological_sort_sccs(
 }
 
 // =========================================================================
-// Hamiltonian path (from original FairnessLayer)
+// Hamiltonian path
 // =========================================================================
 
 fn hamiltonian_path(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
@@ -271,17 +269,12 @@ fn hamiltonian_path(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
 }
 
 // =========================================================================
-// Graph construction result (sent from rayon → async loop)
+// Graph construction result
 // =========================================================================
 
 enum GraphResult {
-    Empty {
-        sub_dag_id: u64,
-    },
-    Finalized {
-        sub_dag_id: u64,
-        tx_order: Vec<TxDigest>,
-    },
+    Empty { sub_dag_id: u64 },
+    Finalized { sub_dag_id: u64, tx_order: Vec<TxDigest> },
     NeedsFairUpdate {
         sub_dag_id: u64,
         vertex_indices: Vec<u16>,
@@ -299,7 +292,7 @@ struct FairUpdateResult {
 }
 
 // =========================================================================
-// Stateless graph construction (runs on rayon / spawn_blocking)
+// Stateless graph construction (runs on spawn_blocking)
 // =========================================================================
 
 fn build_graph(
@@ -318,7 +311,7 @@ fn build_graph(
 
     let t_edge = non_blank_threshold;
 
-    // ─── Step 1: Compute support, classify ───────────────────────────────
+    // Step 1: Compute support, classify
     let mut support = vec![0u8; k];
     for order in &indices_sets {
         for &tx in order {
@@ -342,7 +335,7 @@ fn build_graph(
         return GraphResult::Empty { sub_dag_id };
     }
 
-    // ─── Step 2: Nibble-packed pairwise weights ──────────────────────────
+    // Step 2: Nibble-packed pairwise weights
     let nibble_bytes = (k * k + 1) / 2;
     let mut weight = vec![0u8; nibble_bytes];
 
@@ -368,8 +361,7 @@ fn build_graph(
         }
     }
 
-    // ─── Step 3: Build edges + dense remapping ───────────────────────────
-    // Remap active nodes to dense 0..active_count for SCC/edges.
+    // Step 3: Build edges + dense remapping
     let active_count = active.len();
     let mut orig_to_dense = vec![u16::MAX; k];
     let mut dense_to_orig: Vec<usize> = Vec::with_capacity(active_count);
@@ -402,7 +394,7 @@ fn build_graph(
 
     let t3 = start.elapsed().as_nanos();
 
-    // ─── Step 4: SCC + topo sort ─────────────────────────────────────────
+    // Step 4: SCC + topo sort
     let sccs = tarjan_scc_iterative(active_count, &edges);
     if sccs.is_empty() {
         return GraphResult::Empty { sub_dag_id };
@@ -410,14 +402,10 @@ fn build_graph(
 
     let topo = topological_sort_sccs(&sccs, &edges, active_count);
 
-    // ─── Step 5: Find anchor ─────────────────────────────────────────────
+    // Step 5: Find anchor
     let mut anchor_idx: Option<usize> = None;
     for (idx, &scc_index) in topo.iter().enumerate() {
-        let comp = &sccs[scc_index];
-        if comp
-            .iter()
-            .any(|&di| is_solid[dense_to_orig[di as usize]])
-        {
+        if sccs[scc_index].iter().any(|&di| is_solid[dense_to_orig[di as usize]]) {
             anchor_idx = Some(idx);
         }
     }
@@ -427,19 +415,16 @@ fn build_graph(
         None => return GraphResult::Empty { sub_dag_id },
     };
 
-    // ─── Step 6: Collect graph vertices + find missing edges ─────────────
+    // Step 6: Collect graph vertices + find missing edges
     let mut in_graph = vec![false; active_count];
     for topo_pos in 0..=anchor {
-        let comp = &sccs[topo[topo_pos]];
-        for &di in comp {
+        for &di in &sccs[topo[topo_pos]] {
             in_graph[di as usize] = true;
         }
     }
 
     let shaded_in_graph: Vec<u16> = (0..active_count as u16)
-        .filter(|&di| {
-            in_graph[di as usize] && !is_solid[dense_to_orig[di as usize]]
-        })
+        .filter(|&di| in_graph[di as usize] && !is_solid[dense_to_orig[di as usize]])
         .collect();
 
     let mut missing_edges: Vec<u32> = Vec::new();
@@ -460,15 +445,14 @@ fn build_graph(
 
     let t6 = start.elapsed().as_nanos();
 
-    // ─── Step 7: Finalize or park ────────────────────────────────────────
+    // Step 7: Finalize or park
     if missing_edges.is_empty() {
         let mut finalized: Vec<TxDigest> = Vec::new();
         for (idx, &scc_index) in topo.iter().enumerate() {
             if idx > anchor {
                 break;
             }
-            let comp = &sccs[scc_index];
-            let path = hamiltonian_path(comp, &edges);
+            let path = hamiltonian_path(&sccs[scc_index], &edges);
             for &di in &path {
                 finalized.push(index_to_digest[dense_to_orig[di as usize]]);
             }
@@ -481,17 +465,12 @@ fn build_graph(
             t3, t6, start.elapsed().as_nanos()
         );
 
-        GraphResult::Finalized {
-            sub_dag_id,
-            tx_order: finalized,
-        }
+        GraphResult::Finalized { sub_dag_id, tx_order: finalized }
     } else {
-        // Collect existing edges and vertex info for parking.
         let mut vertex_indices: Vec<u16> = Vec::new();
         let mut existing_edges_list: Vec<(u16, u16)> = Vec::new();
         for topo_pos in 0..=anchor {
-            let comp = &sccs[topo[topo_pos]];
-            for &di in comp {
+            for &di in &sccs[topo[topo_pos]] {
                 vertex_indices.push(di);
             }
         }
@@ -511,12 +490,10 @@ fn build_graph(
         missing_edge_vertices.sort_unstable();
         missing_edge_vertices.dedup();
 
-        // Map is_solid to dense space.
         let is_solid_dense: Vec<bool> = (0..active_count)
             .map(|di| is_solid[dense_to_orig[di]])
             .collect();
 
-        // Map index_to_digest through dense mapping.
         let dense_to_digest: Vec<TxDigest> = (0..active_count)
             .map(|di| index_to_digest[dense_to_orig[di]])
             .collect();
@@ -541,7 +518,7 @@ fn build_graph(
 }
 
 // =========================================================================
-// FairUpdate application (runs on rayon / spawn_blocking)
+// FairUpdate application (runs on spawn_blocking)
 // =========================================================================
 
 fn apply_fair_update(
@@ -556,7 +533,6 @@ fn apply_fair_update(
     solid_threshold: u8,
 ) -> FairUpdateResult {
     let start = Instant::now();
-
     let k = index_to_digest.len();
 
     let mut edge_set: HashSet<(u16, u16)> = existing_edges.into_iter().collect();
@@ -569,14 +545,8 @@ fn apply_fair_update(
             let from = (packed >> 16) as u16;
             let to = (packed & 0xFFFF) as u16;
             *vote_weight.entry((from, to)).or_insert(0) += 1;
-            tx_author_count
-                .entry(from)
-                .or_default()
-                .insert(author_idx);
-            tx_author_count
-                .entry(to)
-                .or_default()
-                .insert(author_idx);
+            tx_author_count.entry(from).or_default().insert(author_idx);
+            tx_author_count.entry(to).or_default().insert(author_idx);
         }
     }
 
@@ -595,14 +565,8 @@ fn apply_fair_update(
         let kuv = vote_weight.get(&(u, v)).copied().unwrap_or(0);
         let kvu = vote_weight.get(&(v, u)).copied().unwrap_or(0);
 
-        let u_in_enough = tx_author_count
-            .get(&u)
-            .map(|s| s.len() as u16 >= t_solid)
-            .unwrap_or(false);
-        let v_in_enough = tx_author_count
-            .get(&v)
-            .map(|s| s.len() as u16 >= t_solid)
-            .unwrap_or(false);
+        let u_in_enough = tx_author_count.get(&u).map(|s| s.len() as u16 >= t_solid).unwrap_or(false);
+        let v_in_enough = tx_author_count.get(&v).map(|s| s.len() as u16 >= t_solid).unwrap_or(false);
 
         if kuv >= kvu {
             if u_in_enough && kuv >= t_edge {
@@ -617,7 +581,6 @@ fn apply_fair_update(
         }
     }
 
-    // Build adjacency for SCC.
     let active_count = vertex_indices.len();
     let mut remap = vec![u16::MAX; k];
     let mut unmap: Vec<u16> = Vec::with_capacity(active_count);
@@ -641,8 +604,7 @@ fn apply_fair_update(
 
     let mut finalized: Vec<TxDigest> = Vec::new();
     for &scc_index in &topo {
-        let comp = &sccs[scc_index];
-        let path = hamiltonian_path(comp, &scc_edges);
+        let path = hamiltonian_path(&sccs[scc_index], &scc_edges);
         for &ri in &path {
             let orig_v = unmap[ri as usize];
             finalized.push(index_to_digest[orig_v as usize]);
@@ -654,10 +616,7 @@ fn apply_fair_update(
         sub_dag_id, new_edges_count, finalized.len(), start.elapsed().as_millis()
     );
 
-    FairUpdateResult {
-        sub_dag_id,
-        tx_order: finalized,
-    }
+    FairUpdateResult { sub_dag_id, tx_order: finalized }
 }
 
 // =========================================================================
@@ -686,14 +645,11 @@ pub struct FairDagProcessor {
     solid_threshold: u8,
 
     rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
-
     tx_fair_propose: Sender<FairProposeMessage>,
 
-    /// Channel: spawn_blocking graph-build tasks → async loop.
     rx_graph_results: tokio::sync::mpsc::Receiver<GraphResult>,
     tx_graph_results: tokio::sync::mpsc::Sender<GraphResult>,
 
-    /// Channel: spawn_blocking FairUpdate tasks → async loop.
     rx_update_results: tokio::sync::mpsc::Receiver<FairUpdateResult>,
     tx_update_results: tokio::sync::mpsc::Sender<FairUpdateResult>,
 
@@ -766,17 +722,12 @@ impl FairDagProcessor {
     }
 
     // =====================================================================
-    // Main async loop — never blocks on CPU work
+    // Main async loop
     // =====================================================================
 
     async fn run(&mut self) {
         loop {
             tokio::select! {
-                // ─────────────────────────────────────────────────────────
-                // Arm 1: Receive committed subdag
-                // → Async extraction (store reads)
-                // → Spawn graph build on blocking thread
-                // ─────────────────────────────────────────────────────────
                 Some((leader_round, certificates)) = self.rx_committed_subdags.recv() => {
                     self.sub_dag_count += 1;
                     let sub_dag_id = self.sub_dag_count;
@@ -815,21 +766,11 @@ impl FairDagProcessor {
                     let st = self.solid_threshold;
 
                     tokio::task::spawn_blocking(move || {
-                        let result = build_graph(
-                            sub_dag_id,
-                            indices_sets,
-                            k,
-                            index_to_digest,
-                            nbt,
-                            st,
-                        );
+                        let result = build_graph(sub_dag_id, indices_sets, k, index_to_digest, nbt, st);
                         let _ = tx.blocking_send(result);
                     });
                 },
 
-                // ─────────────────────────────────────────────────────────
-                // Arm 2: Graph construction result from blocking thread
-                // ─────────────────────────────────────────────────────────
                 Some(result) = self.rx_graph_results.recv() => {
                     match result {
                         GraphResult::Empty { sub_dag_id } => {
@@ -857,7 +798,6 @@ impl FairDagProcessor {
                                 sub_dag_id, vertex_indices.len(), missing_edges.len()
                             );
 
-                            // Notify BatchMaker: vertex→digest for missing edge vertices.
                             let vertices_with_digests: Vec<(u16, u64)> = missing_edge_vertices
                                 .iter()
                                 .map(|&v| (v, index_to_digest[v as usize]))
@@ -884,18 +824,13 @@ impl FairDagProcessor {
                     self.try_finalize_sequential();
                 },
 
-                // ─────────────────────────────────────────────────────────
-                // Arm 3: FairUpdate result from blocking thread
-                // ─────────────────────────────────────────────────────────
                 Some(result) = self.rx_update_results.recv() => {
                     info!(
                         "sub_dag_id={}: FairUpdate complete, {} txs",
                         result.sub_dag_id, result.tx_order.len()
                     );
-                    self.ready_to_finalize
-                        .insert(result.sub_dag_id, result.tx_order);
+                    self.ready_to_finalize.insert(result.sub_dag_id, result.tx_order);
 
-                    // Cleanup signal to BatchMaker.
                     let _ = self
                         .tx_fair_propose
                         .send((result.sub_dag_id, vec![], vec![]))
@@ -908,18 +843,14 @@ impl FairDagProcessor {
     }
 
     // =====================================================================
-    // Subdag extraction (async — store reads)
+    // Subdag extraction — processes BOTH direct and indirect entries
     // =====================================================================
 
     async fn extract_subdag_and_votes(
         &self,
         _leader_round: Round,
         certificates: &[Certificate],
-    ) -> (
-        Vec<Vec<usize>>,
-        Vec<TxDigest>,
-        Vec<(PublicKey, FairUpdateVote)>,
-    ) {
+    ) -> (Vec<Vec<usize>>, Vec<TxDigest>, Vec<(PublicKey, FairUpdateVote)>) {
         let mut per_replica: HashMap<usize, Vec<(TxDigest, u64)>> = HashMap::new();
         let mut extracted_votes: Vec<(PublicKey, FairUpdateVote)> = Vec::new();
 
@@ -935,22 +866,27 @@ impl FairDagProcessor {
                 match self.store.clone().read(batch_digest.to_vec()).await {
                     Ok(Some(serialized_batch)) => {
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            Ok(WorkerMessage::Batch(batch_entries, votes)) => {
-                                let entries =
-                                    per_replica.entry(replica_index).or_default();
-                                for (tx_bytes, oi) in batch_entries {
+                            Ok(WorkerMessage::Batch(direct_entries, indirect_entries, votes)) => {
+                                let entries = per_replica.entry(replica_index).or_default();
+
+                                // Direct entries: extract tx_digest from raw bytes.
+                                for (tx_bytes, oi) in direct_entries {
                                     let tx_id = extract_tx_digest(&tx_bytes);
                                     entries.push((tx_id, oi));
                                 }
+
+                                // Indirect entries: digest already available.
+                                for (tx_digest, oi) in indirect_entries {
+                                    entries.push((tx_digest, oi));
+                                }
+
+                                // FairUpdate votes.
                                 for vote in votes {
                                     extracted_votes.push((author, vote));
                                 }
                             }
                             Ok(_) => {
-                                warn!(
-                                    "Unexpected WorkerMessage type for batch {:?}",
-                                    batch_digest
-                                );
+                                warn!("Unexpected WorkerMessage type for batch {:?}", batch_digest);
                             }
                             Err(e) => {
                                 error!("Deser fail batch {:?}: {}", batch_digest, e);
@@ -1038,12 +974,9 @@ impl FairDagProcessor {
 
             info!(
                 "sub_dag_id={}: spawning FairUpdate, {} votes, {} missing edges",
-                sub_dag_id,
-                votes.len(),
-                parked.missing_edges.len()
+                sub_dag_id, votes.len(), parked.missing_edges.len()
             );
 
-            // Spawn on blocking thread.
             let tx = self.tx_update_results.clone();
             let nbt = self.non_blank_threshold;
             let st = self.solid_threshold;
@@ -1076,11 +1009,9 @@ impl FairDagProcessor {
                 if !tx_order.is_empty() {
                     info!(
                         "FairDAG: FINALIZED sub_dag_id={}, {} transactions",
-                        id,
-                        tx_order.len()
+                        id, tx_order.len()
                     );
                     for tx_id in &tx_order {
-                        // This log line is parsed by logs.py — DO NOT CHANGE FORMAT.
                         info!("FairDAG-RL ordered transaction: {}", tx_id);
                     }
                 } else {
