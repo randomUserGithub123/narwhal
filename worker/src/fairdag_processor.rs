@@ -566,6 +566,8 @@ pub struct FairDagProcessor {
     /// seen in any previous subdag. If the same (replica, digest) appears
     /// again in a later subdag, it is dropped during extraction.
     seen_replica_tx: HashSet<(usize, TxDigest)>,
+
+    finalized_txs: HashSet<TxDigest>,
 }
 
 impl FairDagProcessor {
@@ -616,6 +618,7 @@ impl FairDagProcessor {
                 next_to_finalize: 1,
                 ready_to_finalize: BTreeMap::new(),
                 seen_replica_tx: HashSet::new(),
+                finalized_txs: HashSet::new(),
             }
             .run()
             .await;
@@ -887,16 +890,20 @@ impl FairDagProcessor {
         loop {
             let id = self.next_to_finalize;
             if let Some(tx_order) = self.ready_to_finalize.remove(&id) {
-                if !tx_order.is_empty() {
-                    info!(
-                        "FairDAG: FINALIZED sub_dag_id={}, {} transactions",
-                        id, tx_order.len()
-                    );
-                    for tx_id in &tx_order {
+                let mut count = 0usize;
+                for tx_id in &tx_order {
+                    if self.finalized_txs.insert(*tx_id) {
                         info!("FairDAG-RL ordered transaction: {}", tx_id);
+                        count += 1;
                     }
+                }
+                if count > 0 {
+                    info!(
+                        "FairDAG: FINALIZED sub_dag_id={}, {} unique transactions ({} total, {} duplicates skipped)",
+                        id, count, tx_order.len(), tx_order.len() - count
+                    );
                 } else {
-                    debug!("FairDAG: sub_dag_id={} finalized (empty)", id);
+                    debug!("FairDAG: sub_dag_id={} finalized (empty or all duplicates)", id);
                 }
                 self.next_to_finalize += 1;
             } else {
