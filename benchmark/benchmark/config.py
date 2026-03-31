@@ -145,10 +145,10 @@ class Committee:
         assert isinstance(f, int) and f >= 0
         assert f <= self.size(), "Cannot select more Byzantine nodes than total nodes"
         
-        if self.attack_type in {0, 10}:
-            target_attack_types = {0}
-        else:
-            target_attack_types = {2, 4, 6}
+        # if self.attack_type in {0, 10}:
+        #     target_attack_types = {0}
+        # else:
+        #     target_attack_types = {2, 4, 6}
         
         # candidate_indices = []
         # for idx, (_, authority) in enumerate(self.json['authorities'].items()):
@@ -156,7 +156,7 @@ class Committee:
         #         candidate_indices.append(idx)
         
         # if not candidate_indices:
-        
+
         candidate_indices = list(range(self.size()))
         
         assert len(candidate_indices) >= f, \
