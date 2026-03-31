@@ -80,6 +80,8 @@ pub struct Worker {
     committee: Committee,
     parameters: Parameters,
     store: Store,
+    is_byzantine: bool,
+    byzantine_active: bool,
 }
 
 impl Worker {
@@ -89,7 +91,16 @@ impl Worker {
         committee: Committee,
         parameters: Parameters,
         store: Store,
+        is_byzantine: bool,
+        byzantine_active: bool,
     ) {
+
+        if is_byzantine && byzantine_active {
+            info!("BYZANTINE_ACTIVE: Worker {} is actively Byzantine (reversing orderings)", id);
+        } else if is_byzantine {
+            info!("BYZANTINE_DORMANT: Worker {} is Byzantine but not yet active", id);
+        }
+
         let tracker = LocalOrderTracker::new();
 
         let worker = Self {
@@ -98,6 +109,8 @@ impl Worker {
             committee,
             parameters,
             store,
+            is_byzantine,
+            byzantine_active,
         };
 
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
@@ -149,6 +162,9 @@ impl Worker {
     ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
+        let is_byzantine = self.is_byzantine;
+        let byzantine_active = self.byzantine_active;
+
         let mut address = self
             .committee
             .worker(&self.name, &self.id)
@@ -158,6 +174,8 @@ impl Worker {
         Receiver::spawn(
             address,
             PrimaryReceiverHandler {
+                byzantine_active,
+                is_byzantine,
                 tx_synchronizer,
                 tx_fairdag,
             },
@@ -191,6 +209,9 @@ impl Worker {
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
+        let is_byzantine = self.is_byzantine;
+        let byzantine_active = self.byzantine_active;
+
         let mut address = self
             .committee
             .worker(&self.name, &self.id)
@@ -199,7 +220,7 @@ impl Worker {
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
             address,
-            TxReceiverHandler { tx_batch_maker },
+            TxReceiverHandler { byzantine_active, is_byzantine, tx_batch_maker },
         );
 
         BatchMaker::spawn(
@@ -215,6 +236,8 @@ impl Worker {
             tracker,
             rx_fair_propose,
             rx_indirect,
+            self.is_byzantine,
+            self.byzantine_active,
         );
 
         QuorumWaiter::spawn(
@@ -247,6 +270,9 @@ impl Worker {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
+        let is_byzantine = self.is_byzantine;
+        let byzantine_active = self.byzantine_active;
+
         let mut address = self
             .committee
             .worker(&self.name, &self.id)
@@ -256,6 +282,8 @@ impl Worker {
         Receiver::spawn(
             address,
             WorkerReceiverHandler {
+                byzantine_active,
+                is_byzantine,
                 tx_helper,
                 tx_processor,
                 tracker,
@@ -291,16 +319,22 @@ impl Worker {
 
 #[derive(Clone)]
 struct TxReceiverHandler {
+    byzantine_active: bool,
+    is_byzantine: bool,
     tx_batch_maker: Sender<Transaction>,
 }
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        self.tx_batch_maker
+        
+        if !self.is_byzantine || self.byzantine_active {
+            self.tx_batch_maker
             .send(message.to_vec())
             .await
             .expect("Failed to send transaction");
+        }
+
         tokio::task::yield_now().await;
         Ok(())
     }
@@ -316,6 +350,8 @@ impl MessageHandler for TxReceiverHandler {
 ///     forward — re-forwarding would cause multi-hop amplification.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
+    byzantine_active: bool,
+    is_byzantine: bool,
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tracker: LocalOrderTracker,
@@ -325,43 +361,49 @@ struct WorkerReceiverHandler {
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        let _ = writer.send(Bytes::from("Ack")).await;
+        
+        if !self.is_byzantine || self.byzantine_active {
+            let _ = writer.send(Bytes::from("Ack")).await;
 
-        match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(ref direct_entries, ref _indirect_entries, ref _votes)) => {
-                
-                // Direct entries: record in tracker + forward to BatchMaker.
-                for (tx_bytes, _sender_oi) in direct_entries {
-                    let tx_digest = extract_tx_digest(tx_bytes);
-                    let local_oi = self.tracker.record(tx_digest);
-                    let _ = self.tx_indirect.send((tx_digest, local_oi)).await;
+            match bincode::deserialize(&serialized) {
+                Ok(WorkerMessage::Batch(ref direct_entries, ref _indirect_entries, ref _votes)) => {
+                    
+                    // Direct entries: record in tracker + forward to BatchMaker.
+                    for (tx_bytes, _sender_oi) in direct_entries {
+                        let tx_digest = extract_tx_digest(tx_bytes);
+                        let local_oi = self.tracker.record(tx_digest);
+                        let _ = self.tx_indirect.send((tx_digest, local_oi)).await;
+                    }
+
+                    // // Indirect entries: record in tracker for OI only.
+                    // // Do NOT forward — prevents multi-hop amplification.
+                    // for &(tx_digest, _sender_oi) in indirect_entries {
+                    //     self.tracker.record(tx_digest);
+                    // }
+
+                    self.tx_processor
+                        .send(serialized.to_vec())
+                        .await
+                        .expect("Failed to send batch");
                 }
-
-                // // Indirect entries: record in tracker for OI only.
-                // // Do NOT forward — prevents multi-hop amplification.
-                // for &(tx_digest, _sender_oi) in indirect_entries {
-                //     self.tracker.record(tx_digest);
-                // }
-
-                self.tx_processor
-                    .send(serialized.to_vec())
-                    .await
-                    .expect("Failed to send batch");
+                Ok(WorkerMessage::BatchRequest(missing, requestor)) => {
+                    self.tx_helper
+                        .send((missing, requestor))
+                        .await
+                        .expect("Failed to send batch request");
+                }
+                Err(e) => warn!("Serialization error: {}", e),
             }
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => {
-                self.tx_helper
-                    .send((missing, requestor))
-                    .await
-                    .expect("Failed to send batch request");
-            }
-            Err(e) => warn!("Serialization error: {}", e),
         }
+
         Ok(())
     }
 }
 
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
+    byzantine_active: bool,
+    is_byzantine: bool,
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
     tx_fairdag: Sender<(Round, Vec<Certificate>)>,
 }
@@ -373,26 +415,30 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        match bincode::deserialize(&serialized) {
-            Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(PrimaryWorkerMessage::ExecuteSubdag(leader_round, certificates)) => {
-                info!(
-                    "Worker received ExecuteSubdag for leader round {} with {} certs",
-                    leader_round,
-                    certificates.len()
-                );
-                self.tx_fairdag
-                    .send((leader_round, certificates))
-                    .await
-                    .expect("Failed to send subdag to FairDagProcessor");
-            }
-            Ok(message) => {
-                self.tx_synchronizer
-                    .send(message)
-                    .await
-                    .expect("Failed to send primary message to synchronizer");
+        
+        if !self.is_byzantine || self.byzantine_active {
+            match bincode::deserialize(&serialized) {
+                Err(e) => error!("Failed to deserialize primary message: {}", e),
+                Ok(PrimaryWorkerMessage::ExecuteSubdag(leader_round, certificates)) => {
+                    info!(
+                        "Worker received ExecuteSubdag for leader round {} with {} certs",
+                        leader_round,
+                        certificates.len()
+                    );
+                    self.tx_fairdag
+                        .send((leader_round, certificates))
+                        .await
+                        .expect("Failed to send subdag to FairDagProcessor");
+                }
+                Ok(message) => {
+                    self.tx_synchronizer
+                        .send(message)
+                        .await
+                        .expect("Failed to send primary message to synchronizer");
+                }
             }
         }
+
         Ok(())
     }
 }

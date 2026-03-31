@@ -20,7 +20,7 @@ from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
-BANNED_NODES = []
+BANNED_NODES = ["node021", "node037"]
 
 class DASBench:
     BASE_PORT = 4000
@@ -171,7 +171,7 @@ class DASBench:
             self.node_parameters.print(PathMaker.parameters_file())
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
+            workers_addresses = committee.workers_addresses(faults=0)
             rate_share = ceil(rate / committee.workers())
             
             ### Default Narwhal Approach : 
@@ -222,12 +222,18 @@ class DASBench:
                 self._background_run(cmd, log_file, clients_hostnames[i // 4])
 
             # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
+            faulty_node_ids = committee.get_byzantine_nodes(
+                f=self.faults
+            )
+            for i, address in enumerate(committee.primary_addresses(faults=0)):
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i, username=self.username),
                     PathMaker.parameters_file(),
+                    is_byzantine=int(
+                        i in faulty_node_ids
+                    ),
                     debug=debug,
                 )
                 log_file = PathMaker.primary_log_file(i)
@@ -243,6 +249,9 @@ class DASBench:
                         PathMaker.db_path(i, id, username=self.username),
                         PathMaker.parameters_file(),
                         id,  # The worker's id.
+                        is_byzantine=int(
+                            i in faulty_node_ids
+                        ),
                         debug=debug,
                     )
                     log_file = PathMaker.worker_log_file(i, id)

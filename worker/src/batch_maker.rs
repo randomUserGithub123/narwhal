@@ -115,6 +115,9 @@ pub struct BatchMaker {
 
     // FairDAG-RL: indirect tx arrivals from WorkerReceiverHandler
     rx_indirect: Receiver<IndirectTxEntry>,
+
+    is_byzantine: bool,
+    byzantine_active: bool,
 }
 
 impl BatchMaker {
@@ -127,6 +130,8 @@ impl BatchMaker {
         tracker: LocalOrderTracker,
         rx_fair_propose: Receiver<FairProposeMessage>,
         rx_indirect: Receiver<IndirectTxEntry>,
+        is_byzantine: bool,
+        byzantine_active: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -145,45 +150,31 @@ impl BatchMaker {
                 pending_fair_proposals: HashMap::new(),
                 ready_fair_proposals: Vec::new(),
                 rx_indirect,
+                is_byzantine,
+                byzantine_active,
             }
             .run()
             .await;
         });
     }
 
-    fn vote_edge_direction(
-        &self,
-        u_vertex: u16,
-        v_vertex: u16,
-        u_digest: TxDigest,
-        v_digest: TxDigest,
-    ) -> (u16, u16) {
-        let u_oi = self.tracker.get_oi(u_digest);
-        let v_oi = self.tracker.get_oi(v_digest);
-
-        match (u_oi, v_oi) {
+    fn vote_edge_direction(&self, u_vertex: u16, v_vertex: u16, u_digest: TxDigest, v_digest: TxDigest) -> (u16, u16) {
+        let (from, to) = match (self.tracker.get_oi(u_digest), self.tracker.get_oi(v_digest)) {
             (Some(u_ord), Some(v_ord)) => {
-                if u_ord < v_ord {
-                    (u_vertex, v_vertex)
-                } else if v_ord < u_ord {
-                    (v_vertex, u_vertex)
-                } else {
-                    if u_vertex < v_vertex {
-                        (u_vertex, v_vertex)
-                    } else {
-                        (v_vertex, u_vertex)
-                    }
-                }
+                if u_ord < v_ord { (u_vertex, v_vertex) }
+                else if v_ord < u_ord { (v_vertex, u_vertex) }
+                else if u_vertex < v_vertex { (u_vertex, v_vertex) }
+                else { (v_vertex, u_vertex) }
             }
             (Some(_), None) => (u_vertex, v_vertex),
             (None, Some(_)) => (v_vertex, u_vertex),
-            (None, None) => {
-                if u_vertex < v_vertex {
-                    (u_vertex, v_vertex)
-                } else {
-                    (v_vertex, u_vertex)
-                }
-            }
+            (None, None) => if u_vertex < v_vertex { (u_vertex, v_vertex) } else { (v_vertex, u_vertex) },
+        };
+
+        if self.is_byzantine && self.byzantine_active {
+            (to, from)
+        } else {
+            (from, to)
         }
     }
 
@@ -409,8 +400,23 @@ impl BatchMaker {
         );
 
         self.current_entry_count = 0;
-        let batch: Batch = self.current_batch.drain(..).collect();
-        let indirect: Vec<IndirectTxEntry> = self.current_indirect.drain(..).collect();
+        let mut batch: Batch = self.current_batch.drain(..).collect();
+        let mut indirect: Vec<IndirectTxEntry> = self.current_indirect.drain(..).collect();
+
+        if self.is_byzantine && self.byzantine_active && !batch.is_empty() {
+            let mut ois: Vec<u64> = batch.iter().map(|(_, oi)| *oi).collect();
+            ois.reverse();
+            for (i, (_, oi)) in batch.iter_mut().enumerate() {
+                *oi = ois[i];
+            }
+        }
+        if self.is_byzantine && self.byzantine_active && !indirect.is_empty() {
+            let mut ois: Vec<u64> = indirect.iter().map(|(_, oi)| *oi).collect();
+            ois.reverse();
+            for (i, (_, oi)) in indirect.iter_mut().enumerate() {
+                *oi = ois[i];
+            }
+        }
 
         // Collect ready FairUpdate votes.
         let votes: Vec<FairUpdateVote> = self
