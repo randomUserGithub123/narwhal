@@ -7,6 +7,7 @@ from os.path import join
 from re import findall, search
 from statistics import mean
 from collections import defaultdict
+import random
 
 from benchmark.utils import Print
 
@@ -90,7 +91,7 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_graph_stats_list = zip(*results)
+        sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_graph_stats_list, arrival_times_list = zip(*results)
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
@@ -107,6 +108,21 @@ class LogParser:
         self.fair_graph_stats = []
         for stats_list in fair_graph_stats_list:
             self.fair_graph_stats.extend(stats_list)
+
+        # Adversarial reordering: build per-NODE arrival times.
+        # Group workers by node: workers 0..W-1 → node 0, etc.
+        workers_per_node = self.workers if isinstance(self.workers, int) else 1
+        n_nodes = self.committee_size if isinstance(self.committee_size, int) else len(primaries)
+        self.per_node_arrivals = []
+        for node_idx in range(n_nodes):
+            node_arrivals = {}
+            for w_offset in range(workers_per_node):
+                w_idx = node_idx * workers_per_node + w_offset
+                if w_idx < len(arrival_times_list):
+                    for tx_uid, t in arrival_times_list[w_idx].items():
+                        if tx_uid not in node_arrivals or t < node_arrivals[tx_uid]:
+                            node_arrivals[tx_uid] = t
+            self.per_node_arrivals.append(node_arrivals)
 
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
@@ -313,7 +329,12 @@ class LogParser:
                 'total_ordered': 0,    # computed in summary instead
             })
 
-        return sizes, samples, ip, fair_ordered_txs, fair_graph_stats
+        # Adversarial reordering: per-worker arrival order.
+        # Matches: "fairness_arrival tx_uid=12345 oi=67"
+        tmp = findall(r'\[(.*Z) .* fairness_arrival tx_uid=(\d+) oi=(\d+)', log)
+        arrival_times = {int(tx_uid): _to_posix(t) for t, tx_uid, oi in tmp}
+
+        return sizes, samples, ip, fair_ordered_txs, fair_graph_stats, arrival_times
 
     # ------------------------------------------------------------------
     # Attack results
@@ -511,6 +532,126 @@ class LogParser:
         return self._fairdag_latency()
 
     # ------------------------------------------------------------------
+    # Adversarial reordering: Dist(tx,tx') vs fraction reversed
+    # ------------------------------------------------------------------
+
+    def _adversarial_reordering(self, n_sample_pairs=100_000, max_pair_gap=5000):
+        """
+        Compute fraction of reversed tx pairs grouped by Dist(tx,tx').
+
+        Dist(tx,tx') = |#(tx<tx') - #(tx'<tx)|
+            #(x<y) = number of nodes that received x before y.
+
+        Reversed: send(tx) < send(tx') but finalized(tx') < finalized(tx).
+        Pairs are sampled from within the same client (avoids clock-sync issues).
+
+        max_pair_gap: only pair txs within this many positions of each other
+                      in send-time order. With rate ~5000 tx/s and gap 5000,
+                      this covers ~1 second — enough for network propagation
+                      to create Dist variation, while excluding trivially-
+                      ordered far-apart pairs.
+        """
+        N = self.committee_size
+        if not isinstance(N, int) or N < 2:
+            return None
+
+        if not hasattr(self, 'per_node_arrivals') or not self.per_node_arrivals:
+            return None
+
+        finalized = self.fair_ordered_txs  # {tx_uid: timestamp}
+        if not finalized:
+            return None
+
+        # X-axis: valid Dist values from (N mod 2) to N in steps of 2
+        start_dist = N % 2
+        dist_values = list(range(start_dist, N + 1, 2))
+
+        # Build candidate tx lists per client, sorted by send time
+        per_client_sorted = []
+        for client_sent in self.sent_samples:
+            valid = [tx for tx in client_sent if tx in finalized]
+            if len(valid) >= 2:
+                # Sort by send time so index proximity ≈ temporal proximity
+                valid.sort(key=lambda tx: client_sent[tx])
+                per_client_sorted.append((valid, client_sent))
+
+        if not per_client_sorted:
+            return None
+
+        random.seed(42)  # reproducibility
+
+        # Count total candidate pairs (within window) across all clients
+        total_candidates = 0
+        for valid, _ in per_client_sorted:
+            n = len(valid)
+            for i in range(n):
+                j_max = min(i + max_pair_gap, n - 1)
+                total_candidates += (j_max - i)
+
+        all_pairs = []
+
+        for valid, client_sent in per_client_sorted:
+            n = len(valid)
+            # Proportional share of samples for this client
+            client_candidates = sum(min(max_pair_gap, n - 1 - i) for i in range(n))
+            n_from_client = max(1, int(n_sample_pairs * client_candidates / max(total_candidates, 1)))
+            n_from_client = min(n_from_client, client_candidates)
+
+            # Sample pairs within the window
+            sampled = set()
+            attempts = 0
+            while len(sampled) < n_from_client and attempts < n_from_client * 10:
+                i = random.randint(0, n - 2)
+                gap = random.randint(1, min(max_pair_gap, n - 1 - i))
+                j = i + gap
+                pair = (i, j)
+                sampled.add(pair)
+                attempts += 1
+
+            for i, j in sampled:
+                # valid is already sorted by send time, so valid[i] sent before valid[j]
+                all_pairs.append((valid[i], valid[j]))
+
+        if len(all_pairs) > n_sample_pairs:
+            all_pairs = random.sample(all_pairs, n_sample_pairs)
+
+        # Compute Dist and reversal for each pair
+        dist_counts = {d: 0 for d in dist_values}
+        dist_reversed = {d: 0 for d in dist_values}
+
+        for tx1, tx2 in all_pairs:
+            count_tx1_first = 0
+            count_tx2_first = 0
+
+            for node_arrivals in self.per_node_arrivals:
+                if tx1 in node_arrivals and tx2 in node_arrivals:
+                    if node_arrivals[tx1] < node_arrivals[tx2]:
+                        count_tx1_first += 1
+                    elif node_arrivals[tx2] < node_arrivals[tx1]:
+                        count_tx2_first += 1
+
+            dist = abs(count_tx1_first - count_tx2_first)
+
+            # Snap to nearest valid Dist value
+            if dist not in dist_counts:
+                nearest = min(dist_values, key=lambda d: abs(d - dist))
+                dist = nearest
+
+            dist_counts[dist] += 1
+
+            if finalized[tx2] < finalized[tx1]:
+                dist_reversed[dist] += 1
+
+        results = {}
+        for d in dist_values:
+            if dist_counts[d] > 0:
+                results[d] = (dist_reversed[d] / dist_counts[d], dist_counts[d])
+            else:
+                results[d] = (0.0, 0)
+
+        return results
+
+    # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
 
@@ -547,6 +688,15 @@ class LogParser:
             attack_print = f"Sluggish front-running rate: {round(sluggish_succ_num/sluggish_total*100, 2):,}% ({sluggish_succ_num:,}/{sluggish_total:,})"
         elif speculative_total != 0:
             attack_print = f"Speculative front-running rate: {round(speculative_succ_num/speculative_total*100, 2):,}% ({speculative_succ_num:,}/{speculative_total:,})"
+
+        # Adversarial reordering
+        reorder_results = self._adversarial_reordering()
+        reorder_print = ""
+        if reorder_results:
+            reorder_print = '\n + ADVERSARIAL REORDERING (Dist -> fraction reversed):\n'
+            for d in sorted(reorder_results.keys()):
+                frac, count = reorder_results[d]
+                reorder_print += f'   Dist={d:3d}: {frac:.4f}  ({count:,} pairs)\n'
 
         return (
             '\n'
@@ -587,6 +737,7 @@ class LogParser:
             '\n'
             ' + ATTACK:\n'
             f' {attack_print} \n'
+            f'{reorder_print}'
             '-----------------------------------------\n'
         )
 

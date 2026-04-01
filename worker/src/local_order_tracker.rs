@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::convert::TryInto;
+#[cfg(feature = "benchmark")]
+use log::info;
 
 pub type TxDigest = u64;
 
@@ -55,6 +57,9 @@ impl LocalOrderTracker {
             inner.counter += 1;
             let oi = inner.counter;
             inner.seen.insert(tx_digest, oi);
+            // NOTE: This log entry is used to compute adversarial reordering metrics.
+            #[cfg(feature = "benchmark")]
+            info!("fairness_arrival tx_uid={} oi={}", tx_digest, oi);
             oi
         }
     }
