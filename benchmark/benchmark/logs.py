@@ -75,11 +75,18 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_graph_stats_list, arrival_times_list = zip(*results)
+        sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_ordered_seqs_list, fair_graph_stats_list, arrival_times_list = zip(*results)
         self.sizes = {k: v for x in sizes for k, v in x.items() if k in self.commits}
         self.all_received_samples = self._merge_dicts(self.received_samples)
 
         self.fair_ordered_txs = self._merge_results([x.items() for x in fair_ordered_txs_list])
+
+        # Protocol's final ordering (position in log, not timestamp).
+        # Take from first worker that has it (all workers finalize same order).
+        self.fair_ordered_seqs = {}
+        for seqs in fair_ordered_seqs_list:
+            if seqs and not self.fair_ordered_seqs:
+                self.fair_ordered_seqs = seqs
 
         self.fair_graph_stats = []
         for stats_list in fair_graph_stats_list:
@@ -205,6 +212,12 @@ class LogParser:
 
         tmp = findall(r"\[(.*Z) .* FairDAG-RL ordered transaction: (\d+)", log)
         fair_ordered_txs = {int(tx_id): _to_posix(t) for t, tx_id in tmp}
+        # Position in log = protocol's final order (no timestamp needed)
+        fair_ordered_seqs = {}
+        for pos, (t, tx_id) in enumerate(tmp):
+            tx = int(tx_id)
+            if tx not in fair_ordered_seqs:
+                fair_ordered_seqs[tx] = pos
 
         fair_graph_stats = []
         tmp_old = findall(r"\[(.*Z) .* FairnessLayer: finalized (\d+) transactions from graph (\d+) \(round (\d+)\)\. Total ordered: (\d+)", log)
@@ -216,7 +229,7 @@ class LogParser:
 
         tmp = findall(r'\[(.*Z) .* fairness_arrival tx_uid=(\d+) oi=(\d+)', log)
         arrival_times = {int(tx_uid): _to_posix(t) for t, tx_uid, oi in tmp}
-        return sizes, samples, ip, fair_ordered_txs, fair_graph_stats, arrival_times
+        return sizes, samples, ip, fair_ordered_txs, fair_ordered_seqs, fair_graph_stats, arrival_times
 
     # ---- Attack results ----
 
@@ -313,7 +326,9 @@ class LogParser:
         N = self.committee_size
         if not isinstance(N, int) or N < 2: return None
         if not hasattr(self, 'per_node_arrivals') or not self.per_node_arrivals: return None
-        finalized = self.fair_ordered_txs
+        # Use protocol's ordering position (not timestamps — timestamps
+        # lose intra-subdag order due to millisecond quantization).
+        finalized = self.fair_ordered_seqs
         if not finalized: return None
 
         f = self.faults if isinstance(self.faults, int) else 0
