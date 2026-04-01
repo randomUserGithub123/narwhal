@@ -542,8 +542,9 @@ class LogParser:
         Dist(tx,tx') = |#(tx<tx') - #(tx'<tx)|
             #(x<y) = number of nodes that received x before y.
 
-        Reversed: send(tx) < send(tx') but finalized(tx') < finalized(tx).
-        Pairs are sampled from within the same client (avoids clock-sync issues).
+        Reversed: the majority of nodes received tx before tx', but
+        the protocol finalized tx' before tx (i.e., the adversary
+        successfully overrode the honest majority ordering).
 
         max_pair_gap: only pair txs within this many positions of each other
                       in send-time order. With rate ~5000 tx/s and gap 5000,
@@ -639,8 +640,19 @@ class LogParser:
 
             dist_counts[dist] += 1
 
-            if finalized[tx2] < finalized[tx1]:
-                dist_reversed[dist] += 1
+            # Ground truth = honest majority ordering.
+            # "Reversed" means the adversary flipped the pair vs what
+            # the majority of nodes observed.
+            if count_tx1_first > count_tx2_first:
+                # Majority says tx1 should come first
+                if finalized[tx2] < finalized[tx1]:
+                    dist_reversed[dist] += 1
+            elif count_tx2_first > count_tx1_first:
+                # Majority says tx2 should come first
+                if finalized[tx1] < finalized[tx2]:
+                    dist_reversed[dist] += 1
+            # If tied (count_tx1_first == count_tx2_first), skip —
+            # no clear ground truth, and Dist=0 anyway.
 
         results = {}
         for d in dist_values:
