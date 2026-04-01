@@ -59,6 +59,9 @@ pub struct BatchMaker {
     /// indirect arrivals — so if a tx arrived in another worker's batch
     /// first, it already has an earlier OI.
     tracker: LocalOrderTracker,
+
+    is_byzantine: bool,
+    byzantine_active: bool,
 }
 
 impl BatchMaker {
@@ -69,6 +72,8 @@ impl BatchMaker {
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         tracker: LocalOrderTracker,
+        is_byzantine: bool,
+        byzantine_active: bool,
     ) {
         tokio::spawn(async move {
             Self {
@@ -81,6 +86,8 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 tracker,
+                is_byzantine,
+                byzantine_active,
             }
             .run()
             .await;
@@ -152,7 +159,16 @@ impl BatchMaker {
         );
 
         self.current_batch_size = 0;
-        let batch: Batch = self.current_batch.drain(..).collect();
+        let mut batch: Batch = self.current_batch.drain(..).collect();
+
+        if self.is_byzantine && self.byzantine_active && !batch.is_empty() {
+            let mut ois: Vec<u64> = batch.iter().map(|(_, oi)| *oi).collect();
+            ois.reverse();
+            for (i, (_, oi)) in batch.iter_mut().enumerate() {
+                *oi = ois[i];
+            }
+        }
+
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 

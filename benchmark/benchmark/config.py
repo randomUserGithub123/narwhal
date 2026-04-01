@@ -1,7 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from json import dump, load
 from collections import OrderedDict
-
+from random import sample
 import socket
 
 class ConfigError(Exception):
@@ -139,6 +139,30 @@ class Committee:
                     authority_addresses += [(id, worker["transactions"])]
                 addresses.append(authority_addresses)
         return addresses
+
+    def get_byzantine_nodes(self, f):
+        
+        assert isinstance(f, int) and f >= 0
+        assert f <= self.size(), "Cannot select more Byzantine nodes than total nodes"
+        
+        # if self.attack_type in {0, 10}:
+        #     target_attack_types = {0}
+        # else:
+        #     target_attack_types = {2, 4, 6}
+        
+        # candidate_indices = []
+        # for idx, (_, authority) in enumerate(self.json['authorities'].items()):
+        #     if 'attack_type' in authority and authority['attack_type'] in target_attack_types:
+        #         candidate_indices.append(idx)
+        
+        # if not candidate_indices:
+        
+        candidate_indices = list(range(self.size()))
+        
+        assert len(candidate_indices) >= f, \
+            f"Not enough candidate nodes ({len(candidate_indices)}) for {f} Byzantine nodes"
+        
+        return sample(candidate_indices, f)
 
     def ips(self, name=None):
         ''' Returns all the ips associated with an authority (in any order). '''
