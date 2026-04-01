@@ -1,9 +1,10 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 // Modified for FairDAG-RL: uses shared LocalOrderTracker to assign ordering
 // indicators based on first-arrival time (regardless of source).
+// Also includes indirect tx entries from other workers' batches.
 use crate::local_order_tracker::{extract_tx_digest, LocalOrderTracker};
 use crate::quorum_waiter::QuorumWaiterMessage;
-use crate::worker::WorkerMessage;
+use crate::worker::{IndirectTxEntry, WorkerMessage};
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
@@ -55,10 +56,15 @@ pub struct BatchMaker {
     // FairDAG-RL: shared local order tracker
     // =========================================================================
     /// Shared tracker that records the local arrival order of transactions.
-    /// This is the same tracker used by the WorkerReceiverHandler for
-    /// indirect arrivals — so if a tx arrived in another worker's batch
-    /// first, it already has an earlier OI.
     tracker: LocalOrderTracker,
+
+    // =========================================================================
+    // FairDAG-RL: indirect tx entries from other workers
+    // =========================================================================
+    /// Channel to receive indirect tx entries forwarded by WorkerReceiverHandler.
+    rx_indirect: Receiver<IndirectTxEntry>,
+    /// Accumulated indirect entries to include in the next sealed batch.
+    pending_indirect: Vec<IndirectTxEntry>,
 
     is_byzantine: bool,
     byzantine_active: bool,
@@ -72,6 +78,7 @@ impl BatchMaker {
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         tracker: LocalOrderTracker,
+        rx_indirect: Receiver<IndirectTxEntry>,
         is_byzantine: bool,
         byzantine_active: bool,
     ) {
@@ -86,6 +93,8 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 tracker,
+                rx_indirect,
+                pending_indirect: Vec::new(),
                 is_byzantine,
                 byzantine_active,
             }
@@ -104,9 +113,6 @@ impl BatchMaker {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
                     // FairDAG-RL: record this tx in the shared tracker.
-                    // If it already arrived via another worker's batch, this
-                    // returns the EARLIER OI. If it's genuinely new, it gets
-                    // the next counter value.
                     let tx_digest = extract_tx_digest(&transaction);
                     let oi = self.tracker.record(tx_digest);
 
@@ -122,6 +128,13 @@ impl BatchMaker {
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
+                },
+
+                // FairDAG-RL: Drain indirect tx entries from WorkerReceiverHandler.
+                // These are direct entries from other workers' batches that we
+                // accumulate and attach to our next outgoing batch.
+                Some(entry) = self.rx_indirect.recv() => {
+                    self.pending_indirect.push(entry);
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
@@ -152,14 +165,18 @@ impl BatchMaker {
             .collect();
 
         debug!(
-            "FairDAG BatchMaker: sealing batch with {} entries, OI range [{}, {}]",
+            "FairDAG BatchMaker: sealing batch with {} direct entries, {} indirect entries, OI range [{}, {}]",
             self.current_batch.len(),
+            self.pending_indirect.len(),
             self.current_batch.first().map(|(_, oi)| *oi).unwrap_or(0),
             self.current_batch.last().map(|(_, oi)| *oi).unwrap_or(0),
         );
 
         self.current_batch_size = 0;
         let mut batch: Batch = self.current_batch.drain(..).collect();
+
+        // Drain accumulated indirect entries for this batch.
+        let indirect: Vec<IndirectTxEntry> = self.pending_indirect.drain(..).collect();
 
         if self.is_byzantine && self.byzantine_active && !batch.is_empty() {
             let mut ois: Vec<u64> = batch.iter().map(|(_, oi)| *oi).collect();
@@ -169,7 +186,8 @@ impl BatchMaker {
             }
         }
 
-        let message = WorkerMessage::Batch(batch);
+        // FairDAG-RL: Batch now includes both direct and indirect entries.
+        let message = WorkerMessage::Batch(batch, indirect);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]

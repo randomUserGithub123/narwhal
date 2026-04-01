@@ -5,6 +5,8 @@
 //   1. SharedLocalOrderTracker for OI assignment (v3)
 //   2. WorkerMessage::Batch carries (tx, oi) pairs (v3)
 //   3. PrimaryReceiverHandler dispatches ExecuteSubdag to FairDagProcessor (v4)
+//   4. Indirect tx propagation: direct entries from incoming batches are
+//      forwarded to BatchMaker so they piggyback on outgoing batches (one-hop).
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::fairdag_processor::FairDagProcessor;
 use crate::helper::Helper;
@@ -36,11 +38,15 @@ pub const CHANNEL_CAPACITY: usize = 10_000;
 /// Indicates a serialized `WorkerPrimaryMessage` message.
 pub type SerializedBatchDigestMessage = Vec<u8>;
 
+/// Indirect tx arrival: (tx_digest, local_oi) from WorkerReceiverHandler → BatchMaker.
+pub type IndirectTxEntry = (u64, u64);
+
 /// The message exchanged between workers.
-/// FairDAG-RL: Batch carries Vec<(Transaction, u64)> — each tx with its OI.
+/// FairDAG-RL: Batch carries Vec<(Transaction, u64)> as direct entries,
+/// plus Vec<IndirectTxEntry> as indirect entries (tx_digest + OI only).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Batch(Batch),
+    Batch(Batch, Vec<IndirectTxEntry>),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
@@ -95,9 +101,12 @@ impl Worker {
         // FairDAG-RL: Channel for committed subdags → FairDagProcessor.
         let (tx_fairdag, rx_fairdag) = channel(CHANNEL_CAPACITY);
 
+        // FairDAG-RL: Channel for indirect tx entries from WorkerReceiverHandler → BatchMaker.
+        let (tx_indirect, rx_indirect) = channel(CHANNEL_CAPACITY);
+
         worker.handle_primary_messages(tx_fairdag);
-        worker.handle_clients_transactions(tx_primary.clone(), tracker.clone());
-        worker.handle_workers_messages(tx_primary, tracker);
+        worker.handle_clients_transactions(tx_primary.clone(), tracker.clone(), rx_indirect);
+        worker.handle_workers_messages(tx_primary, tracker, tx_indirect);
 
         // FairDAG-RL: Spawn the FairDagProcessor. It reads batches from the
         // local store and runs the fairness layer.
@@ -177,6 +186,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tracker: LocalOrderTracker,
+        rx_indirect: tokio::sync::mpsc::Receiver<IndirectTxEntry>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -196,7 +206,7 @@ impl Worker {
             TxReceiverHandler { byzantine_active, is_byzantine, tx_batch_maker },
         );
 
-        // FairDAG-RL: BatchMaker gets the shared tracker.
+        // FairDAG-RL: BatchMaker gets the shared tracker + rx_indirect channel.
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
@@ -208,6 +218,7 @@ impl Worker {
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
             tracker,
+            rx_indirect,
             self.is_byzantine,
             self.byzantine_active,
         );
@@ -238,6 +249,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tracker: LocalOrderTracker,
+        tx_indirect: Sender<IndirectTxEntry>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -259,6 +271,7 @@ impl Worker {
                 tx_helper,
                 tx_processor,
                 tracker,
+                tx_indirect,
             },
         );
 
@@ -313,7 +326,8 @@ impl MessageHandler for TxReceiverHandler {
 }
 
 /// Handles incoming messages from other workers.
-/// FairDAG-RL: records indirect tx arrivals in the shared tracker.
+/// FairDAG-RL: records indirect tx arrivals in the shared tracker and
+/// forwards direct entries to BatchMaker (one-hop propagation only).
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     byzantine_active: bool,
@@ -321,6 +335,8 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tracker: LocalOrderTracker,
+    /// Channel to forward indirect tx entries to BatchMaker.
+    tx_indirect: Sender<IndirectTxEntry>,
 }
 
 #[async_trait]
@@ -332,10 +348,20 @@ impl MessageHandler for WorkerReceiverHandler {
             let _ = writer.send(Bytes::from("Ack")).await;
 
             match bincode::deserialize(&serialized) {
-                Ok(WorkerMessage::Batch(ref batch_entries)) => {
-                    // FairDAG-RL: Record indirect arrivals.
-                    for (tx_bytes, _sender_oi) in batch_entries {
+                Ok(WorkerMessage::Batch(ref direct_entries, ref _indirect_entries)) => {
+                    // FairDAG-RL: Direct entries from the incoming batch —
+                    // record in tracker AND forward to BatchMaker as indirect
+                    // candidates for our own outgoing batches.
+                    for (tx_bytes, _sender_oi) in direct_entries {
                         let tx_digest = extract_tx_digest(tx_bytes);
+                        let local_oi = self.tracker.record(tx_digest);
+                        let _ = self.tx_indirect.send((tx_digest, local_oi)).await;
+                    }
+
+                    // Indirect entries from the incoming batch: record in
+                    // tracker for OI only. Do NOT re-forward — prevents
+                    // multi-hop amplification.
+                    for &(tx_digest, _sender_oi) in _indirect_entries {
                         self.tracker.record(tx_digest);
                     }
 

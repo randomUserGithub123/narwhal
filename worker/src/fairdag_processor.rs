@@ -69,12 +69,6 @@ impl FairDagProcessor {
 
             // ─────────────────────────────────────────────────────────────────
             // Step 1: Drain all queued subdags into a batch.
-            //
-            // After the blocking recv() returns one subdag, try_recv() pulls
-            // any additional subdags that arrived while we were processing
-            // the previous batch. This turns sequential processing into
-            // pipelined batch processing: all extractions happen first, then
-            // all fairness computation benefits from the combined OI data.
             // ─────────────────────────────────────────────────────────────────
             let mut batch_raw: Vec<(Round, Vec<Certificate>)> = vec![(leader_round, certificates)];
             while let Ok((r, c)) = self.rx_committed_subdags.try_recv() {
@@ -91,10 +85,6 @@ impl FairDagProcessor {
 
             // ─────────────────────────────────────────────────────────────────
             // Step 2: Extract all subdags (reads from store).
-            //
-            // This is I/O-bound (store reads), so doing it for the full batch
-            // before any computation means the fairness layer has ALL OIs
-            // available when it starts processing.
             // ─────────────────────────────────────────────────────────────────
             let extract_start = Instant::now();
             let mut subdags: Vec<CommittedSubdag> = Vec::with_capacity(batch_size);
@@ -129,14 +119,6 @@ impl FairDagProcessor {
 
             // ─────────────────────────────────────────────────────────────────
             // Step 3: Process all subdags through the fairness layer.
-            //
-            // Sequential processing: each subdag is processed individually.
-            // Even without process_subdag_batch(), this benefits from batch
-            // extraction because later subdags' OIs from update_nodes are
-            // available when earlier graphs run update_weights_and_edges.
-            //
-            // With the batch lib.rs (process_subdag_batch), all ingest happens
-            // first, then catchup/weights/finalize run once with all OIs.
             // ─────────────────────────────────────────────────────────────────
             let process_start = Instant::now();
             let mut total_fair_ordered: usize = 0;
@@ -201,7 +183,10 @@ impl FairDagProcessor {
                     Ok(Some(serialized_batch)) => {
                         batches_found += 1;
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            Ok(WorkerMessage::Batch(batch_entries)) => {
+                            // FairDAG-RL: Updated pattern to match new Batch variant
+                            // with indirect entries. We only use the direct entries
+                            // for ordering — indirect entries are informational.
+                            Ok(WorkerMessage::Batch(batch_entries, _indirect_entries)) => {
                                 for (tx_bytes, oi) in batch_entries {
                                     let tx_id = extract_tx_digest(&tx_bytes);
                                     ordering_entries.push((tx_id, oi));
