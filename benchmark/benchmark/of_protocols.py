@@ -257,16 +257,15 @@ class OFBench:
         num_faults = int(self.node_parameters.json.get('faults', 0))
         min_coverage = n_replicas - num_faults
 
-        logs_dir = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), PathMaker.logs_path())
-        )
-
         # 1. Parse per-replica arrival times and protocol ordering
         per_node_arrivals = []   # list of dicts: tx_uid -> timestamp
         protocol_order = {}      # tx_uid -> position (from first replica that has it)
 
         for i in range(n_replicas):
-            log_file = os.path.join(logs_dir, f"replica-{i}.log")
+            log_file = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                             PathMaker.hotstuff_log_file(f"replica-{i}"))
+            )
             arrivals_i = {}
             if not os.path.exists(log_file):
                 Print.warn(f"Replica log not found: {log_file}")
