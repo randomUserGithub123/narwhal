@@ -27,6 +27,7 @@ class OFBench:
         except ConfigError as e:
             raise BenchError("Invalid bench parameters", e)
         self.local = local
+        self.num_clients = bench_parameters_dict.get('num_clients', 1)
         if(
             not self.local
         ):
@@ -126,9 +127,10 @@ class OFBench:
             Print.warn(f"Error during kill: {e}")
 
     def _preserve_machines(self, nodes):
-        # we need one machine per node + 1 for client
+        # One machine per replica + 1 machine per 4 clients (like DAS)
         self._amount_for_nodes = self.nodes[0]
-        self._num_machines = self._amount_for_nodes + 1
+        self._num_client_machines = ceil(self.num_clients / 4)
+        self._num_machines = self._amount_for_nodes + self._num_client_machines
 
         time_string = str(datetime.timedelta(seconds=self.duration + 72 + nodes * 2)) # extra time to set up things
         self.reservation_id = self.preserve_manager.create_reservation(self._num_machines + len(BANNED_NODES), time_string)
@@ -359,11 +361,13 @@ class OFBench:
                 flavor=self.flavor
             ))
 
+            num_clients = self.num_clients
+
             if(
                 local
             ):
                 replica_IPs = ['127.0.0.1'] * self.nodes[0]
-                self.clients_hostnames = [None]
+                self.clients_hostnames = [None] * num_clients
             else:
                 self._preserve_machines(self.nodes[0])
                 sleep(5)
@@ -374,7 +378,11 @@ class OFBench:
                 shuffle(all_hostnames)
                 all_hostnames = all_hostnames[:self._num_machines]
                 replica_IPs = all_hostnames[:self._amount_for_nodes]
-                self.clients_hostnames = all_hostnames[self._amount_for_nodes:]
+                client_machines = all_hostnames[self._amount_for_nodes:]
+                # Pack up to 4 clients per machine (like DAS)
+                self.clients_hostnames = [
+                    client_machines[i // 4] for i in range(num_clients)
+                ]
 
             Print.info(f"Generating {flavor} configuration files...")
             if(
@@ -427,12 +435,13 @@ class OFBench:
 
             sleep(5) # Wait for replicas to be spawned, otherwise client will silently exit
 
-            Print.info(f"Starting {flavor} Client(s) ...")
+            Print.info(f"Starting {flavor} Client(s) ({num_clients} clients)...")
             client_logs = []
+            rate_share = ceil(int(self.bench_parameters.rate[0]) / num_clients)
             for i, hostname in enumerate(self.clients_hostnames):
                 client_cmd = CommandMaker.run_hotstuff_client(
-                    idx=0,
-                    max_async=int(self.bench_parameters.rate[0]),
+                    idx=i,
+                    max_async=rate_share,
                     tx_size=self.tx_size,
                     fairness=self.node_parameters.json['gamma'],
                     sb_users=sb_users,

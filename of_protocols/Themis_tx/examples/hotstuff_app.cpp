@@ -23,6 +23,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <chrono>
+#include <thread>
 
 #include "salticidae/stream.h"
 #include "salticidae/util.h"
@@ -97,6 +99,14 @@ class HotStuffApp: public HotStuff {
 
     /* database manager for in-memory database (Small Bank) */
     SmallBankManager *small_bank_manager;
+
+    /* Receive-side jitter for fairness measurement:
+     * Simulates independent network delay per replica per tx.
+     * Hardcoded: exponential with mean = 5ms.
+     * With N=21 and 1000 tx/s this gives realistic ordering diversity. */
+    static constexpr double JITTER_MEAN_US = 5000.0;  // 5 ms in microseconds
+    std::mt19937_64 jitter_rng{std::random_device{}()};
+    std::exponential_distribution<double> jitter_dist{1.0 / JITTER_MEAN_US};
 
     void client_request_cmd_handler(MsgReqCmd &&, const conn_t &);
 
@@ -389,6 +399,12 @@ void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn
 
     // Register tx_uid mapping and log arrival for adversarial reordering metric
     {
+        // Receive-side jitter: simulate independent network delay per replica
+        // double delay_us = jitter_dist(jitter_rng);
+        // std::this_thread::sleep_for(
+            // std::chrono::microseconds(static_cast<int64_t>(delay_us))
+        // );
+
         uint64_t tx_uid = (uint64_t)cmd->get_cid() * 1000000000ULL + (uint64_t)cmd->get_cnt();
         register_tx_uid(cmd_hash, tx_uid);
         struct timeval tv;

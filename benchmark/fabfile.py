@@ -257,7 +257,7 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
         # (0, 1, 1, 800, 1.0, 1, 5, 5, 4000),
         #### Change input_rate #####
         # (0, 1, 1, None, 1.0, 1, 5, 1, 500),
-        (0, 1, 1, None, 1.0, 1, 5, 1, 1000),
+        (0, 1, 1, 100, 1.0, 1, 5, 1, 1000),
         # (0, 1, 1, None, 1.0, 1, 5, 1, 1500),
         # (0, 1, 1, None, 1.0, 1, 5, 1, 2000),
         # (0, 1, 1, None, 1.0, 1, 5, 1, 2500),
@@ -289,6 +289,7 @@ def of(ctx, debug=True, local=False, username="mputnik", flavor="hotstuff"):
             'rate': rate,
             'tx_size': 128,
             'duration': 60,
+            'num_clients': 7, # number of client machines sending transactions
         }
         node_params = {
             'header_size': 512,  # bytes
