@@ -72,7 +72,8 @@ class CommandMaker:
     @staticmethod
     def run_hotstuff_replicas(
         n_replicas,
-        is_pompe_variant: bool = False
+        is_pompe_variant: bool = False,
+        num_faults: int = 0
     ):
 
         assert isinstance(n_replicas, int) and n_replicas > 0
@@ -80,7 +81,7 @@ class CommandMaker:
         cmds = []
         for i in range(n_replicas):
             if not is_pompe_variant:
-                cmd = f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf"
+                cmd = f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf --num-faults {num_faults}"
             else:
                 benchmark_log_dir = join(dirname(dirname(__file__)), "logs")
                 cmd = f"./examples/pompe-app ./conf-gen/hotstuff.conf {benchmark_log_dir}/server{i}.log --conf ./conf-gen/hotstuff-sec{i}.conf"

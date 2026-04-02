@@ -148,6 +148,9 @@ class CommandDummy: public Command {
         return payload;
     }
 
+    uint32_t get_cid() const { return cid; }
+    uint32_t get_cnt() const { return n; }
+
     bool verify() const override {
         return true;
     }

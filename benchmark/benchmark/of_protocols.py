@@ -236,9 +236,149 @@ class OFBench:
         print(f"Average latency: {average_latency} ms")
         print("=================================\n")
 
+        # Compute adversarial reordering metric
+        reorder_str = self._compute_adversarial_reordering()
+
+        tps = count / self.duration
+        rate = self.bench_parameters.rate[0]
         return SimpleNamespace(
-            result=lambda: f"{self.bench_parameters.rate[0]} {count / self.duration} {average_latency}"
+            result=lambda: f"{rate} {tps} {average_latency}\n{reorder_str}"
         )
+
+    def _compute_adversarial_reordering(self):
+        """
+        Parse replica logs for fairness_arrival / fairness_ordered lines
+        and compute the Dist(tx,tx') vs fraction-reversed metric.
+        """
+        import re as _re
+        from collections import defaultdict
+
+        n_replicas = self.nodes[0]
+        num_faults = int(self.node_parameters.json.get('faults', 0))
+        min_coverage = n_replicas - num_faults
+
+        logs_dir = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), PathMaker.logs_path())
+        )
+
+        # 1. Parse per-replica arrival times and protocol ordering
+        per_node_arrivals = []   # list of dicts: tx_uid -> timestamp
+        protocol_order = {}      # tx_uid -> position (from first replica that has it)
+
+        for i in range(n_replicas):
+            log_file = os.path.join(logs_dir, f"replica-{i}.log")
+            arrivals_i = {}
+            if not os.path.exists(log_file):
+                Print.warn(f"Replica log not found: {log_file}")
+                per_node_arrivals.append(arrivals_i)
+                continue
+
+            try:
+                with open(log_file, 'r') as f:
+                    log_content = f.read()
+            except Exception as e:
+                Print.warn(f"Failed to read {log_file}: {e}")
+                per_node_arrivals.append(arrivals_i)
+                continue
+
+            # Parse arrivals: fairness_arrival tx_uid=<uid> ts=<sec>.<usec>
+            for m in _re.finditer(r'fairness_arrival tx_uid=(\d+) ts=(\d+\.\d+)', log_content):
+                tx_uid = int(m.group(1))
+                ts = float(m.group(2))
+                if tx_uid not in arrivals_i or ts < arrivals_i[tx_uid]:
+                    arrivals_i[tx_uid] = ts
+
+            per_node_arrivals.append(arrivals_i)
+
+            # Parse protocol ordering (take from first replica that has entries)
+            if not protocol_order:
+                pos = 0
+                for m in _re.finditer(r'fairness_ordered tx_uid=(\d+)', log_content):
+                    tx_uid = int(m.group(1))
+                    if tx_uid not in protocol_order:
+                        protocol_order[tx_uid] = pos
+                        pos += 1
+
+        if not protocol_order:
+            Print.warn("No fairness_ordered entries found in replica logs")
+            return "ADVERSARIAL REORDERING: no data"
+
+        # 2. Build eligible tx list (in protocol order, seen by >= min_coverage nodes)
+        eligible = []
+        for tx_uid in sorted(protocol_order.keys(), key=lambda t: protocol_order[t]):
+            n_seen = sum(1 for na in per_node_arrivals if tx_uid in na)
+            if n_seen >= min_coverage:
+                eligible.append(tx_uid)
+
+        n_txs = len(eligible)
+        if n_txs < 2:
+            Print.warn(f"Only {n_txs} eligible txs, need >= 2")
+            return "ADVERSARIAL REORDERING: not enough eligible txs"
+
+        Print.info(f"Adversarial reordering: {n_txs} eligible txs, {n_txs*(n_txs-1)//2} pairs, {n_replicas} nodes, min_coverage={min_coverage}")
+
+        # 3. For each pair, compute Dist and check reversal
+        start_dist = n_replicas % 2
+        max_dist = n_replicas
+        # Buckets: dist -> (count, reversed)
+        buckets = defaultdict(lambda: [0, 0])
+
+        fin_pos = {tx: protocol_order[tx] for tx in eligible}
+
+        for i_idx in range(n_txs):
+            tx_i = eligible[i_idx]
+            fi = fin_pos[tx_i]
+            for j_idx in range(i_idx + 1, n_txs):
+                tx_j = eligible[j_idx]
+                fj = fin_pos[tx_j]
+
+                c1 = 0  # nodes where tx_i arrived before tx_j
+                c2 = 0  # nodes where tx_j arrived before tx_i
+                both = 0
+
+                for na in per_node_arrivals:
+                    if tx_i not in na or tx_j not in na:
+                        continue
+                    both += 1
+                    if na[tx_i] < na[tx_j]:
+                        c1 += 1
+                    elif na[tx_j] < na[tx_i]:
+                        c2 += 1
+
+                if both < min_coverage:
+                    continue
+
+                dist = abs(c1 - c2)
+
+                # Snap to valid dist value (same parity as n)
+                if dist % 2 != start_dist % 2:
+                    dist = max(dist - 1, start_dist)
+                dist = min(dist, max_dist)
+
+                buckets[dist][0] += 1
+
+                # Reversed = majority says one order, protocol says opposite
+                reversed_pair = (c1 > c2 and fj < fi) or (c2 > c1 and fi < fj)
+                if reversed_pair:
+                    buckets[dist][1] += 1
+
+        # 4. Format output
+        dist_values = list(range(start_dist, max_dist + 1, 2))
+        total_pairs = 0
+        total_reversed = 0
+        lines = []
+        for d in dist_values:
+            count, rev = buckets.get(d, [0, 0])
+            total_pairs += count
+            total_reversed += rev
+            frac = rev / count if count > 0 else 0.0
+            lines.append(f"   Dist={d:3d}: {frac:.4f}  ({count:,} pairs, {rev:,} reversed)")
+
+        overall_frac = total_reversed / total_pairs if total_pairs > 0 else 0.0
+        header = f"ADVERSARIAL REORDERING (n={n_replicas}, f={num_faults}, eligible={n_txs}, total_pairs={total_pairs:,}, total_reversed={total_reversed:,}, overall={overall_frac:.4f}):"
+        result = header + "\n" + "\n".join(lines)
+        print(f"\n{result}\n")
+        return result
 
     def run(self, debug=False, local=True, flavor="themis"):
         
@@ -327,11 +467,13 @@ class OFBench:
             Print.info(f"Logs directory ensured at {logs_dir}")
 
             Print.info(f"Starting {flavor} Replicas ...")
+            num_faults = int(self.node_parameters.json.get('faults', 0))
             replica_cmds = CommandMaker.run_hotstuff_replicas(
                 n_replicas=self.nodes[0],
                 is_pompe_variant=(
                     flavor == "pompe"
-                )
+                ),
+                num_faults=num_faults
             )
             for i, cmd in enumerate(replica_cmds):
                 log_file = PathMaker.hotstuff_log_file(f"replica-{i}")

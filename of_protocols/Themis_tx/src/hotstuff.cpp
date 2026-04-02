@@ -526,6 +526,7 @@ HotStuffBase::~HotStuffBase() {}
 void HotStuffBase::start(
         std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
         double fairness_parameter,      // Themis
+        uint32_t num_faults,            // Byzantine simulation
         bool ec_loop) {
     for (size_t i = 0; i < replicas.size(); i++)
     {
@@ -552,6 +553,15 @@ void HotStuffBase::start(
     if (nfaulty == 0)
         LOG_WARN("too few replicas in the system to tolerate any failure");
     on_init(nfaulty, fairness_parameter);       // Themis
+
+    // Byzantine simulation: designate replicas 0..num_faults-1 as Byzantine
+    if (num_faults > 0 && get_id() < (ReplicaID)num_faults) {
+        set_byzantine(true);
+        LOG_INFO("[R-%d] *** BYZANTINE MODE ENABLED *** (num_faults=%d)", get_id(), num_faults);
+    } else if (num_faults > 0) {
+        LOG_INFO("[R-%d] Honest replica (num_faults=%d)", get_id(), num_faults);
+    }
+
     pmaker->init(this);
     if (ec_loop)
         ec.dispatch();

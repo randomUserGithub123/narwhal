@@ -245,6 +245,7 @@ class HotStuffBase: public HotStuffCore {
     void exec_command(uint256_t cmd_hash, commit_cb_t callback);
     void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                 double fairness_parameter,      // Themis
+                uint32_t num_faults = 0,        // Byzantine simulation
                 bool ec_loop = false);
 
     size_t size() const { return peers.size(); }
@@ -320,6 +321,7 @@ class HotStuff: public HotStuffBase {
 
     void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &replicas, 
                 double fairness_parameter,  // Themis
+                uint32_t num_faults = 0,    // Byzantine simulation
                 bool ec_loop = false) {
         std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
         for (auto &r: replicas)
@@ -329,7 +331,7 @@ class HotStuff: public HotStuffBase {
                     new PubKeyType(std::get<1>(r)),
                     uint256_t(std::get<2>(r))
                 ));
-        HotStuffBase::start(std::move(reps), fairness_parameter, ec_loop);      // Themis
+        HotStuffBase::start(std::move(reps), fairness_parameter, num_faults, ec_loop);      // Themis
     }
 };
 

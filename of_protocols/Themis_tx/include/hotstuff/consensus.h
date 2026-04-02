@@ -55,6 +55,10 @@ class HotStuffCore {
     /* == feature switches == */
     /** always vote negatively, useful for some PaceMakers */
     bool vote_disabled;
+    /** whether this replica acts as a Byzantine node (reverses local orders) */
+    bool is_byzantine_ = false;
+    /** map from command hash to numeric tx_uid for logging */
+    std::unordered_map<uint256_t, uint64_t> hash_to_txuid_;
 
     block_t get_delivered_blk(const uint256_t &blk_hash);
     void sanity_check_delivered(const block_t &blk);
@@ -188,6 +192,19 @@ class HotStuffCore {
     const std::set<block_t> get_tails() const { return tails; }
     operator std::string () const;
     void set_vote_disabled(bool f) { vote_disabled = f; }
+
+    /* Byzantine simulation */
+    void set_byzantine(bool b) { is_byzantine_ = b; }
+    bool is_byzantine() const { return is_byzantine_; }
+
+    /* tx_uid registration for adversarial reordering metric */
+    void register_tx_uid(const uint256_t &hash, uint64_t txuid) {
+        hash_to_txuid_[hash] = txuid;
+    }
+    uint64_t get_tx_uid(const uint256_t &hash) const {
+        auto it = hash_to_txuid_.find(hash);
+        return it != hash_to_txuid_.end() ? it->second : 0;
+    }
 };
 
 /** Abstraction for proposal messages. */

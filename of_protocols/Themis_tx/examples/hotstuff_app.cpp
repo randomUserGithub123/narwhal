@@ -22,6 +22,7 @@
 #include <random>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/time.h>
 
 #include "salticidae/stream.h"
 #include "salticidae/util.h"
@@ -146,7 +147,7 @@ class HotStuffApp: public HotStuff {
                 const Net::Config &repnet_config,
                 const ClientNetwork<opcode_t>::Config &clinet_config);
 
-    void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps, double fairness_parameter); // Themis
+    void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps, double fairness_parameter, uint32_t num_faults); // Themis + Byzantine
     void stop();
 };
 
@@ -192,6 +193,7 @@ int main(int argc, char **argv) {
     auto opt_notls = Config::OptValFlag::create(false);
     auto opt_max_rep_msg = Config::OptValInt::create(4 << 20); // 4M by default
     auto opt_max_cli_msg = Config::OptValInt::create(65536); // 64K by default
+    auto opt_num_faults = Config::OptValInt::create(0); // Byzantine simulation
 
     config.add_opt("sb-users", opt_sb_users, Config::SET_VAL);
     config.add_opt("sb-prob-choose_mtx", opt_sb_prob_choose_mtx, Config::SET_VAL);
@@ -219,6 +221,7 @@ int main(int argc, char **argv) {
     config.add_opt("notls", opt_notls, Config::SWITCH_ON, 's', "disable TLS");
     config.add_opt("max-rep-msg", opt_max_rep_msg, Config::SET_VAL, 'S', "the maximum replica message size");
     config.add_opt("max-cli-msg", opt_max_cli_msg, Config::SET_VAL, 'S', "the maximum client message size");
+    config.add_opt("num-faults", opt_num_faults, Config::SET_VAL, 'f', "number of Byzantine replicas for adversarial simulation");
     config.add_opt("help", opt_help, Config::SWITCH_ON, 'h', "show this help info");
 
     EventContext ec;
@@ -318,7 +321,7 @@ int main(int argc, char **argv) {
     ev_sigint.add(SIGINT);
     ev_sigterm.add(SIGTERM);
 
-    papp->start(reps, opt_fairness_parameter->get());  // Themis
+    papp->start(reps, opt_fairness_parameter->get(), opt_num_faults->get());  // Themis + Byzantine
     elapsed.stop(true);
     return 0;
 }
@@ -384,6 +387,16 @@ void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn
     HOTSTUFF_LOG_DEBUG("[[client_request_cmd_handler]] Payload Received [%.10s] = %s", get_hex(cmd->get_hash()).c_str(), data.c_str());                          
     HOTSTUFF_LOG_DEBUG("processing %s", std::string(*cmd).c_str()); 
 
+    // Register tx_uid mapping and log arrival for adversarial reordering metric
+    {
+        uint64_t tx_uid = (uint64_t)cmd->get_cid() * 1000000000ULL + (uint64_t)cmd->get_cnt();
+        register_tx_uid(cmd_hash, tx_uid);
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        HOTSTUFF_LOG_INFO("fairness_arrival tx_uid=%lu ts=%ld.%06ld",
+                          (unsigned long)tx_uid, (long)tv.tv_sec, (long)tv.tv_usec);
+    }
+
     exec_command(cmd_hash, [this, addr, cmd](Finality fin) {
 
          /* Execute the transaction before sending response to the client */
@@ -400,7 +413,7 @@ void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn
     });
 }
 
-void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps, double fairness_parameter) {  // Themis
+void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps, double fairness_parameter, uint32_t num_faults) {  // Themis + Byzantine
     ev_stat_timer = TimerEvent(ec, [this](TimerEvent &) {
         HotStuff::print_stat();
         HotStuffApp::print_stat();
@@ -422,7 +435,7 @@ void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytea
     HOTSTUFF_LOG_INFO("blk_size = %lu", blk_size);
     HOTSTUFF_LOG_INFO("conns = %lu", HotStuff::size());
     HOTSTUFF_LOG_INFO("** starting the event loop...");
-    HotStuff::start(reps, fairness_parameter);      // Themis
+    HotStuff::start(reps, fairness_parameter, num_faults);      // Themis + Byzantine
     cn.reg_conn_handler([this](const salticidae::ConnPool::conn_t &_conn, bool connected) {
         auto conn = salticidae::static_pointer_cast<conn_t::type>(_conn);
         if (connected)

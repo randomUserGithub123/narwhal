@@ -19,6 +19,7 @@
 #include <stack>
 #include <string>
 #include <queue>
+#include <algorithm>
 
 #include "hotstuff/util.h"
 #include "hotstuff/consensus.h"
@@ -199,6 +200,13 @@ void HotStuffCore::update(const block_t &nblk) {
         size_t n = order.size();
         for (size_t i=0; i<n; i++) {
             do_decide(Finality(id, 1, i, blk->height, order[i], blk->get_hash()));
+            // Log finalized ordering for adversarial reordering metric
+            {
+                uint64_t txuid = get_tx_uid(order[i]);
+                if (txuid != 0) {
+                    HOTSTUFF_LOG_INFO("fairness_ordered tx_uid=%lu", (unsigned long)txuid);
+                }
+            }
             storage->remove_local_order_seen_execute_level(order[i]);
             storage->remove_from_proposed_cmds_cache(order[i]);
         }
@@ -450,6 +458,12 @@ void HotStuffCore::on_local_order (ReplicaID proposer, const std::vector<uint256
     HOTSTUFF_LOG_DEBUG("[[on_local_order]] [R-%d] [L-%d] START", get_id(), proposer);
     /** Add seen but Unproposed commands to the local order **/
     auto cmds = order;
+
+    // Byzantine simulation: reverse local ordering
+    if (is_byzantine_) {
+        HOTSTUFF_LOG_INFO("[[BYZANTINE]] [R-%d] Reversing local order of %zu commands", get_id(), cmds.size());
+        std::reverse(cmds.begin(), cmds.end());
+    }
 
     if(!is_reorder){
         // cmds = storage->get_unproposed_cmds();
