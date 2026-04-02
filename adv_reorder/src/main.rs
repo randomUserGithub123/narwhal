@@ -31,6 +31,10 @@ struct Args {
     /// Show progress
     #[arg(short, long)]
     verbose: bool,
+
+    /// Log file glob pattern (default: worker-*-0.log)
+    #[arg(short = 'p', long, default_value = "worker-*-0.log")]
+    log_pattern: String,
 }
 
 /// Per-node arrival data: tx_uid → arrival timestamp (as f64 seconds)
@@ -65,30 +69,58 @@ fn parse_timestamp(s: &str) -> f64 {
     day * 86400.0 + h * 3600.0 + m * 60.0 + s + ms
 }
 
-/// Parse worker log for arrival times.
-/// Matches: "fairness_arrival tx_uid=12345" (DoD-W)
-/// or:      "fairness_arrival tx_uid=12345 oi=67" (Herring)
+/// Extract node ID from filename.
+/// Supports: worker-X-0.log → X, hotstuff-replica-X.log → X
+fn extract_node_id(filename: &str) -> Option<usize> {
+    // Try worker-X-0.log first
+    if let Some(caps) = Regex::new(r"worker-(\d+)-").ok()?.captures(filename) {
+        return caps.get(1)?.as_str().parse().ok();
+    }
+    // Try hotstuff-replica-X.log (Themis)
+    if let Some(caps) = Regex::new(r"hotstuff-replica-(\d+)").ok()?.captures(filename) {
+        return caps.get(1)?.as_str().parse().ok();
+    }
+    // Try replica-X.log (generic)
+    if let Some(caps) = Regex::new(r"replica-(\d+)").ok()?.captures(filename) {
+        return caps.get(1)?.as_str().parse().ok();
+    }
+    None
+}
+
+/// Parse worker/replica log for arrival times.
+/// Supports both formats:
+///   FairDAG:  "[2026-04-01T19:24:32.030Z ...] fairness_arrival tx_uid=12345"
+///   Themis:   "2026-04-02 13:12:28.565 [hotstuff info] fairness_arrival tx_uid=12345 ts=1775128348.565"
 fn parse_worker_arrivals(path: &PathBuf) -> Option<(usize, NodeArrivals)> {
     let filename = path.file_name()?.to_str()?;
-
-    // Extract node ID: worker-X-0.log → X
-    let re_fn = Regex::new(r"worker-(\d+)-").ok()?;
-    let node_id: usize = re_fn.captures(filename)?.get(1)?.as_str().parse().ok()?;
+    let node_id = extract_node_id(filename)?;
 
     let file = File::open(path).ok()?;
     let reader = BufReader::with_capacity(512 * 1024, file);
 
-    let re_arrival =
+    // Regex for FairDAG format: [ISO_TIMESTAMP ...] fairness_arrival tx_uid=N
+    let re_arrival_bracket =
         Regex::new(r"\[([\d\-T:.Z]+)\s.*fairness_arrival tx_uid=(\d+)").ok()?;
+    // Regex for Themis format: fairness_arrival tx_uid=N ts=EPOCH
+    let re_arrival_ts =
+        Regex::new(r"fairness_arrival tx_uid=(\d+) ts=([\d.]+)").ok()?;
 
     let mut arrivals: NodeArrivals = HashMap::new();
 
     for line in reader.lines().filter_map(|l| l.ok()) {
-        if let Some(caps) = re_arrival.captures(&line) {
+        // Try Themis format first (has explicit ts= epoch)
+        if let Some(caps) = re_arrival_ts.captures(&line) {
+            let tx_uid: u64 = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+            let ts: f64 = caps.get(2).unwrap().as_str().parse().unwrap_or(0.0);
+            arrivals.entry(tx_uid).or_insert(ts);
+            continue;
+        }
+        // Fall back to FairDAG bracket format
+        if let Some(caps) = re_arrival_bracket.captures(&line) {
             let ts_str = caps.get(1).unwrap().as_str();
             let tx_uid: u64 = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
             let ts = parse_timestamp(ts_str);
-            arrivals.entry(tx_uid).or_insert(ts); // keep first arrival
+            arrivals.entry(tx_uid).or_insert(ts);
         }
     }
 
@@ -100,8 +132,7 @@ fn parse_worker_arrivals(path: &PathBuf) -> Option<(usize, NodeArrivals)> {
 /// Returns tx_uid → position (0-based, order of appearance in log).
 fn parse_worker_protocol_order_herring(path: &PathBuf) -> Option<(usize, ProtocolOrder)> {
     let filename = path.file_name()?.to_str()?;
-    let re_fn = Regex::new(r"worker-(\d+)-").ok()?;
-    let node_id: usize = re_fn.captures(filename)?.get(1)?.as_str().parse().ok()?;
+    let node_id = extract_node_id(filename)?;
 
     let file = File::open(path).ok()?;
     let reader = BufReader::with_capacity(512 * 1024, file);
@@ -129,8 +160,7 @@ fn parse_worker_protocol_order_herring(path: &PathBuf) -> Option<(usize, Protoco
 /// Matches: "fairness_ordered tx_uid=12345"
 fn parse_worker_protocol_order_dodw(path: &PathBuf) -> Option<(usize, ProtocolOrder)> {
     let filename = path.file_name()?.to_str()?;
-    let re_fn = Regex::new(r"worker-(\d+)-").ok()?;
-    let node_id: usize = re_fn.captures(filename)?.get(1)?.as_str().parse().ok()?;
+    let node_id = extract_node_id(filename)?;
 
     let file = File::open(path).ok()?;
     let reader = BufReader::with_capacity(512 * 1024, file);
@@ -169,7 +199,7 @@ fn main() {
     let start = Instant::now();
 
     // ---- 1. Find and parse all worker logs ----
-    let pattern = args.logs_dir.join("worker-*-0.log");
+    let pattern = args.logs_dir.join(&args.log_pattern);
     let pattern_str = pattern.to_str().unwrap_or("");
 
     let paths: Vec<PathBuf> = glob::glob(pattern_str)
