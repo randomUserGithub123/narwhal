@@ -8,6 +8,7 @@ from re import findall, search
 from statistics import mean
 from collections import defaultdict
 import random
+import os
 
 from benchmark.utils import Print
 
@@ -317,76 +318,75 @@ class LogParser:
     # Adversarial reordering: Dist(tx,tx') vs fraction reversed
     # ------------------------------------------------------------------
 
-    def _adversarial_reordering(self, n_sample_pairs=100_000, time_window_ms=500):
+    def _adversarial_reordering(self):
         """
-        Cross-client tx pairs grouped by Dist(tx,tx').
-        Ground truth = honest majority ordering.
-        Same-client pairs always have Dist=N in TCP systems (useless).
+        ALL-PAIRS adversarial reordering via Rust binary (adv_reorder).
+        Falls back to Python if binary not found.
         """
+        import subprocess, json, shutil
+
         N = self.committee_size
         if not isinstance(N, int) or N < 2: return None
-        if not hasattr(self, 'per_node_arrivals') or not self.per_node_arrivals: return None
-        # Use protocol's ordering position (not timestamps — timestamps
-        # lose intra-subdag order due to millisecond quantization).
-        finalized = self.fair_ordered_seqs
-        if not finalized: return None
 
         f = self.faults if isinstance(self.faults, int) else 0
-        min_coverage = N - f
-        start_dist = N % 2
-        dist_values = list(range(start_dist, N + 1, 2))
 
-        tx_median_arrival = {}
-        for tx in finalized:
-            arrivals = [na[tx] for na in self.per_node_arrivals if tx in na]
-            if len(arrivals) >= min_coverage:
-                tx_median_arrival[tx] = sorted(arrivals)[len(arrivals) // 2]
-        if len(tx_median_arrival) < 2: return None
+        # Find the Rust binary
+        binary = shutil.which('adv_reorder')
+        if binary is None:
+            # Try common locations
+            for candidate in ['./adv_reorder', '../adv_reorder/target/release/adv_reorder']:
+                if os.path.isfile(candidate):
+                    binary = candidate
+                    break
+        if binary is None:
+            print("  WARN: adv_reorder binary not found, skipping reordering metric")
+            return None
 
-        tx_to_client = {}
-        for cidx, csent in enumerate(self.sent_samples):
-            for tx in csent:
-                if tx in tx_median_arrival: tx_to_client[tx] = cidx
-        if len(set(tx_to_client.values())) < 2: return None
+        # Find logs directory
+        logs_dir = getattr(self, 'logs_dir', None)
+        if logs_dir is None:
+            for candidate in ['logs']:
+                if os.path.isdir(candidate):
+                    logs_dir = candidate
+                    break
+        if logs_dir is None:
+            print("  WARN: logs directory not found")
+            return None
 
-        all_txs_sorted = sorted(tx_median_arrival.keys(), key=lambda tx: tx_median_arrival[tx])
-        n_total = len(all_txs_sorted)
-        random.seed(42)
-        time_window_s = time_window_ms / 1000.0
-        all_pairs = []; attempts = 0
+        cmd = [
+            binary,
+            '-d', logs_dir,
+            '-n', str(N),
+            '-f', str(f),
+            '--verbose',
+        ]
+        print(f"  Running: {' '.join(cmd)}")
 
-        while len(all_pairs) < n_sample_pairs and attempts < n_sample_pairs * 20:
-            i = random.randint(0, n_total - 2)
-            tx1 = all_txs_sorted[i]; client1 = tx_to_client.get(tx1)
-            if client1 is None: attempts += 1; continue
-            sr = min(200, n_total - i - 1)
-            if sr < 1: attempts += 1; continue
-            j = i + random.randint(1, sr)
-            if j >= n_total: attempts += 1; continue
-            tx2 = all_txs_sorted[j]; client2 = tx_to_client.get(tx2)
-            if client2 is None or client1 == client2: attempts += 1; continue
-            if abs(tx_median_arrival[tx2] - tx_median_arrival[tx1]) > time_window_s: attempts += 1; continue
-            all_pairs.append((tx1, tx2)); attempts += 1
-        if not all_pairs: return None
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                print(f"  WARN: adv_reorder failed: {result.stderr[:500]}")
+                return None
 
-        dist_counts = {d: 0 for d in dist_values}
-        dist_reversed = {d: 0 for d in dist_values}
-        for tx1, tx2 in all_pairs:
-            c1 = 0; c2 = 0; nb = 0
-            for na in self.per_node_arrivals:
-                if tx1 in na and tx2 in na:
-                    nb += 1
-                    if na[tx1] < na[tx2]: c1 += 1
-                    elif na[tx2] < na[tx1]: c2 += 1
-            if nb < min_coverage: continue
-            dist = abs(c1 - c2)
-            if dist not in dist_counts:
-                dist = min(dist_values, key=lambda d: abs(d - dist))
-            dist_counts[dist] += 1
-            if c1 > c2 and finalized[tx2] < finalized[tx1]: dist_reversed[dist] += 1
-            elif c2 > c1 and finalized[tx1] < finalized[tx2]: dist_reversed[dist] += 1
+            data = json.loads(result.stdout)
 
-        return {d: (dist_reversed[d] / dist_counts[d], dist_counts[d]) if dist_counts[d] > 0 else (0.0, 0) for d in dist_values}
+            # Convert JSON to our dict format
+            start_dist = N % 2
+            dist_values = list(range(start_dist, N + 1, 2))
+            results = {d: (0.0, 0) for d in dist_values}
+            for entry in data.get('results', []):
+                d = entry['dist']
+                if d in results:
+                    results[d] = (entry['fraction_reversed'], entry['count'])
+
+            return results
+
+        except subprocess.TimeoutExpired:
+            print("  WARN: adv_reorder timed out (600s)")
+            return None
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  WARN: Failed to parse adv_reorder output: {e}")
+            return None
 
     # ---- Output ----
 
@@ -461,4 +461,6 @@ class LogParser:
         clients = [open(fn).read() for fn in sorted(glob(join(directory, "client-*.log")))]
         primaries = [open(fn).read() for fn in sorted(glob(join(directory, "primary-*.log")))]
         workers = [open(fn).read() for fn in sorted(glob(join(directory, "worker-*.log")))]
-        return cls(clients, primaries, workers, attack_type=attack_type, arbitragers=arbitragers, faults=faults)
+        instance = cls(clients, primaries, workers, attack_type=attack_type, arbitragers=arbitragers, faults=faults)
+        instance.logs_dir = directory
+        return instance
