@@ -280,6 +280,7 @@ std::vector<uint256_t> HotStuffCore::
     /* TODO: Handle condorset cycles */
     std::vector<uint256_t> order;
     for (auto const &scc: sccs) {
+        HOTSTUFF_LOG_INFO("fairness_scc size=%zu", scc.size());
         for (auto const &cmd: scc) {
             order.push_back(cmd);
         }
@@ -601,12 +602,23 @@ std::unordered_map<uint256_t, std::unordered_set<uint256_t>> HotStuffCore::fair_
         for(auto &to : from.second){
             uint256_t from_v = from.first;
             uint256_t to_v = to.first;
-            uint16_t occurance = to.second;
-            if(1.0 * occurance >= config.tx_edge_threshold
-                && graph[to_v].count(from_v)==0){ 
-                    /* edge occurance is above threshold and no reverse edge is already present in graph */
-                    graph[from_v].insert(to_v);
-                }
+            uint16_t k = to.second;
+            // Check threshold
+            if(1.0 * k < config.tx_edge_threshold)
+                continue;
+            // Check k >= k' (the missing comparison!)
+            uint16_t k_prime = 0;
+            if(edge_count.count(to_v) && edge_count[to_v].count(from_v))
+                k_prime = edge_count[to_v][from_v];
+            if(k < k_prime)
+                continue;
+            // Deterministic tiebreak when k == k'
+            if(k == k_prime && !(from_v < to_v))
+                continue;
+            // No reverse edge already present
+            if(graph[to_v].count(from_v) == 0){
+                graph[from_v].insert(to_v);
+            }
         }
     }
     /** (5) Compute the condensation graph G* **/
@@ -697,12 +709,23 @@ std::vector<std::pair<uint256_t, uint256_t>> HotStuffCore::fair_update(){
         for(auto &to : from.second){
             uint256_t from_v = from.first;
             uint256_t to_v = to.first;
-            uint16_t occurance = to.second;
-            if(1.0 * occurance >= config.tx_edge_threshold
-                && e_update_map[to_v].count(from_v)==0){ 
-                    /* edge occurance is above threshold and no reverse edge is already present in graph */
-                    e_update_map[from_v].insert(to_v);
-                }
+            uint16_t k = to.second;
+            // Check threshold
+            if(1.0 * k < config.tx_edge_threshold)
+                continue;
+            // Check k >= k' (the missing comparison!)
+            uint16_t k_prime = 0;
+            if(edge_count.count(to_v) && edge_count[to_v].count(from_v))
+                k_prime = edge_count[to_v][from_v];
+            if(k < k_prime)
+                continue;
+            // Deterministic tiebreak when k == k'
+            if(k == k_prime && !(from_v < to_v))
+                continue;
+            // No reverse edge already present
+            if(e_update_map[to_v].count(from_v) == 0){
+                e_update_map[from_v].insert(to_v);
+            }
         }
     }
 
