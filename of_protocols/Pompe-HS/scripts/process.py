@@ -37,11 +37,14 @@ for file in files:
     # Parse SCC sizes from replica logs
     if 'replica' in file:
         scc_sizes = []
-        with open(sys.argv[2] + "/" + file, "r") as f:
-            for line in f:
-                match = re.search(scc_pattern, line)
-                if match:
-                    scc_sizes.append(int(match.group(1)))
+        try:
+            with open(sys.argv[2] + "/" + file, "r", errors="replace") as f:
+                for line in f:
+                    match = re.search(scc_pattern, line)
+                    if match:
+                        scc_sizes.append(int(match.group(1)))
+        except Exception:
+            pass
         if len(scc_sizes) > len(best_scc_sizes):
             best_scc_sizes = scc_sizes
 

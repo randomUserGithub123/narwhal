@@ -224,6 +224,7 @@ class OFBench:
         print(proc.stdout)
 
         if proc.returncode != 0:
+            print("process.py stderr:", proc.stderr)
             raise BenchError("process.py failed", proc.stderr)
         
         lines = proc.stdout.strip().split('\n')
