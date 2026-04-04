@@ -227,15 +227,19 @@ class OFBench:
             raise BenchError("process.py failed", proc.stderr)
         
         lines = proc.stdout.strip().split('\n')
+        avg_scc = 0.0
         for line in lines:
             if "Total tx count: " in line:
                 count = int(line.split(": ")[1].strip())
             elif "Average: " in line:
                 average_latency = float(line.split(": ")[1].strip())
+            elif "Avg cycle size: " in line:
+                avg_scc = float(line.split(": ")[1].strip())
 
         print("\n============ Summary ============")
         print(f"TPS: {count / self.duration}")
         print(f"Average latency: {average_latency} ms")
+        print(f"Avg cycle size: {avg_scc:.4f}")
         print("=================================\n")
 
         # Compute adversarial reordering metric
@@ -243,8 +247,9 @@ class OFBench:
 
         tps = count / self.duration
         rate = self.bench_parameters.rate[0]
+        _avg_scc = avg_scc
         return SimpleNamespace(
-            result=lambda: f"{rate} {tps} {average_latency}\n{reorder_str}"
+            result=lambda: f"{rate} {tps} {average_latency} {_avg_scc:.4f}\n{reorder_str}"
         )
 
     def _compute_adversarial_reordering(self):
