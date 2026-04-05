@@ -607,7 +607,7 @@ void HotStuffBase::start(
 #endif
                 on_local_order(proposer, cmds);
 
-                return true;
+                return false;
             }
             /*
             if (proposer != get_id()) continue;
