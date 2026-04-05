@@ -603,7 +603,7 @@ void HotStuffBase::start(
             LOG_INFO("[R-%d] lo_timer: buffer=%zu, blk_size=%zu",
                     get_id(), local_order_buffer.size(), blk_size);
         }
-        while (local_order_buffer.size() >= blk_size) {
+        if (local_order_buffer.size() >= blk_size) {
             ReplicaID proposer = pmaker->get_proposer();
             std::vector<uint256_t> cmds;
             for (uint32_t i = 0; i < blk_size; i++)
