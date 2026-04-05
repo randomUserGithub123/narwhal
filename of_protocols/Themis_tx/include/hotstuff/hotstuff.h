@@ -177,6 +177,8 @@ class HotStuffBase: public HotStuffCore {
     std::queue<uint256_t> local_order_buffer;               // Themis
     /** Timer to send unproposed cmds and edges if any **/
     TimerEvent reorder_timer;                            // Themis
+    /** Timer to periodically drain local_order_buffer without starving the event loop **/
+    TimerEvent lo_timer;                                 // Themis
 
     /* statistics */
     uint64_t fetched;

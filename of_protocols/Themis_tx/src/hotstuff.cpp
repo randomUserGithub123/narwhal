@@ -566,18 +566,16 @@ void HotStuffBase::start(
     if (ec_loop)
         ec.dispatch();
 
+    /* Themis: cmd_pending handler ONLY buffers commands into local_order_buffer.
+     * It does NOT send local orders directly — that is done by lo_timer below.
+     * This prevents the MPSC queue's notification fd from starving the event
+     * loop (votes, proposals, and local orders from other replicas would never
+     * get processed if we sent local orders inside this handler). */
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-        HOTSTUFF_LOG_DEBUG("[[cmd_pending.reg_handler]] [R-%d] [L-%d] cmd_pending reg_handler Invoked", get_id(), pmaker->get_proposer());
-
         std::pair<uint256_t, commit_cb_t> e;
-
-        // TODO: Themis : Add pending decisions into this round local order again, 
-        // as they were skipped previously by the leader (due to non majority) ???
 
         while (q.try_dequeue(e))
         {
-            ReplicaID proposer = pmaker->get_proposer();
-
             const auto &cmd_hash = e.first;
             auto it = decision_waiting.find(cmd_hash);
             if (it == decision_waiting.end())
@@ -585,57 +583,32 @@ void HotStuffBase::start(
             else
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
 
-
-            // Themis
             local_order_buffer.push(cmd_hash);
-            HOTSTUFF_LOG_DEBUG("[[cmd_pending.reg_handler]] [R-%d] [L-%d] Push commans to local buffer = %.10s", get_id(), proposer, get_hex(cmd_hash).c_str());
-
-            if(local_order_buffer.size() >= blk_size){
-                ReplicaID proposer = pmaker->get_proposer();
-                std::vector<uint256_t> cmds;
-                for (uint32_t i = 0; i < blk_size; i++)
-                {
-                    cmds.push_back(local_order_buffer.front());
-                    local_order_buffer.pop();
-                }
-
-#ifdef HOTSTUFF_ENABLE_LOG_DEBUG
-// #ifdef NOTDEFINE
-                for (uint32_t i = 0; i < blk_size; i++){
-                    HOTSTUFF_LOG_DEBUG("[[cmd_pending.reg_handler]] [R-%d] [L-%d] Created List of commands and sending to pacemaker (%d) = %.10s", get_id(), proposer, i, get_hex(cmds[i]).c_str());
-                }
-#endif
-                on_local_order(proposer, cmds);
-            }
-            /*
-            if (proposer != get_id()) continue;
-            cmd_pending_buffer.push(cmd_hash);
-            if (cmd_pending_buffer.size() >= blk_size)
-            {
-                std::vector<uint256_t> cmds;
-                for (uint32_t i = 0; i < blk_size; i++)
-                {
-                    cmds.push_back(cmd_pending_buffer.front());
-                    cmd_pending_buffer.pop();
-                }
-                pmaker->beat().then([this, cmds = std::move(cmds)](ReplicaID proposer) {
-                    if (proposer == get_id())
-                        on_propose(cmds, pmaker->get_parents());
-                });
-                return true;
-            }
-            */
         }
 
         return false;
     });
 
-    // /** Initialize and start unproposed Timer **/ 
-    // reorder_timer = TimerEvent(ec, [this](TimerEvent &) {
-    //     reorder(pmaker->get_proposer());
-    //     reset_reorder_timer();
-    // });
-    // reorder_timer.add(5);
+    /* Themis: periodic timer that drains local_order_buffer into local orders.
+     * Fires every 50ms.  Between firings the event loop processes consensus
+     * messages (MsgVote, MsgPropose, MsgLocalOrder from other replicas).
+     * At 1000 TPS / lo_size=100 a batch fills in ~100ms → 2 timer cycles.
+     * At  500 TPS / lo_size=100 a batch fills in ~200ms → 4 timer cycles.
+     * Both leave plenty of event-loop headroom for consensus. */
+    lo_timer = TimerEvent(ec, [this](TimerEvent &te) {
+        while (local_order_buffer.size() >= blk_size) {
+            ReplicaID proposer = pmaker->get_proposer();
+            std::vector<uint256_t> cmds;
+            for (uint32_t i = 0; i < blk_size; i++)
+            {
+                cmds.push_back(local_order_buffer.front());
+                local_order_buffer.pop();
+            }
+            on_local_order(proposer, cmds);
+        }
+        te.add(0.05);  // reschedule every 50ms
+    });
+    lo_timer.add(0.05);
 }
 
 }
