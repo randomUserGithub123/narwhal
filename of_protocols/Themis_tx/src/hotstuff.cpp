@@ -569,15 +569,33 @@ void HotStuffBase::start(
     if (ec_loop)
         ec.dispatch();
 
-    /* Themis: cmd_pending handler ONLY buffers commands into local_order_buffer.
-     * It does NOT send local orders directly — that is done by lo_timer below.
-     * This prevents the MPSC queue's notification fd from starving the event
-     * loop (votes, proposals, and local orders from other replicas would never
-     * get processed if we sent local orders inside this handler). */
-    cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-        std::pair<uint256_t, commit_cb_t> e;
+    // /* Themis: cmd_pending handler ONLY buffers commands into local_order_buffer.
+    //  * It does NOT send local orders directly — that is done by lo_timer below.
+    //  * This prevents the MPSC queue's notification fd from starving the event
+    //  * loop (votes, proposals, and local orders from other replicas would never
+    //  * get processed if we sent local orders inside this handler). */
+    // cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
+    //     std::pair<uint256_t, commit_cb_t> e;
 
-        while (q.try_dequeue(e))
+    //     while (q.try_dequeue(e))
+    //     {
+    //         const auto &cmd_hash = e.first;
+    //         auto it = decision_waiting.find(cmd_hash);
+    //         if (it == decision_waiting.end())
+    //             it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
+    //         else
+    //             e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
+
+    //         local_order_buffer.push(cmd_hash);
+    //     }
+
+    //     return false;
+    // });
+
+    lo_timer = TimerEvent(ec, [this](TimerEvent &te) {
+        // 1. Drain the MPSC queue into local_order_buffer
+        std::pair<uint256_t, commit_cb_t> e;
+        while (cmd_pending.try_dequeue(e))
         {
             const auto &cmd_hash = e.first;
             auto it = decision_waiting.find(cmd_hash);
@@ -589,20 +607,7 @@ void HotStuffBase::start(
             local_order_buffer.push(cmd_hash);
         }
 
-        return false;
-    });
-
-    /* Themis: periodic timer that drains local_order_buffer into local orders.
-     * Fires every 50ms.  Between firings the event loop processes consensus
-     * messages (MsgVote, MsgPropose, MsgLocalOrder from other replicas).
-     * At 1000 TPS / lo_size=100 a batch fills in ~100ms → 2 timer cycles.
-     * At  500 TPS / lo_size=100 a batch fills in ~200ms → 4 timer cycles.
-     * Both leave plenty of event-loop headroom for consensus. */
-    lo_timer = TimerEvent(ec, [this](TimerEvent &te) {
-        if (local_order_buffer.size() > 0) {
-            LOG_INFO("[R-%d] lo_timer: buffer=%zu, blk_size=%zu",
-                    get_id(), local_order_buffer.size(), blk_size);
-        }
+        // 2. Send one batch if ready
         if (local_order_buffer.size() >= blk_size) {
             ReplicaID proposer = pmaker->get_proposer();
             std::vector<uint256_t> cmds;
@@ -613,7 +618,8 @@ void HotStuffBase::start(
             }
             on_local_order(proposer, cmds);
         }
-        te.add(0.05);  // reschedule every 50ms
+
+        te.add(0.05);
     });
     lo_timer.add(0.05);
 }
