@@ -599,38 +599,40 @@ void HotStuffBase::start(
 
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
         std::pair<uint256_t, commit_cb_t> e;
-
-        while (q.try_dequeue(e))
+        
+        // Process at most ONE batch worth per invocation.
+        // This caps handler time to ~25µs, giving network events
+        // a chance between invocations even with a hot pipe.
+        size_t count = 0;
+        while (count < blk_size && q.try_dequeue(e))
         {
+            count++;
             const auto &cmd_hash = e.first;
             auto it = decision_waiting.find(cmd_hash);
             if (it == decision_waiting.end())
                 it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
             else
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
-
-            // Themis
             local_order_buffer.push(cmd_hash);
-
-            if(local_order_buffer.size() >= blk_size){
-                ReplicaID proposer = pmaker->get_proposer();
-                std::vector<uint256_t> cmds;
-                for (uint32_t i = 0; i < blk_size; i++)
-                {
-                    cmds.push_back(local_order_buffer.front());
-                    local_order_buffer.pop();
-                }
-
-                LOG_PROTO("[R-%d] cmd_handler: batch ready, sending %zu cmds to L-%d, remaining_buffer=%zu",
-                          get_id(), cmds.size(), proposer, local_order_buffer.size());
-
-                on_local_order(proposer, cmds);
-
-                return false;  // YIELD: let event loop process network msgs
-            }
         }
 
-        return false;
+        if (local_order_buffer.size() >= blk_size) {
+            ReplicaID proposer = pmaker->get_proposer();
+            std::vector<uint256_t> cmds;
+            for (uint32_t i = 0; i < blk_size; i++)
+            {
+                cmds.push_back(local_order_buffer.front());
+                local_order_buffer.pop();
+            }
+            LOG_PROTO("[R-%d] cmd_handler: sending %zu cmds to L-%d",
+                    get_id(), cmds.size(), proposer);
+            on_local_order(proposer, cmds);
+        }
+
+        // Return true ONLY if items remain AND no batch was just sent.
+        // This drains the queue across multiple invocations without
+        // starving network events after a batch send.
+        return !q.empty() && local_order_buffer.size() < blk_size;
     });
 }
 
