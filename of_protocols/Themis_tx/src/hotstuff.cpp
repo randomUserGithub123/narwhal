@@ -24,6 +24,7 @@ using salticidae::static_pointer_cast;
 #define LOG_INFO HOTSTUFF_LOG_INFO
 #define LOG_DEBUG HOTSTUFF_LOG_DEBUG
 #define LOG_WARN HOTSTUFF_LOG_WARN
+#define LOG_PROTO HOTSTUFF_LOG_PROTO
 
 namespace hotstuff {
 
@@ -223,6 +224,8 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         LOG_WARN("invalid proposal from %d", prop.proposer);
         return;
     }
+    LOG_PROTO("[R-%d] RECV proposal from L-%d, blk=%.10s",
+              get_id(), prop.proposer, get_hex(blk->get_hash()).c_str());
     promise::all(std::vector<promise_t>{
         async_deliver_blk(blk->get_hash(), peer)
     }).then([this, prop = std::move(prop)]() {
@@ -310,24 +313,38 @@ void HotStuffBase::local_order_handler(MsgLocalOrder &&msg, const Net::conn_t &c
 
 // Themis
 void HotStuffBase::process_local_order(const LocalOrder &local_order){
-    LOG_INFO("[R-%d] process_local_order from R-%d, cache_size=%zu, nmajority=%zu",
-             get_id(), local_order.initiator,
-             storage->get_local_order_cache_size(), get_config().nmajority);
+    LOG_PROTO("[R-%d] process_local_order from R-%d, cache=%zu, need=%zu",
+              get_id(), local_order.initiator,
+              storage->get_local_order_cache_size(), get_config().nmajority);
+
     if(on_receive_local_order(local_order, pmaker->get_parents())==true){
+        LOG_PROTO("[R-%d] MAJORITY REACHED, running FairPropose+FairUpdate", get_id());
+
         /* FairPropose() */
         std::unordered_map<uint256_t, std::unordered_set<uint256_t>> graph = fair_propose();
+        LOG_PROTO("[R-%d] FairPropose done, graph_size=%zu", get_id(), graph.size());
+
         /* FairUpdate() */
         std::vector<std::pair<uint256_t, uint256_t>> e_update = fair_update();
+        LOG_PROTO("[R-%d] FairUpdate done, e_update_size=%zu", get_id(), e_update.size());
+
         /* Store proposed commands */
         for(auto g: graph){
             storage->add_to_proposed_cmds_cache(g.first);
         }
-        // storage->clear_local_order();
+
         HOTSTUFF_LOG_DEBUG("[[process_local_order]] [fromR-%d] [thisL-%d] Cleared Local Order", local_order.initiator, get_id());
         /** Create a new proposal block and broadcast to the replicas **/
         pmaker->beat().then([this, graph = std::move(graph), e_up = std::move(e_update)](ReplicaID proposer) {
             if (proposer == get_id())
+            {
+                LOG_PROTO("[R-%d] beat resolved, I am proposer, calling on_propose", get_id());
                 on_propose(graph, e_up, pmaker->get_parents());
+            }
+            else
+            {
+                LOG_PROTO("[R-%d] beat resolved, proposer is R-%d (not me), skipping", get_id(), proposer);
+            }
         });
     }
 }
@@ -467,6 +484,9 @@ void HotStuffBase::do_broadcast_proposal(const Proposal &prop) {
     }
 #endif
 
+    LOG_PROTO("[R-%d] BROADCAST proposal height=%lu, graph_size=%zu",
+              get_id(), prop.blk->get_height(), prop.blk->get_graph().size());
+
     //MsgPropose prop_msg(prop);
     pn.multicast_msg(MsgPropose(prop), peers);
     //for (const auto &replica: peers)
@@ -482,7 +502,11 @@ void HotStuffBase::do_vote(ReplicaID last_proposer, const Vote &vote) {
             on_receive_vote(vote);
         }
         else
+        {
+            LOG_PROTO("[R-%d] SEND vote for %.10s to L-%d",
+                      get_id(), get_hex(vote.blk_hash).c_str(), proposer);
             pn.send_msg(MsgVote(vote), get_config().get_peer_id(proposer));
+        }
     });
 }
 
@@ -490,11 +514,13 @@ void HotStuffBase::do_vote(ReplicaID last_proposer, const Vote &vote) {
 void HotStuffBase::do_send_local_order(ReplicaID proposer, const LocalOrder &local_order) {
     if (proposer == get_id())
     {
-        HOTSTUFF_LOG_DEBUG("[[do_send_local_order]] [R-%d] [L-%d] deliver LocalOrder to itself = %s", get_id(), proposer, local_order);
+        LOG_PROTO("[R-%d] SEND local_order to SELF (leader), %zu cmds",
+                  get_id(), local_order.ordered_hashes.size());
         process_local_order(local_order);
     }
     else{
-        HOTSTUFF_LOG_DEBUG("[[do_send_local_order]] [R-%d] [L-%d] Send LocalOrder to Leader = %s", get_id(), proposer, local_order);
+        LOG_PROTO("[R-%d] SEND local_order to L-%d, %zu cmds",
+                  get_id(), proposer, local_order.ordered_hashes.size());
         pn.send_msg(MsgLocalOrder(local_order), get_config().get_peer_id(proposer));
     }
 }
@@ -569,33 +595,12 @@ void HotStuffBase::start(
     if (ec_loop)
         ec.dispatch();
 
-    // /* Themis: cmd_pending handler ONLY buffers commands into local_order_buffer.
-    //  * It does NOT send local orders directly — that is done by lo_timer below.
-    //  * This prevents the MPSC queue's notification fd from starving the event
-    //  * loop (votes, proposals, and local orders from other replicas would never
-    //  * get processed if we sent local orders inside this handler). */
-    // cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-    //     std::pair<uint256_t, commit_cb_t> e;
+    LOG_PROTO("[R-%d] STARTING cmd_pending handler, blk_size=%zu", get_id(), blk_size);
 
-    //     while (q.try_dequeue(e))
-    //     {
-    //         const auto &cmd_hash = e.first;
-    //         auto it = decision_waiting.find(cmd_hash);
-    //         if (it == decision_waiting.end())
-    //             it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
-    //         else
-    //             e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
-
-    //         local_order_buffer.push(cmd_hash);
-    //     }
-
-    //     return false;
-    // });
-
-    lo_timer = TimerEvent(ec, [this](TimerEvent &te) {
-        // 1. Drain the MPSC queue into local_order_buffer
+    cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
         std::pair<uint256_t, commit_cb_t> e;
-        while (cmd_pending.try_dequeue(e))
+
+        while (q.try_dequeue(e))
         {
             const auto &cmd_hash = e.first;
             auto it = decision_waiting.find(cmd_hash);
@@ -603,27 +608,30 @@ void HotStuffBase::start(
                 it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
             else
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
+
+            // Themis
             local_order_buffer.push(cmd_hash);
+
+            if(local_order_buffer.size() >= blk_size){
+                ReplicaID proposer = pmaker->get_proposer();
+                std::vector<uint256_t> cmds;
+                for (uint32_t i = 0; i < blk_size; i++)
+                {
+                    cmds.push_back(local_order_buffer.front());
+                    local_order_buffer.pop();
+                }
+
+                LOG_PROTO("[R-%d] cmd_handler: batch ready, sending %zu cmds to L-%d, remaining_buffer=%zu",
+                          get_id(), cmds.size(), proposer, local_order_buffer.size());
+
+                on_local_order(proposer, cmds);
+
+                return false;  // YIELD: let event loop process network msgs
+            }
         }
 
-        // 2. Log and send one batch if ready
-        if (local_order_buffer.size() > 0) {
-            HOTSTUFF_LOG_PROTO("[R-%d] lo_timer: buffer=%zu, blk_size=%zu",
-                     get_id(), local_order_buffer.size(), blk_size);
-        }
-        if (local_order_buffer.size() >= blk_size) {
-            ReplicaID proposer = pmaker->get_proposer();
-            std::vector<uint256_t> cmds;
-            for (uint32_t i = 0; i < blk_size; i++)
-            {
-                cmds.push_back(local_order_buffer.front());
-                local_order_buffer.pop();
-            }
-            on_local_order(proposer, cmds);
-        }
-        te.add(0.05);
+        return false;
     });
-    lo_timer.add(0.05);
 }
 
 }

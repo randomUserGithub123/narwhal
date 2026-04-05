@@ -171,14 +171,12 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
     std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
     std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
-    using cmd_queue_t = salticidae::MPSCQueue<std::pair<uint256_t, commit_cb_t>>;
+    using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::queue<uint256_t> cmd_pending_buffer;
     std::queue<uint256_t> local_order_buffer;               // Themis
     /** Timer to send unproposed cmds and edges if any **/
     TimerEvent reorder_timer;                            // Themis
-    /** Timer to periodically drain local_order_buffer without starving the event loop **/
-    TimerEvent lo_timer;                                 // Themis
 
     /* statistics */
     uint64_t fetched;
