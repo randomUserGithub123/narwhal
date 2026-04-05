@@ -629,10 +629,7 @@ void HotStuffBase::start(
             on_local_order(proposer, cmds);
         }
 
-        // Return true ONLY if items remain AND no batch was just sent.
-        // This drains the queue across multiple invocations without
-        // starving network events after a batch send.
-        return !q.empty() && local_order_buffer.size() < blk_size;
+        return count == blk_size && local_order_buffer.size() < blk_size;
     });
 }
 
