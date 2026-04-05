@@ -603,11 +603,14 @@ void HotStuffBase::start(
                 it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
             else
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
-
             local_order_buffer.push(cmd_hash);
         }
 
-        // 2. Send one batch if ready
+        // 2. Log and send one batch if ready
+        if (local_order_buffer.size() > 0) {
+            HOTSTUFF_LOG_PROTO("[R-%d] lo_timer: buffer=%zu, blk_size=%zu",
+                     get_id(), local_order_buffer.size(), blk_size);
+        }
         if (local_order_buffer.size() >= blk_size) {
             ReplicaID proposer = pmaker->get_proposer();
             std::vector<uint256_t> cmds;
@@ -618,7 +621,6 @@ void HotStuffBase::start(
             }
             on_local_order(proposer, cmds);
         }
-
         te.add(0.05);
     });
     lo_timer.add(0.05);
