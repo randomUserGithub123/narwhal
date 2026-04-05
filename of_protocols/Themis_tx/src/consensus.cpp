@@ -251,42 +251,212 @@ void HotStuffCore::print_all_blocks(const block_t &nblk, const block_t &blk){
     //                     get_hex(b_exec->get_hash()).c_str(), b_exec->get_height());
 }
 
+// Themis: Find a Hamiltonian cycle in a strongly connected tournament.
+// Returns vertices in cycle order: v0 -> v1 -> ... -> vn-1 -> v0
+// where each edge vi -> vi+1 exists in the graph (majority-preferred direction).
+//
+// Algorithm (O(n^2), fine for typical SCC sizes <= 50):
+//   1. Find a 3-cycle (guaranteed by Camion's theorem for SC tournaments)
+//   2. Insert remaining vertices one-by-one into the cycle
+//
+static std::vector<uint256_t> find_hamiltonian_cycle(
+    const std::vector<uint256_t> &vertices,
+    const std::unordered_map<uint256_t, std::unordered_set<uint256_t>> &graph)
+{
+    size_t n = vertices.size();
+    if (n <= 1) return vertices;
+    // SCCs of size 2 cannot exist in a tournament, but handle gracefully.
+    if (n == 2) return vertices;
+ 
+    auto has_edge = [&](const uint256_t &a, const uint256_t &b) -> bool {
+        auto it = graph.find(a);
+        if (it == graph.end()) return false;
+        return it->second.count(b) > 0;
+    };
+ 
+    // --- Step 1: find a 3-cycle ---
+    // Pick v0.  W = {w : v0 -> w},  L = {l : l -> v0}.
+    // Strong connectivity guarantees both non-empty and that some w in W
+    // beats some l in L, giving the 3-cycle  v0 -> w -> l -> v0.
+    std::vector<uint256_t> cycle;
+    const uint256_t &v0 = vertices[0];
+    bool found = false;
+ 
+    for (size_t i = 1; i < n && !found; i++) {
+        if (!has_edge(v0, vertices[i])) continue;        // need v0 -> w
+        const uint256_t &w = vertices[i];
+        for (size_t j = 1; j < n && !found; j++) {
+            if (j == i) continue;
+            if (!has_edge(vertices[j], v0)) continue;    // need l -> v0
+            const uint256_t &l = vertices[j];
+            if (has_edge(w, l)) {                         // need w -> l
+                cycle = {v0, w, l};                       // v0 -> w -> l -> v0
+                found = true;
+            }
+        }
+    }
+ 
+    if (!found) {
+        // Should never happen for a strongly-connected tournament, n >= 3.
+        HOTSTUFF_LOG_WARN("hamiltonian_cycle: no 3-cycle found (n=%zu), "
+                          "falling back to arbitrary order", n);
+        return vertices;
+    }
+ 
+    // --- Step 2: insert remaining vertices one-by-one ---
+    // For each new vertex v, scan the cycle for an edge c_i -> c_{i+1}
+    // where c_i -> v AND v -> c_{i+1}, then splice v in between.
+    // Such a position always exists: v cannot beat every cycle member
+    // (else no incoming edge, contradicting strong connectivity) and
+    // cannot lose to every one, so there is a "transition point".
+    std::unordered_set<uint256_t> in_cycle(cycle.begin(), cycle.end());
+ 
+    for (const auto &v : vertices) {
+        if (in_cycle.count(v)) continue;
+ 
+        size_t k = cycle.size();
+        bool inserted = false;
+        for (size_t i = 0; i < k; i++) {
+            size_t next_i = (i + 1) % k;
+            if (has_edge(cycle[i], v) && has_edge(v, cycle[next_i])) {
+                cycle.insert(cycle.begin() + (long)(i + 1), v);
+                inserted = true;
+                break;
+            }
+        }
+ 
+        if (!inserted) {
+            HOTSTUFF_LOG_WARN("hamiltonian_cycle: failed to insert vertex, "
+                              "appending (cycle size %zu)", cycle.size());
+            cycle.push_back(v);
+        }
+        in_cycle.insert(v);
+    }
+ 
+    return cycle;
+}
+ 
+// Rotate a Hamiltonian cycle so that `target` becomes the LAST element.
+// Paper section IV-B: the last SCC's cycle is rotated so a solid tx is last,
+// ensuring correct ordering at the boundary to the next proposal.
+static std::vector<uint256_t> rotate_cycle_so_last(
+    const std::vector<uint256_t> &cycle,
+    const uint256_t &target)
+{
+    size_t n = cycle.size();
+    if (n <= 1) return cycle;
+ 
+    size_t pos = n;
+    for (size_t i = 0; i < n; i++) {
+        if (cycle[i] == target) { pos = i; break; }
+    }
+    if (pos == n) return cycle;   // target not found
+ 
+    // Rotate so cycle[(pos+1)%n] is first, making cycle[pos] last.
+    std::vector<uint256_t> rotated;
+    rotated.reserve(n);
+    for (size_t i = 1; i <= n; i++) {
+        rotated.push_back(cycle[(pos + i) % n]);
+    }
+    return rotated;
+}
+ 
+ 
+// ============================================================
+// REPLACE the existing fair_finalize() with this version
+// ============================================================
+ 
 // Themis
 std::vector<uint256_t> HotStuffCore::
                         fair_finalize(block_t const &blk, 
                         std::vector<std::pair<uint256_t, uint256_t>> const &e_update){
     auto &graph = blk->get_graph();
-
-    
-    /** (1) For all Bi and transactions tx, tx0 in Bi that do not have an edge between them, 
-     * if (tx; tx0) is in some Bj.e_update, then add that edge to Bi.G **/
-    // for(auto const &edge: e_update){
-    //     if(graph.count(edge.first)>0 && graph.count(edge.second)>0){
-    //         /* nodes exists but edge does not exists: update these edges */
-    //         blk->update_graph(edge);
-    //     }
-    // }
-
-    /** (2) is graph B.G is a tournament **/
+ 
+    /** (1) Check if the graph is a tournament (fully specified) **/
     if(!blk->is_tournament_graph()){
-        /* Graph is not a tournament graph */
         return std::vector<uint256_t>();
     }
-
-    /** (3) Compute the condensation graph of B.G, and topological sorting S **/
+ 
+    /** (2) Compute the condensation graph and topological sorting **/
     CondensationGraph util_obj = CondensationGraph(blk->get_graph());
     auto const &sccs = util_obj.get_condensation_graph();
-    /* Finalize a Global Order */
-    /* TODO: Handle condorset cycles */
+ 
+    /** (3) Build fair ordering using Hamiltonian cycles (paper Fig. 3) **/
     std::vector<uint256_t> order;
-    for (auto const &scc: sccs) {
+    size_t num_sccs = sccs.size();
+ 
+    for (size_t scc_idx = 0; scc_idx < num_sccs; scc_idx++) {
+        auto const &scc = sccs[scc_idx];
         HOTSTUFF_LOG_INFO("fairness_scc size=%zu", scc.size());
-        for (auto const &cmd: scc) {
+ 
+        if (scc.size() <= 1) {
+            for (auto const &cmd : scc) {
+                order.push_back(cmd);
+            }
+            continue;
+        }
+ 
+        /* Find Hamiltonian cycle in this strongly-connected tournament. */
+        auto hcycle = find_hamiltonian_cycle(scc, graph);
+ 
+        /* For the LAST SCC: rotate so a solid tx is last (paper section IV-B).
+         * Since solid/shaded status isn't stored in blocks at finalization time,
+         * we use highest out-degree as proxy (tx seen earliest by most replicas
+         * will have the most outgoing edges). */
+        if (scc_idx == num_sccs - 1 && hcycle.size() >= 2) {
+            uint256_t best = hcycle[0];
+            size_t best_deg = 0;
+            for (auto const &v : hcycle) {
+                auto it = graph.find(v);
+                size_t deg = (it != graph.end()) ? it->second.size() : 0;
+                if (deg > best_deg) { best_deg = deg; best = v; }
+            }
+            hcycle = rotate_cycle_so_last(hcycle, best);
+        }
+ 
+        for (auto const &cmd : hcycle) {
             order.push_back(cmd);
         }
     }
+ 
     return order;
 }
+// // Themis
+// std::vector<uint256_t> HotStuffCore::
+//                         fair_finalize(block_t const &blk, 
+//                         std::vector<std::pair<uint256_t, uint256_t>> const &e_update){
+//     auto &graph = blk->get_graph();
+
+    
+//     /** (1) For all Bi and transactions tx, tx0 in Bi that do not have an edge between them, 
+//      * if (tx; tx0) is in some Bj.e_update, then add that edge to Bi.G **/
+//     // for(auto const &edge: e_update){
+//     //     if(graph.count(edge.first)>0 && graph.count(edge.second)>0){
+//     //         /* nodes exists but edge does not exists: update these edges */
+//     //         blk->update_graph(edge);
+//     //     }
+//     // }
+
+//     /** (2) is graph B.G is a tournament **/
+//     if(!blk->is_tournament_graph()){
+//         /* Graph is not a tournament graph */
+//         return std::vector<uint256_t>();
+//     }
+
+//     /** (3) Compute the condensation graph of B.G, and topological sorting S **/
+//     CondensationGraph util_obj = CondensationGraph(blk->get_graph());
+//     auto const &sccs = util_obj.get_condensation_graph();
+//     /* Finalize a Global Order */
+//     /* TODO: Handle condorset cycles */
+//     std::vector<uint256_t> order;
+//     for (auto const &scc: sccs) {
+//         HOTSTUFF_LOG_INFO("fairness_scc size=%zu", scc.size());
+//         for (auto const &cmd: scc) {
+//             order.push_back(cmd);
+//         }
+//     }
+//     return order;
+// }
 
 
 
