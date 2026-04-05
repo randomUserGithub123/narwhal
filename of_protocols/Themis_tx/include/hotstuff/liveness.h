@@ -148,11 +148,18 @@ class PMWaitQC: public virtual PaceMaker {
             auto pm = pending_beats.front();
             pending_beats.pop();
             pm_qc_finish.reject();
+            HOTSTUFF_LOG_PROTO("[R-%d] PMWaitQC::schedule_next: waiting for QC on blk=%.10s, pending_beats=%zu",
+                              hsc->get_id(), get_hex(last_proposed->get_hash()).c_str(), pending_beats.size());
             (pm_qc_finish = hsc->async_qc_finish(last_proposed))
                 .then([this, pm]() {
+                    HOTSTUFF_LOG_PROTO("[R-%d] PMWaitQC: QC resolved, unlocking proposer",
+                                      hsc->get_id());
                     pm.resolve(get_proposer());
                 });
             locked = true;
+        } else if (!pending_beats.empty() && locked) {
+            HOTSTUFF_LOG_PROTO("[R-%d] PMWaitQC::schedule_next: LOCKED, %zu beats queued, waiting for QC",
+                              hsc->get_id(), pending_beats.size());
         }
     }
 
@@ -160,6 +167,8 @@ class PMWaitQC: public virtual PaceMaker {
         pm_wait_propose.reject();
         (pm_wait_propose = hsc->async_wait_proposal()).then(
                 [this](const Proposal &prop) {
+            HOTSTUFF_LOG_PROTO("[R-%d] PMWaitQC: proposal received blk=%.10s, unlocking",
+                              hsc->get_id(), get_hex(prop.blk->get_hash()).c_str());
             last_proposed = prop.blk;
             locked = false;
             schedule_next();

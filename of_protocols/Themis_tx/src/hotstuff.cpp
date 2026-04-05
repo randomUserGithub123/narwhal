@@ -313,20 +313,30 @@ void HotStuffBase::local_order_handler(MsgLocalOrder &&msg, const Net::conn_t &c
 
 // Themis
 void HotStuffBase::process_local_order(const LocalOrder &local_order){
-    LOG_PROTO("[R-%d] process_local_order from R-%d, cache=%zu, need=%zu",
-              get_id(), local_order.initiator,
-              storage->get_local_order_cache_size(), get_config().nmajority);
+    LOG_PROTO("[R-%d] process_local_order: from R-%d, %zu cmds, %zu l_upd, cache=%zu, need=%zu",
+             get_id(), local_order.initiator,
+             local_order.ordered_hashes.size(), local_order.l_update.size(),
+             storage->get_local_order_cache_size(), get_config().nmajority);
 
     if(on_receive_local_order(local_order, pmaker->get_parents())==true){
         LOG_PROTO("[R-%d] MAJORITY REACHED, running FairPropose+FairUpdate", get_id());
 
         /* FairPropose() */
+        ElapsedTime fp_timer;
+        fp_timer.start();
         std::unordered_map<uint256_t, std::unordered_set<uint256_t>> graph = fair_propose();
-        LOG_PROTO("[R-%d] FairPropose done, graph_size=%zu", get_id(), graph.size());
+        fp_timer.stop(false);
 
         /* FairUpdate() */
+        ElapsedTime fu_timer;
+        fu_timer.start();
         std::vector<std::pair<uint256_t, uint256_t>> e_update = fair_update();
-        LOG_PROTO("[R-%d] FairUpdate done, e_update_size=%zu", get_id(), e_update.size());
+        fu_timer.stop(false);
+
+        LOG_PROTO("[R-%d] FairPropose: graph=%zu (%.3fms), FairUpdate: e_upd=%zu (%.3fms), pending_beats=%zu",
+                 get_id(), graph.size(), fp_timer.elapsed_sec*1000,
+                 e_update.size(), fu_timer.elapsed_sec*1000,
+                 pmaker->get_pending_size());
 
         /* Store proposed commands */
         for(auto g: graph){
@@ -338,12 +348,14 @@ void HotStuffBase::process_local_order(const LocalOrder &local_order){
         pmaker->beat().then([this, graph = std::move(graph), e_up = std::move(e_update)](ReplicaID proposer) {
             if (proposer == get_id())
             {
-                LOG_PROTO("[R-%d] beat resolved, I am proposer, calling on_propose", get_id());
+                LOG_PROTO("[R-%d] beat() resolved: I am proposer, graph=%zu, calling on_propose",
+                         get_id(), graph.size());
                 on_propose(graph, e_up, pmaker->get_parents());
             }
             else
             {
-                LOG_PROTO("[R-%d] beat resolved, proposer is R-%d (not me), skipping", get_id(), proposer);
+                LOG_PROTO("[R-%d] beat() resolved: proposer=R-%d (not me), SKIPPING proposal",
+                         get_id(), proposer);
             }
         });
     }
@@ -356,31 +368,31 @@ bool HotStuffBase::conn_handler(const salticidae::ConnPool::conn_t &conn, bool c
     {
         if (!pn.enable_tls) return true;
         auto cert = conn->get_peer_cert();
-        //SALTICIDAE_LOG_INFO("%s", salticidae::get_hash(cert->get_der()).to_hex().c_str());
+        //SALTICIDAE_LOG_PROTO("%s", salticidae::get_hash(cert->get_der()).to_hex().c_str());
         return valid_tls_certs.count(salticidae::get_hash(cert->get_der()));
     }
     return true;
 }
 
 void HotStuffBase::print_stat() const {
-    LOG_INFO("===== begin stats =====");
-    LOG_INFO("-------- queues -------");
-    LOG_INFO("blk_fetch_waiting: %lu", blk_fetch_waiting.size());
-    LOG_INFO("blk_delivery_waiting: %lu", blk_delivery_waiting.size());
-    LOG_INFO("decision_waiting: %lu", decision_waiting.size());
-    LOG_INFO("-------- misc ---------");
-    LOG_INFO("fetched: %lu", fetched);
-    LOG_INFO("delivered: %lu", delivered);
-    LOG_INFO("cmd_cache: %lu", storage->get_cmd_cache_size());
-    LOG_INFO("blk_cache: %lu", storage->get_blk_cache_size());
-    LOG_INFO("------ misc (10s) -----");
-    LOG_INFO("fetched: %lu", part_fetched);
-    LOG_INFO("delivered: %lu", part_delivered);
-    LOG_INFO("decided: %lu", part_decided);
-    LOG_INFO("gened: %lu", part_gened);
-    LOG_INFO("avg. parent_size: %.3f",
+    LOG_PROTO("===== begin stats =====");
+    LOG_PROTO("-------- queues -------");
+    LOG_PROTO("blk_fetch_waiting: %lu", blk_fetch_waiting.size());
+    LOG_PROTO("blk_delivery_waiting: %lu", blk_delivery_waiting.size());
+    LOG_PROTO("decision_waiting: %lu", decision_waiting.size());
+    LOG_PROTO("-------- misc ---------");
+    LOG_PROTO("fetched: %lu", fetched);
+    LOG_PROTO("delivered: %lu", delivered);
+    LOG_PROTO("cmd_cache: %lu", storage->get_cmd_cache_size());
+    LOG_PROTO("blk_cache: %lu", storage->get_blk_cache_size());
+    LOG_PROTO("------ misc (10s) -----");
+    LOG_PROTO("fetched: %lu", part_fetched);
+    LOG_PROTO("delivered: %lu", part_delivered);
+    LOG_PROTO("decided: %lu", part_decided);
+    LOG_PROTO("gened: %lu", part_gened);
+    LOG_PROTO("avg. parent_size: %.3f",
             part_delivered ? part_parent_size / double(part_delivered) : 0);
-    LOG_INFO("delivery time: %.3f avg, %.3f min, %.3f max",
+    LOG_PROTO("delivery time: %.3f avg, %.3f min, %.3f max",
             part_delivered ? part_delivery_time / double(part_delivered) : 0,
             part_delivery_time_min == double_inf ? 0 : part_delivery_time_min,
             part_delivery_time_max);
@@ -394,7 +406,7 @@ void HotStuffBase::print_stat() const {
     part_delivery_time_min = double_inf;
     part_delivery_time_max = 0;
 #ifdef HOTSTUFF_MSG_STAT
-    LOG_INFO("--- replica msg. (10s) ---");
+    LOG_PROTO("--- replica msg. (10s) ---");
     size_t _nsent = 0;
     size_t _nrecv = 0;
     for (const auto &replica: peers)
@@ -406,7 +418,7 @@ void HotStuffBase::print_stat() const {
         size_t nsb = conn->get_nsentb();
         size_t nrb = conn->get_nrecvb();
         conn->clear_msgstat();
-        LOG_INFO("%s: %u(%u), %u(%u), %u",
+        LOG_PROTO("%s: %u(%u), %u(%u), %u",
             get_hex10(replica).c_str(), ns, nsb, nr, nrb, part_fetched_replica[replica]);
         _nsent += ns;
         _nrecv += nr;
@@ -414,13 +426,13 @@ void HotStuffBase::print_stat() const {
     }
     nsent += _nsent;
     nrecv += _nrecv;
-    LOG_INFO("sent: %lu", _nsent);
-    LOG_INFO("recv: %lu", _nrecv);
-    LOG_INFO("--- replica msg. total ---");
-    LOG_INFO("sent: %lu", nsent);
-    LOG_INFO("recv: %lu", nrecv);
+    LOG_PROTO("sent: %lu", _nsent);
+    LOG_PROTO("recv: %lu", _nrecv);
+    LOG_PROTO("--- replica msg. total ---");
+    LOG_PROTO("sent: %lu", nsent);
+    LOG_PROTO("recv: %lu", nrecv);
 #endif
-    LOG_INFO("====== end stats ======");
+    LOG_PROTO("====== end stats ======");
 }
 
 HotStuffBase::HotStuffBase(uint32_t blk_size,
@@ -586,9 +598,9 @@ void HotStuffBase::start(
     // Byzantine simulation: designate replicas 0..num_faults-1 as Byzantine
     if (num_faults > 0 && get_id() < (ReplicaID)num_faults) {
         set_byzantine(true);
-        LOG_INFO("[R-%d] *** BYZANTINE MODE ENABLED *** (num_faults=%d)", get_id(), num_faults);
+        LOG_PROTO("[R-%d] *** BYZANTINE MODE ENABLED *** (num_faults=%d)", get_id(), num_faults);
     } else if (num_faults > 0) {
-        LOG_INFO("[R-%d] Honest replica (num_faults=%d)", get_id(), num_faults);
+        LOG_PROTO("[R-%d] Honest replica (num_faults=%d)", get_id(), num_faults);
     }
 
     pmaker->init(this);
@@ -604,6 +616,7 @@ void HotStuffBase::start(
         // This caps handler time to ~25µs, giving network events
         // a chance between invocations even with a hot pipe.
         size_t count = 0;
+        size_t dups = 0;
         while (count < blk_size && q.try_dequeue(e))
         {
             count++;
@@ -611,10 +624,17 @@ void HotStuffBase::start(
             auto it = decision_waiting.find(cmd_hash);
             if (it == decision_waiting.end())
                 it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
-            else
+            else {
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
+                dups++;
+            }
             local_order_buffer.push(cmd_hash);
         }
+
+        // Diagnostic: log handler activity
+        LOG_PROTO("[R-%d] cmd_handler: dequeued=%zu dups=%zu lo_buf=%zu dw=%zu",
+                 get_id(), count, dups, local_order_buffer.size(),
+                 decision_waiting.size());
 
         if (local_order_buffer.size() >= blk_size) {
             ReplicaID proposer = pmaker->get_proposer();
@@ -624,8 +644,8 @@ void HotStuffBase::start(
                 cmds.push_back(local_order_buffer.front());
                 local_order_buffer.pop();
             }
-            LOG_PROTO("[R-%d] cmd_handler: sending %zu cmds to L-%d",
-                    get_id(), cmds.size(), proposer);
+            LOG_PROTO("[R-%d] cmd_handler: SEND local_order %zu cmds to L-%d, lo_buf_remain=%zu",
+                     get_id(), cmds.size(), proposer, local_order_buffer.size());
             on_local_order(proposer, cmds);
         }
 

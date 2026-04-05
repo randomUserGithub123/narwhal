@@ -178,18 +178,22 @@ void HotStuffCore::update(const block_t &nblk) {
                                 std::string(*blk) + " " +
                                 std::string(*b_exec));
 
-    HOTSTUFF_LOG_DEBUG("[[update]] [R-%d] [L-] Commit queue Size = %d", get_id(), commit_queue.size());
+    LOG_INFO("[R-%d] update: commit_queue size=%zu", get_id(), commit_queue.size());
     for (auto it = commit_queue.rbegin(); it != commit_queue.rend(); it++)
     {
         const block_t &blk = *it;
 
         // Themis
-        HOTSTUFF_LOG_DEBUG("[[update]] [R-%d] [L-] Graph Size = %d, block = %.10s", get_id(), blk->get_graph().size(), get_hex(blk->get_hash()).c_str());
+        LOG_INFO("[R-%d] update: blk=%.10s height=%lu graph_size=%zu is_tournament=%d",
+                 get_id(), get_hex(blk->get_hash()).c_str(), blk->get_height(),
+                 blk->get_graph().size(), blk->is_tournament_graph());
         auto const &order = fair_finalize(blk, nblk->get_e_update());
-        HOTSTUFF_LOG_DEBUG("[[update]] [R-%d] [L-] Final Order Size = %d", get_id(), order.size());
+        LOG_INFO("[R-%d] update: fair_finalize order_size=%zu (blk=%.10s)",
+                 get_id(), order.size(), get_hex(blk->get_hash()).c_str());
         if(order.empty() && !blk->get_graph().empty()) {
             /* this is not a tournament graph: stop looking at further blocks */
-            HOTSTUFF_LOG_DEBUG("[[update]] [R-%d] [L-] Not a tournament Graph", get_id());
+            LOG_INFO("[R-%d] update: STALL graph_not_tournament blk=%.10s graph_size=%zu",
+                     get_id(), get_hex(blk->get_hash()).c_str(), blk->get_graph().size());
             break;
         }
 
@@ -198,6 +202,8 @@ void HotStuffCore::update(const block_t &nblk) {
         do_consensus(blk);
         LOG_PROTO("commit %s", std::string(*blk).c_str());
         size_t n = order.size();
+        LOG_INFO("[R-%d] update: COMMIT blk=%.10s height=%lu decided=%zu txs",
+                 get_id(), get_hex(blk->get_hash()).c_str(), blk->get_height(), n);
         for (size_t i=0; i<n; i++) {
             do_decide(Finality(id, 1, i, blk->height, order[i], blk->get_hash()));
             // Log finalized ordering for adversarial reordering metric
@@ -500,6 +506,10 @@ block_t HotStuffCore::on_propose(/* const std::vector<uint256_t> &cmds,*/       
     const uint256_t bnew_hash = bnew->get_hash();
     bnew->self_qc = create_quorum_cert(bnew_hash);
     on_deliver_blk(bnew);
+    // Diagnostic: log block creation
+    LOG_INFO("[R-%d] on_propose: NEW BLOCK blk=%.10s height=%lu graph=%zu e_update=%zu",
+             get_id(), get_hex(bnew_hash).c_str(), bnew->get_height(),
+             graph.size(), e_update.size());
     update(bnew);
     Proposal prop(id, bnew, nullptr);
     LOG_PROTO("propose %s", std::string(*bnew).c_str());
@@ -618,6 +628,9 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
     qc->add_part(vote.voter, *vote.cert);
     if (qsize + 1 == config.nmajority)
     {
+        LOG_INFO("[R-%d] QC FORMED for blk=%.10s height=%lu (%zu/%zu votes)",
+                 get_id(), get_hex10(blk->get_hash()).c_str(), blk->get_height(),
+                 qsize + 1, config.nmajority);
         qc->compute();
         update_hqc(blk, qc);
         on_qc_finish(blk);
@@ -657,7 +670,7 @@ void HotStuffCore::on_local_order (ReplicaID proposer, const std::vector<uint256
 
     if(cmds.size()==0 && l_update.size()==0){
         /* Nothing to send to Leader */
-        HOTSTUFF_LOG_DEBUG("[[on_local_order]] [R-%d] [L-%d] Nothing to order", get_id(), proposer);
+        LOG_INFO("[R-%d] on_local_order: EMPTY nothing to send to L-%d", get_id(), proposer);
         return;
     }
 
@@ -693,10 +706,24 @@ bool HotStuffCore::on_receive_local_order (const LocalOrder &local_order, const 
     /** add new local order to the storage **/
     storage->add_local_order(local_order.initiator, local_order.ordered_hashes, local_order.l_update);
 
+    // Diagnostic: log which replicas have reported
+    {
+        auto rep_vec = storage->get_ordered_hash_replia_vector();
+        std::string rep_list;
+        for (auto r : rep_vec) rep_list += std::to_string(r) + " ";
+        LOG_INFO("[R-%d] on_recv_local_order: from R-%d (%zu cmds, %zu l_upd), "
+                 "cache=%zu/%zu, reporters=[%s]",
+                 get_id(), local_order.initiator,
+                 local_order.ordered_hashes.size(), local_order.l_update.size(),
+                 storage->get_local_order_cache_size(), config.nmajority,
+                 rep_list.c_str());
+    }
+
     /** Trigger FairPropose() and FairUpdate() **/
     if(storage->get_local_order_cache_size() >= config.nmajority){
         // Check if the commands in front of all the queues are proposed OR not
         std::vector<ReplicaID> replicas = storage->get_ordered_hash_replia_vector();
+        size_t filtered_out_total = 0;
         for(ReplicaID replica: replicas){
             std::vector<uint256_t> unproposed_hashes;
             for(uint256_t tx_hash: storage->get_ordered_hash_vector(replica)){
@@ -704,7 +731,9 @@ bool HotStuffCore::on_receive_local_order (const LocalOrder &local_order, const 
                     unproposed_hashes.push_back(tx_hash);
                 }
             }
-            if(unproposed_hashes.size() < storage->get_ordered_hash_vector(replica).size()){
+            size_t orig_size = storage->get_ordered_hash_vector(replica).size();
+            if(unproposed_hashes.size() < orig_size){
+                filtered_out_total += (orig_size - unproposed_hashes.size());
                 storage->clear_front_ordered_hash(replica);
                 if(!unproposed_hashes.empty()){
                     storage->add_ordered_hash_to_front(replica, unproposed_hashes);
@@ -721,9 +750,11 @@ bool HotStuffCore::on_receive_local_order (const LocalOrder &local_order, const 
         }
 #endif
         bool ready = storage->get_local_order_cache_size() >= config.nmajority;
-        HOTSTUFF_LOG_DEBUG("[R-%d] on_receive_local_order from R-%d: cache=%zu, nmajority=%zu, ready=%d",
-                        get_id(), local_order.initiator,
-                        storage->get_local_order_cache_size(), config.nmajority, ready);
+        // Diagnostic: post-filter state
+        LOG_INFO("[R-%d] on_recv_local_order: MAJORITY check: filtered_out=%zu, "
+                 "post_filter_cache=%zu, ready=%d",
+                 get_id(), filtered_out_total,
+                 storage->get_local_order_cache_size(), ready);
         return ready;
     }
     HOTSTUFF_LOG_DEBUG("[[on_receive_local_order]] [fromR-%d] [thisL-%d] No majority Found", local_order.initiator, get_id());
@@ -735,6 +766,19 @@ std::unordered_map<uint256_t, std::unordered_set<uint256_t>> HotStuffCore::fair_
     HOTSTUFF_LOG_DEBUG("[[fairPropose START]] [R-%d]", get_id());
     /** (1) get those replicas from which Leader has received their local order **/
     std::vector<ReplicaID> replicas = storage->get_ordered_hash_replia_vector();
+
+    // Diagnostic: log replica order sizes
+    {
+        size_t total_tx_entries = 0;
+        std::string rep_sizes;
+        for (auto r : replicas) {
+            size_t sz = storage->get_ordered_hash_vector(r).size();
+            total_tx_entries += sz;
+            rep_sizes += "R" + std::to_string(r) + ":" + std::to_string(sz) + " ";
+        }
+        LOG_INFO("[R-%d] fair_propose: %zu replica orders, %zu total tx entries [%s]",
+                 get_id(), replicas.size(), total_tx_entries, rep_sizes.c_str());
+    }
 
     /** (2) Create an empty graph G = (V,E) **/
     std::unordered_map<uint256_t, std::unordered_set<uint256_t>> graph;
@@ -749,17 +793,27 @@ std::unordered_map<uint256_t, std::unordered_set<uint256_t>> HotStuffCore::fair_
     }
     /* find non blank transactions and add them to the graph */
     std::unordered_set<uint256_t> solid_tx_set;
+    size_t n_blank = 0;
     for(auto &tx: tx_count){
         uint256_t hash = tx.first;
         double count = tx.second * 1.0;
         if(count >= config.non_blank_tx_threshold) {
             /** this is a non blank transaction **/
             graph.insert(std::make_pair(hash, std::unordered_set<uint256_t>()));
+        } else {
+            n_blank++;
         }
         if(count >= config.solid_tx_threshold) {
             solid_tx_set.insert(hash);
         }
     }
+    // Diagnostic: log tx classification
+    LOG_INFO("[R-%d] fair_propose: unique_txs=%zu solid=%zu shaded=%zu blank=%zu "
+             "(thresholds: solid>=%.0f nonblank>=%.0f edge>=%.0f)",
+             get_id(), tx_count.size(), solid_tx_set.size(),
+             graph.size() - solid_tx_set.size(), n_blank,
+             config.solid_tx_threshold, config.non_blank_tx_threshold,
+             config.tx_edge_threshold);
 
     /** (4) Add edges to E **/
     std::unordered_map<uint256_t, std::unordered_map<uint256_t, uint16_t>> edge_count;
@@ -812,24 +866,25 @@ std::unordered_map<uint256_t, std::unordered_set<uint256_t>> HotStuffCore::fair_
 #endif
     
 
-    /** (6) Find the Last vertex `V` in S that has solid transaction. **/
+    /** (6) Find the LAST vertex `V` in S that has solid transaction.
+     *  Paper: "Let V be the last vertex of S that contains a solid transaction."
+     *  We scan ALL SCCs to find the last one containing a solid tx.
+     *  (Previous code broke at the first non-solid SCC, which is incorrect
+     *   when a shaded SCC appears between two solid SCCs.) **/
     size_t n_scc = topo_sorted_cond_graph.size();
-    int scc_i=0;
-    for( ; scc_i<n_scc; scc_i++){
-        bool solid_found=false;
-        for(auto const &tx: topo_sorted_cond_graph[scc_i]){
-            if(solid_tx_set.count(tx)>0){
-                solid_found = true;
+    int last_solid_scc = -1;  // index of last SCC containing a solid tx
+    for(size_t i = 0; i < n_scc; i++){
+        for(auto const &tx: topo_sorted_cond_graph[i]){
+            if(solid_tx_set.count(tx) > 0){
+                last_solid_scc = (int)i;
                 break;
             }
         }
-        if(!solid_found){
-            break;
-        }
     }
+    LOG_INFO("[R-%d] fair_propose: n_scc=%zu last_solid_scc=%d", get_id(), n_scc, last_solid_scc);
 
-    /** (7) Remove those transactions from G, that are part of vertices after V in S **/
-    for( ; scc_i<n_scc; scc_i++){
+    /** (7) Remove those transactions from G, that are part of vertices AFTER V in S **/
+    for(size_t scc_i = (size_t)(last_solid_scc + 1); scc_i < n_scc; scc_i++){
         for(auto const &tx: topo_sorted_cond_graph[scc_i]){
             /* remove this tx from original graph */
             graph.erase(tx);
@@ -854,6 +909,9 @@ std::unordered_map<uint256_t, std::unordered_set<uint256_t>> HotStuffCore::fair_
     for(ReplicaID replica: replicas){
         storage->clear_front_ordered_hash(replica);
     }
+
+    // Diagnostic: log final graph size after pruning
+    LOG_INFO("[R-%d] fair_propose: DONE final_graph_size=%zu", get_id(), graph.size());
 
     return graph;
 }
@@ -923,6 +981,9 @@ std::vector<std::pair<uint256_t, uint256_t>> HotStuffCore::fair_update(){
 #endif
     
     HOTSTUFF_LOG_DEBUG("[[fair_update ENDS]] [R-%d]", get_id());
+
+    LOG_INFO("[R-%d] fair_update: %zu replicas provided l_updates, e_update_size=%zu",
+             get_id(), replicas.size(), e_update.size());
 
     for(auto const &replica: replicas){
         storage->clear_front_l_update(replica);
