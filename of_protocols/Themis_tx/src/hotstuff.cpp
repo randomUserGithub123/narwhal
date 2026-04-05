@@ -310,6 +310,9 @@ void HotStuffBase::local_order_handler(MsgLocalOrder &&msg, const Net::conn_t &c
 
 // Themis
 void HotStuffBase::process_local_order(const LocalOrder &local_order){
+    LOG_INFO("[R-%d] process_local_order from R-%d, cache_size=%zu, nmajority=%zu",
+             get_id(), local_order.initiator,
+             storage->get_local_order_cache_size(), get_config().nmajority);
     if(on_receive_local_order(local_order, pmaker->get_parents())==true){
         /* FairPropose() */
         std::unordered_map<uint256_t, std::unordered_set<uint256_t>> graph = fair_propose();
@@ -596,6 +599,10 @@ void HotStuffBase::start(
      * At  500 TPS / lo_size=100 a batch fills in ~200ms → 4 timer cycles.
      * Both leave plenty of event-loop headroom for consensus. */
     lo_timer = TimerEvent(ec, [this](TimerEvent &te) {
+        if (local_order_buffer.size() > 0) {
+            LOG_INFO("[R-%d] lo_timer: buffer=%zu, blk_size=%zu",
+                    get_id(), local_order_buffer.size(), blk_size);
+        }
         while (local_order_buffer.size() >= blk_size) {
             ReplicaID proposer = pmaker->get_proposer();
             std::vector<uint256_t> cmds;

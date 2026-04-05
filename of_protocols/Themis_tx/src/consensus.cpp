@@ -672,6 +672,8 @@ void HotStuffCore::on_local_order (ReplicaID proposer, const std::vector<uint256
         HOTSTUFF_LOG_DEBUG("[[on_local_order]] [R-%d] [L-%d] LocalOrder Created = %.10s", get_id(), proposer, get_hex(cmd).c_str());
     }
 #endif
+    HOTSTUFF_LOG_INFO("[R-%d] on_local_order: sending %zu cmds to leader %d",
+                      get_id(), cmds.size(), proposer);
     do_send_local_order(proposer, local_order);
 }
 
@@ -718,7 +720,11 @@ bool HotStuffCore::on_receive_local_order (const LocalOrder &local_order, const 
             }
         }
 #endif
-        return storage->get_local_order_cache_size() >= config.nmajority;
+        bool ready = storage->get_local_order_cache_size() >= config.nmajority;
+        HOTSTUFF_LOG_DEBUG("[R-%d] on_receive_local_order from R-%d: cache=%zu, nmajority=%zu, ready=%d",
+                        get_id(), local_order.initiator,
+                        storage->get_local_order_cache_size(), config.nmajority, ready);
+        return ready;
     }
     HOTSTUFF_LOG_DEBUG("[[on_receive_local_order]] [fromR-%d] [thisL-%d] No majority Found", local_order.initiator, get_id());
     return false;
