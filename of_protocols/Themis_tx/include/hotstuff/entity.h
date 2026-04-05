@@ -204,7 +204,9 @@ class Block {
 
     // Themis
     void update_graph(std::pair<uint256_t, uint256_t> const &edge){
-        graph[edge.first].insert(edge.second);
+        if (graph.count(edge.first) > 0 && graph.count(edge.second) > 0) {
+            graph[edge.first].insert(edge.second);
+        }
     }
 
     // Themis
