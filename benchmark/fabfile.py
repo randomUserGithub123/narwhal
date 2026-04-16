@@ -128,11 +128,11 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
         # (0, 1, 400, 0, 1, 4, 5, 4000),
         # (0, 1, 800, 0, 1, 4, 5, 4000),
         ### Changing GAMMA
-        (0, 1, 25 * 128, 1.0, 1, 1, 5, 5, 4000),
-        (0, 1, 25 * 128, 0.9, 1, 1, 6, 5, 4000),
-        (0, 1, 25 * 128, 0.8, 1, 1, 7, 5, 4000),
-        (0, 1, 25 * 128, 0.7, 1, 1, 10, 5, 4000),
-        (0, 1, 25 * 128, 0.6, 1, 1, 17, 5, 4000),
+        # (0, 1, 25 * 128, 1.0, 1, 1, 5, 5, 4000),
+        # (0, 1, 25 * 128, 0.9, 1, 1, 6, 5, 4000),
+        # (0, 1, 25 * 128, 0.8, 1, 1, 7, 5, 4000),
+        (0, 1, 25 * 128, 0.7, 1, 1, 11, 5, 4000),
+        (0, 1, 25 * 128, 0.6, 1, 1, 21, 5, 4000),
         ### Chaning input_rate ###
         # (0, 1, 4_000, 1, 1, 4, 5, 500),
         # (0, 1, 4_000, 1, 1, 4, 5, 1000),
@@ -199,7 +199,8 @@ def das(ctx, debug=True, console=False, build=True, username="mputnik"):
             "scc_ordering": "alphabetical", # batch-OF parameter
         }
 
-        k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
+        # k = round((2 * (node_params['gamma'] + 1)) / (2 * node_params['gamma'] - 1), 10)
+        k = round(4 / (2 * node_params['gamma'] - 1), 10)
         node_params.update({
             "fault_threshold": int(math.floor((bench_params["nodes"] - 1) / k))
         })
