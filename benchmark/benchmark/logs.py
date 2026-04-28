@@ -363,23 +363,25 @@ class LogParser:
         print(f"  Running: {' '.join(cmd)}")
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0:
-                print(f"  WARN: adv_reorder failed: {result.stderr[:500]}")
-                return None
+            # result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            # if result.returncode != 0:
+            #     print(f"  WARN: adv_reorder failed: {result.stderr[:500]}")
+            #     return None
 
-            data = json.loads(result.stdout)
+            # data = json.loads(result.stdout)
 
-            # Convert JSON to our dict format
-            start_dist = N % 2
-            dist_values = list(range(start_dist, N + 1, 2))
-            results = {d: (0.0, 0) for d in dist_values}
-            for entry in data.get('results', []):
-                d = entry['dist']
-                if d in results:
-                    results[d] = (entry['fraction_reversed'], entry['count'])
+            # # Convert JSON to our dict format
+            # start_dist = N % 2
+            # dist_values = list(range(start_dist, N + 1, 2))
+            # results = {d: (0.0, 0) for d in dist_values}
+            # for entry in data.get('results', []):
+            #     d = entry['dist']
+            #     if d in results:
+            #         results[d] = (entry['fraction_reversed'], entry['count'])
 
-            return results
+            # return results
+
+            return None
 
         except subprocess.TimeoutExpired:
             print("  WARN: adv_reorder timed out (600s)")
