@@ -477,13 +477,10 @@ fn apply_fair_update(
         let kuv = vote_weight.get(&(u, v)).copied().unwrap_or(0);
         let kvu = vote_weight.get(&(v, u)).copied().unwrap_or(0);
 
-        let u_in_enough = tx_author_count.get(&u).map(|s| s.len() as u16 >= t_solid).unwrap_or(false);
-        let v_in_enough = tx_author_count.get(&v).map(|s| s.len() as u16 >= t_solid).unwrap_or(false);
-
         if kuv >= kvu {
-            if u_in_enough && kuv >= t_edge { edge_set.insert((u, v)); new_edges_count += 1; }
+            if kuv >= t_edge { edge_set.insert((u, v)); new_edges_count += 1; }
         } else {
-            if v_in_enough && kvu >= t_edge { edge_set.insert((v, u)); new_edges_count += 1; }
+            if kvu >= t_edge { edge_set.insert((v, u)); new_edges_count += 1; }
         }
     }
 
@@ -562,10 +559,23 @@ pub struct FairDagProcessor {
     next_to_finalize: u64,
     ready_to_finalize: BTreeMap<u64, Vec<TxDigest>>,
 
-    /// Cross-subdag dedup: tracks (replica_index, tx_digest) pairs already
-    /// seen in any previous subdag. If the same (replica, digest) appears
-    /// again in a later subdag, it is dropped during extraction.
-    seen_replica_tx: HashSet<(usize, TxDigest)>,
+    /// Cumulative support: tx → set of replica indices that have committed it
+    /// in some subdag, restricted to txs that are still pending (not yet
+    /// permanently proposed in some G_r).
+    pending_support: HashMap<TxDigest, HashSet<usize>>,
+
+    /// Per-replica cumulative ordering of pending txs, in OI order.
+    /// Indexed by replica_index. Updated deterministically in subdag-commit order.
+    pending_orderings: Vec<Vec<TxDigest>>,
+
+    /// Permanently proposed: txs that have entered some G_r and been confirmed
+    /// (Finalized branch landed, or NeedsFairUpdate vertex was retained).
+    proposed_txs: HashSet<TxDigest>,
+
+    /// Design B: tentatively claimed by some in-flight build_graph.
+    /// Maps sub_dag_id → set of txs claimed by that subdag's build_graph dispatch.
+    /// On result arrival: claimed-and-in-G_r → proposed_txs; claimed-and-not-in-G_r → released.
+    claimed_txs: HashMap<u64, HashSet<TxDigest>>,
 
     finalized_txs: HashSet<TxDigest>,
 }
@@ -617,7 +627,10 @@ impl FairDagProcessor {
                 sub_dag_count: 0,
                 next_to_finalize: 1,
                 ready_to_finalize: BTreeMap::new(),
-                seen_replica_tx: HashSet::new(),
+                pending_support: HashMap::new(),
+                pending_orderings: vec![Vec::new(); n],
+                proposed_txs: HashSet::new(),
+                claimed_txs: HashMap::new(),
                 finalized_txs: HashSet::new(),
             }
             .run()
@@ -639,6 +652,7 @@ impl FairDagProcessor {
     async fn run(&mut self) {
         loop {
             tokio::select! {
+                
                 Some((leader_round, certificates)) = self.rx_committed_subdags.recv() => {
                     self.sub_dag_count += 1;
                     let sub_dag_id = self.sub_dag_count;
@@ -654,6 +668,7 @@ impl FairDagProcessor {
                         k, indices_sets.len(), extracted_votes.len()
                     );
 
+                    // Route votes to their target subdags' pending pools.
                     for (author, vote) in extracted_votes {
                         let decompressed = unpack_and_decompress_edges(
                             &vote.directed_edges_compressed, vote.edge_count,
@@ -667,6 +682,11 @@ impl FairDagProcessor {
                     }
 
                     self.try_resolve_parked_graphs().await;
+
+                    // Design B: record the claim set BEFORE dispatching build_graph.
+                    // This is synchronous and runs on the main loop, so the next subdag's
+                    // extract_subdag_and_votes will see this claim and exclude it.
+                    let _claim = self.compute_and_record_claim(sub_dag_id, &indices_sets, &index_to_digest);
 
                     let tx = self.tx_graph_results.clone();
                     let nbt = self.non_blank_threshold;
@@ -682,6 +702,8 @@ impl FairDagProcessor {
                     match result {
                         GraphResult::Empty { sub_dag_id } => {
                             debug!("sub_dag_id={}: empty graph", sub_dag_id);
+                            // Nothing entered any graph. Release all claimed txs back to pending.
+                            self.release_claim(sub_dag_id, &HashSet::new());
                             self.ready_to_finalize.insert(sub_dag_id, vec![]);
                         }
                         GraphResult::Finalized { sub_dag_id, tx_order } => {
@@ -689,6 +711,10 @@ impl FairDagProcessor {
                                 "sub_dag_id={}: finalized immediately, {} txs",
                                 sub_dag_id, tx_order.len()
                             );
+                            // tx_order is exactly the set that entered G_{r}.
+                            let included: HashSet<TxDigest> = tx_order.iter().copied().collect();
+                            self.confirm_proposed(&included);
+                            self.release_claim(sub_dag_id, &included);
                             self.ready_to_finalize.insert(sub_dag_id, tx_order);
                         }
                         GraphResult::NeedsFairUpdate {
@@ -701,15 +727,25 @@ impl FairDagProcessor {
                                 sub_dag_id, vertex_indices.len(), missing_edges.len()
                             );
 
+                            // The vertices that ENTERED G_r are exactly vertex_indices.
+                            let included: HashSet<TxDigest> = vertex_indices
+                                .iter()
+                                .map(|&v| index_to_digest[v as usize])
+                                .collect();
+                            self.confirm_proposed(&included);
+                            self.release_claim(sub_dag_id, &included);
+
                             let vertices_with_digests: Vec<(u16, u64)> = missing_edge_vertices
                                 .iter()
                                 .map(|&v| (v, index_to_digest[v as usize]))
                                 .collect();
 
                             self.parked_graphs.insert(sub_dag_id, ParkedGraph {
-                                vertex_indices, existing_edges,
+                                vertex_indices,
+                                existing_edges,
                                 missing_edges: missing_edges.clone(),
-                                index_to_digest, is_solid,
+                                index_to_digest,
+                                is_solid,
                             });
 
                             let _ = self.tx_fair_propose
@@ -735,8 +771,35 @@ impl FairDagProcessor {
         }
     }
 
+    /// Promote txs that entered some G_r to permanent. Removes them from
+    /// pending_support and from each replica's pending_orderings.
+    fn confirm_proposed(&mut self, included: &HashSet<TxDigest>) {
+        if included.is_empty() {
+            return;
+        }
+        for tx in included {
+            self.proposed_txs.insert(*tx);
+            self.pending_support.remove(tx);
+        }
+        for ordering in self.pending_orderings.iter_mut() {
+            ordering.retain(|tx| !included.contains(tx));
+        }
+    }
+
+    /// Close out the claim entry for `sub_dag_id`. Txs in the claim set that
+    /// are NOT in `included` are released back to pending (Case B: post-anchor
+    /// truncation, or never made the active set in build_graph).
+    ///
+    /// Released txs are not explicitly re-inserted anywhere — they are still
+    /// in pending_support and pending_orderings, and once we drop the claim
+    /// entry they no longer appear in the `excluded` union computed by
+    /// extract_subdag_and_votes for future subdags.
+    fn release_claim(&mut self, sub_dag_id: u64, _included: &HashSet<TxDigest>) {
+        self.claimed_txs.remove(&sub_dag_id);
+    }
+
     // =====================================================================
-    // Subdag extraction — deduplicates (replica, tx_digest) across subdags
+    // Subdag extraction
     // =====================================================================
 
     async fn extract_subdag_and_votes(
@@ -744,7 +807,8 @@ impl FairDagProcessor {
         _leader_round: Round,
         certificates: &[Certificate],
     ) -> (Vec<Vec<usize>>, Vec<TxDigest>, Vec<(PublicKey, FairUpdateVote)>) {
-        let mut per_replica: HashMap<usize, Vec<(TxDigest, u64)>> = HashMap::new();
+        // ----- Phase 1: ingest new (replica, tx, oi) triples into cumulative state. -----
+        let mut new_per_replica: HashMap<usize, Vec<(TxDigest, u64)>> = HashMap::new();
         let mut extracted_votes: Vec<(PublicKey, FairUpdateVote)> = Vec::new();
 
         for cert in certificates {
@@ -760,25 +824,35 @@ impl FairDagProcessor {
                     Ok(Some(serialized_batch)) => {
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
                             Ok(WorkerMessage::Batch(direct_entries, indirect_entries, votes)) => {
-                                let entries = per_replica.entry(replica_index).or_default();
-
                                 for (tx_bytes, oi) in direct_entries {
                                     let tx_id = extract_tx_digest(&tx_bytes);
-                                    // Drop if this (replica, tx) was seen in a previous subdag.
-                                    if self.seen_replica_tx.insert((replica_index, tx_id)) {
-                                        entries.push((tx_id, oi));
+                                    if self.proposed_txs.contains(&tx_id) {
+                                        continue;
+                                    }
+                                    let supp = self.pending_support.entry(tx_id).or_default();
+                                    if supp.insert(replica_index) {
+                                        new_per_replica
+                                            .entry(replica_index)
+                                            .or_default()
+                                            .push((tx_id, oi));
                                     }
                                 }
 
-                                for (tx_digest, oi) in indirect_entries {
-                                    // Drop if this (replica, tx) was seen in a previous subdag.
-                                    if self.seen_replica_tx.insert((replica_index, tx_digest)) {
-                                        entries.push((tx_digest, oi));
+                                for (tx_id, oi) in indirect_entries {
+                                    if self.proposed_txs.contains(&tx_id) {
+                                        continue;
+                                    }
+                                    let supp = self.pending_support.entry(tx_id).or_default();
+                                    if supp.insert(replica_index) {
+                                        new_per_replica
+                                            .entry(replica_index)
+                                            .or_default()
+                                            .push((tx_id, oi));
                                     }
                                 }
 
-                                for vote in votes {
-                                    extracted_votes.push((author, vote));
+                                for v in votes {
+                                    extracted_votes.push((author, v));
                                 }
                             }
                             Ok(_) => {
@@ -799,27 +873,36 @@ impl FairDagProcessor {
             }
         }
 
-        // Dedup within this subdag: sort by OI, keep first occurrence.
-        for entries in per_replica.values_mut() {
-            entries.sort_by_key(|&(_, oi)| oi);
-            let mut seen = HashSet::new();
-            entries.retain(|(digest, _)| seen.insert(*digest));
+        // Append new entries to per-replica cumulative orderings, sorted by OI.
+        for (replica_index, mut new_entries) in new_per_replica {
+            new_entries.sort_by_key(|&(_, oi)| oi);
+            for (tx_id, _) in new_entries {
+                self.pending_orderings[replica_index].push(tx_id);
+            }
         }
 
-        // Build global index space.
+        // ----- Phase 2: build snapshot for build_graph, excluding proposed + claimed. -----
+        // Union of all currently-claimed tx sets across in-flight build_graph dispatches.
+        let mut excluded: HashSet<TxDigest> = self.proposed_txs.clone();
+        for claim_set in self.claimed_txs.values() {
+            for tx in claim_set {
+                excluded.insert(*tx);
+            }
+        }
+
         let mut digest_to_index: HashMap<TxDigest, usize> = HashMap::new();
         let mut index_to_digest: Vec<TxDigest> = Vec::new();
-
-        let mut replica_indices: Vec<usize> = per_replica.keys().copied().collect();
-        replica_indices.sort_unstable();
-
         let mut indices_sets: Vec<Vec<usize>> = Vec::new();
 
-        for &ri in &replica_indices {
-            let entries = &per_replica[&ri];
-            let mut order: Vec<usize> = Vec::with_capacity(entries.len());
-
-            for &(tx_digest, _oi) in entries {
+        for ordering in self.pending_orderings.iter() {
+            if ordering.is_empty() {
+                continue;
+            }
+            let mut order: Vec<usize> = Vec::with_capacity(ordering.len());
+            for &tx_digest in ordering {
+                if excluded.contains(&tx_digest) {
+                    continue;
+                }
                 let idx = *digest_to_index.entry(tx_digest).or_insert_with(|| {
                     let i = index_to_digest.len();
                     index_to_digest.push(tx_digest);
@@ -827,13 +910,46 @@ impl FairDagProcessor {
                 });
                 order.push(idx);
             }
-
             if !order.is_empty() {
                 indices_sets.push(order);
             }
         }
 
         (indices_sets, index_to_digest, extracted_votes)
+    }
+
+    /// Design B: mark every non-blank tx in the snapshot as tentatively claimed
+    /// by `sub_dag_id`. Called synchronously before dispatching build_graph,
+    /// so that the next subdag's extract_subdag_and_votes excludes these txs.
+    ///
+    /// Returns the claim set, which the caller stores in `self.claimed_txs`.
+    fn compute_and_record_claim(
+        &mut self,
+        sub_dag_id: u64,
+        indices_sets: &[Vec<usize>],
+        index_to_digest: &[TxDigest],
+    ) -> HashSet<TxDigest> {
+        // Count cumulative support among the snapshot's vertices.
+        // (Equivalent to |pending_support[tx]| since the snapshot was built
+        // from pending_orderings; we recompute from indices_sets to stay
+        // consistent with what build_graph will see.)
+        let k = index_to_digest.len();
+        let mut support = vec![0u8; k];
+        for order in indices_sets {
+            for &idx in order {
+                support[idx] = support[idx].saturating_add(1);
+            }
+        }
+
+        let mut claim: HashSet<TxDigest> = HashSet::new();
+        for (idx, &cnt) in support.iter().enumerate() {
+            if cnt >= self.non_blank_threshold {
+                claim.insert(index_to_digest[idx]);
+            }
+        }
+
+        self.claimed_txs.insert(sub_dag_id, claim.clone());
+        claim
     }
 
     // =====================================================================
