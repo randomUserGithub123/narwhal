@@ -1,19 +1,43 @@
-// FairDAG-RL with explicit FairUpdate (Themis-style) — Option D variant.
+// FairDAG-RL with explicit FairUpdate (Themis-style) — Option D + cumulative-chain fix.
 //
-// Option D design:
-//   - At dispatch time, claim only SOLID transactions (cumulative support ≥ τ_s),
-//     not shaded ones. Shaded txs in one subdag's snapshot remain visible to
-//     subsequent subdags' snapshots.
-//   - Each subdag's task runs edge computation in parallel, then SYNCHRONIZES
-//     before Tarjan: it awaits the previous subdag's K_kept (the set of vertex
-//     digests that entered the previous subdag's G_r). It then discards those
-//     digests from its own active set before running Tarjan/anchor.
-//   - This preserves the single-graph property without hiding shaded txs from
-//     concurrent subdags, which fixes the cross-subdag visibility gap that the
-//     all-non-blank claim mechanism creates.
+// === Why this file exists ===
+//
+// Plain Option D (claim-only-solids + sync-barrier on immediate-prior K_kept) has a
+// residual race that violates single_graph when subdags are parked:
+//
+//   r:    parked, K_r computed, chain signal fires (K_r broadcast to r+1).
+//   r+1:  awaits K_r, discards correctly, signals K_{r+1} (which excludes K_r's txs
+//         because r+1 already discarded them).
+//   r+2:  commits BEFORE r's GraphResult reaches the main loop, so proposed_txs has
+//         not yet absorbed K_r. r+2's snapshot includes shaded txs from K_r.
+//         r+2 awaits K_{r+1} — does NOT contain K_r's txs — so r+2's discard misses
+//         K_r. K_r's shaded txs land in r+2's active set and enter G_{r+2}.
+//
+// Result: X ∈ G_r ∩ G_{r+2}, single_graph violated. The HashSet at finalization
+// masks the duplicate at the output but the SCC structure of G_{r+2} has been
+// computed against a transaction that was already finalized elsewhere, which can
+// pull other transactions into the wrong batch.
+//
+// === Fix ===
+//
+// The chain carries the CUMULATIVE in-flight K_kept (Arc<HashSet>) instead of the
+// per-subdag K. Each subdag r's task:
+//   1. Awaits prior_cumulative = K_1 ∪ ... ∪ K_{r-1}.
+//   2. Uses prior_cumulative as the discard set in phase 2/3.
+//   3. Computes own K_r.
+//   4. Signals new_cumulative = prior_cumulative ∪ K_r to subdag r+1.
+//
+// This guarantees that any subdag s > r whose snapshot was extracted before r's
+// OnResult fired sees K_r in its discard, regardless of how many parked subdags sit
+// between r and s.
+//
+// The cumulative set is not actively pruned (entries stay even after their owning
+// subdag's OnResult has fired and the txs have moved to proposed_txs). This is
+// memory-bounded by the depth of in-flight subdags and is harmless because
+// extract_subdag_and_votes already excludes proposed_txs from the snapshot, so a
+// stale entry in the cumulative set can never match an active vertex.
 //
 // IMPORTANT: this is exploratory. Correctness has NOT been formally verified.
-// Use for performance experimentation only.
 
 use crate::local_order_tracker::extract_tx_digest;
 use crate::worker::{FairProposeMessage, FairUpdateVote, WorkerMessage};
@@ -23,12 +47,16 @@ use log::{debug, error, info, warn};
 use lz4_flex::decompress_size_prepended;
 use primary::{Certificate, Round};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 
 type TxDigest = u64;
+
+/// Cumulative in-flight K_kept passed along the chain. Cheap to clone (Arc bump).
+type CumulativeKKept = Arc<HashSet<TxDigest>>;
 
 // =========================================================================
 // Edge compression helpers
@@ -319,12 +347,17 @@ fn run_phase1(
 
 // =========================================================================
 // Phase 2 + 3: Tarjan, anchor, truncation, missing-edge selection
-// (runs after sync barrier with prior subdag's K_kept)
+// (runs after sync barrier with prior subdag's cumulative K_kept)
 // =========================================================================
 
 enum GraphResult {
     Empty { sub_dag_id: u64 },
-    Finalized { sub_dag_id: u64, tx_order: Vec<TxDigest>, k_kept: HashSet<TxDigest> },
+    Finalized {
+        sub_dag_id: u64,
+        tx_order: Vec<TxDigest>,
+        /// OWN K_r only (not cumulative). Used by main loop to update proposed_txs.
+        k_kept: HashSet<TxDigest>,
+    },
     NeedsFairUpdate {
         sub_dag_id: u64,
         vertex_indices: Vec<u16>,
@@ -333,6 +366,7 @@ enum GraphResult {
         missing_edge_vertices: Vec<u16>,
         index_to_digest: Vec<TxDigest>,
         is_solid: Vec<bool>,
+        /// OWN K_r only.
         k_kept: HashSet<TxDigest>,
     },
 }
@@ -344,9 +378,9 @@ struct FairUpdateResult {
 
 fn run_phase23(
     p1: Phase1Result,
-    discard: HashSet<TxDigest>,
+    prior_cumulative: CumulativeKKept,
     non_blank_threshold: u8,
-    kkept_sender: oneshot::Sender<HashSet<TxDigest>>,
+    cumulative_sender: oneshot::Sender<CumulativeKKept>,
 ) -> GraphResult {
     let start = Instant::now();
     let Phase1Result {
@@ -364,13 +398,14 @@ fn run_phase23(
     #[inline(always)]
     fn w_idx(i: usize, j: usize, k: usize) -> usize { i * k + j }
 
-    // Build active set: non-blank AND not in discard.
+    // Active set: non-blank AND not in cumulative discard from prior in-flight subdags.
     let active: Vec<usize> = (0..k)
-        .filter(|&u| is_non_blank[u] && !discard.contains(&index_to_digest[u]))
+        .filter(|&u| is_non_blank[u] && !prior_cumulative.contains(&index_to_digest[u]))
         .collect();
 
     if active.is_empty() {
-        let _ = kkept_sender.send(HashSet::new());
+        // No own contribution; forward prior cumulative unchanged so the chain stays intact.
+        let _ = cumulative_sender.send(prior_cumulative);
         return GraphResult::Empty { sub_dag_id };
     }
 
@@ -396,7 +431,7 @@ fn run_phase23(
 
     let sccs = tarjan_scc_iterative(active_count, &edges);
     if sccs.is_empty() {
-        let _ = kkept_sender.send(HashSet::new());
+        let _ = cumulative_sender.send(prior_cumulative);
         return GraphResult::Empty { sub_dag_id };
     }
 
@@ -412,7 +447,7 @@ fn run_phase23(
     let anchor = match anchor_idx {
         Some(a) => a,
         None => {
-            let _ = kkept_sender.send(HashSet::new());
+            let _ = cumulative_sender.send(prior_cumulative);
             return GraphResult::Empty { sub_dag_id };
         }
     };
@@ -422,16 +457,25 @@ fn run_phase23(
         for &di in &sccs[topo[topo_pos]] { in_graph[di as usize] = true; }
     }
 
-    // K_kept: digests of vertices that entered G_r (i.e., in_graph).
-    // Compute and SIGNAL early so the next subdag's phase 2/3 can start
-    // running in parallel with this subdag's phase 3 (missing edges + output).
+    // Own K_r: digests of vertices that entered G_r (in_graph).
     let mut k_kept: HashSet<TxDigest> = HashSet::new();
     for di in 0..active_count {
         if in_graph[di] {
             k_kept.insert(index_to_digest[dense_to_orig[di]]);
         }
     }
-    let _ = kkept_sender.send(k_kept.clone());
+
+    // Build new cumulative = prior_cumulative ∪ k_kept and signal it EARLY so the next
+    // subdag's phase 2/3 can start in parallel with this subdag's missing-edge phase.
+    //
+    // We clone prior_cumulative's contents into a fresh HashSet because the next subdag's
+    // discard set is structurally the union of all in-flight K's; we cannot share storage
+    // because each chain link extends by k_kept. The Arc itself is still cheap to ship.
+    let mut new_cumulative: HashSet<TxDigest> =
+        HashSet::with_capacity(prior_cumulative.len() + k_kept.len());
+    new_cumulative.extend(prior_cumulative.iter().copied());
+    for &tx in &k_kept { new_cumulative.insert(tx); }
+    let _ = cumulative_sender.send(Arc::new(new_cumulative));
 
     let shaded_in_graph: Vec<u16> = (0..active_count as u16)
         .filter(|&di| in_graph[di as usize] && !is_solid[dense_to_orig[di as usize]])
@@ -464,9 +508,9 @@ fn run_phase23(
         }
 
         info!(
-            "FAIRDAG_TIMING: sub_dag_id={} FINALIZED: k={} active={} txs={} discarded={} \
-             phase1={}ns phase23={}ns",
-            sub_dag_id, k, active_count, finalized.len(), discard.len(),
+            "FAIRDAG_TIMING: sub_dag_id={} FINALIZED: k={} active={} txs={} \
+             cumulative_discard={} phase1={}ns phase23={}ns",
+            sub_dag_id, k, active_count, finalized.len(), prior_cumulative.len(),
             phase1_ns, start.elapsed().as_nanos()
         );
 
@@ -498,9 +542,9 @@ fn run_phase23(
 
         info!(
             "FAIRDAG_TIMING: sub_dag_id={} PARKED: k={} active={} vertices={} \
-             existing={} missing={} discarded={} phase1={}ns phase23={}ns",
+             existing={} missing={} cumulative_discard={} phase1={}ns phase23={}ns",
             sub_dag_id, k, active_count, vertex_indices.len(),
-            existing_edges_list.len(), missing_edges.len(), discard.len(),
+            existing_edges_list.len(), missing_edges.len(), prior_cumulative.len(),
             phase1_ns, start.elapsed().as_nanos()
         );
 
@@ -611,7 +655,7 @@ struct ParkedGraph {
 }
 
 // =========================================================================
-// FairDagProcessor (Option D)
+// FairDagProcessor (Option D + cumulative chain)
 // =========================================================================
 
 pub struct FairDagProcessor {
@@ -643,9 +687,10 @@ pub struct FairDagProcessor {
     pending_orderings: Vec<Vec<TxDigest>>,
     proposed_txs: HashSet<TxDigest>,
 
-    /// Option D: only solids are claimed at dispatch.
-    /// Maps sub_dag_id → set of solid txs in that subdag's snapshot.
-    /// Released on result arrival (txs in K_kept move to proposed_txs).
+    /// Solids claimed at dispatch (per subdag). Released on result arrival.
+    /// Shaded txs are deliberately NOT claimed — they remain visible to concurrent
+    /// subdags' snapshots so cross-subdag edge weights are computed correctly. The
+    /// cumulative-K chain handles single_graph for shaded.
     claimed_solids: HashMap<u64, HashSet<TxDigest>>,
 
     finalized_txs: HashSet<TxDigest>,
@@ -667,14 +712,13 @@ impl FairDagProcessor {
 
         let gamma = committee.get_gamma().unwrap();
 
-        // Paper formula: τ = n(1−γ) + f + 1.
-        // (Earlier code had a γ·f term that is incorrect for γ < 1.)
+        // Paper formula: τ = n(1 − γ) + f + 1.
         let non_blank_threshold =
             ((n as f64) * (1.0 - gamma) + (f as f64) + 1.0).floor() as u8;
         let solid_threshold = (n - 2 * f) as u8;
 
         info!(
-            "FairDagProcessor [Option D]: n={}, f={}, gamma={}, τ={}, τ_s={}",
+            "FairDagProcessor [Option D + cumulative-chain]: n={}, f={}, gamma={}, τ={}, τ_s={}",
             n, f, gamma, non_blank_threshold, solid_threshold
         );
 
@@ -723,11 +767,13 @@ impl FairDagProcessor {
     // =====================================================================
 
     async fn run(&mut self) {
-        // Genesis: pre-fired sender so subdag 1's task starts immediately
-        // with an empty discard set.
-        let (genesis_tx, mut prior_kkept_rx): (oneshot::Sender<HashSet<TxDigest>>, _) =
-            oneshot::channel();
-        let _ = genesis_tx.send(HashSet::new());
+        // Genesis: pre-fired sender so subdag 1's task starts with an empty cumulative
+        // discard set.
+        let (genesis_tx, mut prior_cumulative_rx): (
+            oneshot::Sender<CumulativeKKept>,
+            oneshot::Receiver<CumulativeKKept>,
+        ) = oneshot::channel();
+        let _ = genesis_tx.send(Arc::new(HashSet::new()));
 
         loop {
             tokio::select! {
@@ -761,42 +807,48 @@ impl FairDagProcessor {
 
                     self.try_resolve_parked_graphs().await;
 
-                    // Option D: claim only SOLIDS in this snapshot.
+                    // Claim only solids in this snapshot. Shaded stays visible.
                     self.compute_and_record_solid_claim(sub_dag_id, &indices_sets, &index_to_digest);
 
-                    // Option D: prepare oneshot for THIS subdag's K_kept,
-                    // and take ownership of the previous subdag's receiver.
-                    let (kkept_tx, kkept_rx) = oneshot::channel::<HashSet<TxDigest>>();
-                    let current_prior_rx = std::mem::replace(&mut prior_kkept_rx, kkept_rx);
-                    // current_prior_rx now points to the PREVIOUS subdag's signal.
+                    // Prepare next link in the cumulative chain.
+                    let (cumul_tx, cumul_rx) = oneshot::channel::<CumulativeKKept>();
+                    let current_prior_rx = std::mem::replace(&mut prior_cumulative_rx, cumul_rx);
+                    // current_prior_rx receives the PREVIOUS subdag's cumulative.
 
                     let tx = self.tx_graph_results.clone();
                     let nbt = self.non_blank_threshold;
                     let st = self.solid_threshold;
 
-                    // Task: phase 1 (parallel) → await prior K_kept → phase 2/3
-                    // (which signals our own K_kept ASAP, before completing).
+                    // Task: phase 1 (parallel) → await prior cumulative → phase 2/3
+                    // (which extends and forwards the cumulative ASAP, before completing).
                     tokio::spawn(async move {
                         let p1_opt = tokio::task::spawn_blocking(move || {
                             run_phase1(sub_dag_id, indices_sets, k, index_to_digest, nbt, st)
                         }).await.expect("phase1 panicked");
 
-                        let prior_kkept = match current_prior_rx.await {
+                        let prior_cumulative: CumulativeKKept = match current_prior_rx.await {
                             Ok(set) => set,
                             Err(_) => {
-                                warn!("sub_dag_id={}: prior K_kept sender dropped, falling back to empty discard", sub_dag_id);
-                                HashSet::new()
+                                // Prior task's sender dropped — chain is broken. Aborting
+                                // here is the only safe choice; falling back to an empty
+                                // set silently violates single_graph.
+                                error!(
+                                    "FATAL sub_dag_id={}: prior cumulative sender dropped, \
+                                     single_graph cannot be guaranteed",
+                                    sub_dag_id
+                                );
+                                std::process::abort();
                             }
                         };
 
                         let result = match p1_opt {
                             Some(p1) => tokio::task::spawn_blocking(move || {
-                                run_phase23(p1, prior_kkept, nbt, kkept_tx)
+                                run_phase23(p1, prior_cumulative, nbt, cumul_tx)
                             }).await.expect("phase23 panicked"),
                             None => {
-                                // No phase 2/3 work; signal empty K_kept so the
-                                // next subdag's task isn't blocked.
-                                let _ = kkept_tx.send(HashSet::new());
+                                // No own contribution; forward prior cumulative unchanged
+                                // so the next subdag's task isn't blocked.
+                                let _ = cumul_tx.send(prior_cumulative);
                                 GraphResult::Empty { sub_dag_id }
                             }
                         };
@@ -952,8 +1004,9 @@ impl FairDagProcessor {
             }
         }
 
-        // Option D: snapshot exclusion = proposed ∪ claimed-solids.
-        // Shaded txs from in-flight subdags ARE included.
+        // Snapshot exclusion at extract time = proposed ∪ all-claimed-solids.
+        // Shaded txs from in-flight subdags ARE included in the snapshot; the cumulative
+        // chain inside phase 2/3 discards them from the active set under the sync barrier.
         let mut excluded: HashSet<TxDigest> = self.proposed_txs.clone();
         for claim_set in self.claimed_solids.values() {
             for tx in claim_set { excluded.insert(*tx); }
@@ -981,10 +1034,10 @@ impl FairDagProcessor {
         (indices_sets, index_to_digest, extracted_votes)
     }
 
-    /// Option D: claim only SOLID transactions in this subdag's snapshot.
-    /// Solids are guaranteed to enter G_r (anchor rule), so claiming them
-    /// eagerly preserves single_graph for the common case while leaving
-    /// shaded txs visible to concurrent subdags' tasks.
+    /// Claim only SOLID transactions in this subdag's snapshot.
+    /// Solids are guaranteed to enter G_r (anchor rule), so claiming them eagerly
+    /// preserves single_graph for the common case while leaving shaded txs visible
+    /// to concurrent subdags' tasks (which discard them via the cumulative chain).
     fn compute_and_record_solid_claim(
         &mut self,
         sub_dag_id: u64,
