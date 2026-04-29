@@ -1,9 +1,19 @@
-// FairDAG-RL with explicit FairUpdate (Themis-style).
+// FairDAG-RL with explicit FairUpdate (Themis-style) — Option D variant.
 //
-// Cross-subdag dedup: tracks (replica_index, tx_digest) pairs already seen.
-// If replica X reported tx_digest Y in sub-dag 1, Y is dropped from
-// replica X's entries in sub-dag 2 (same tx shouldn't contribute twice
-// from the same replica).
+// Option D design:
+//   - At dispatch time, claim only SOLID transactions (cumulative support ≥ τ_s),
+//     not shaded ones. Shaded txs in one subdag's snapshot remain visible to
+//     subsequent subdags' snapshots.
+//   - Each subdag's task runs edge computation in parallel, then SYNCHRONIZES
+//     before Tarjan: it awaits the previous subdag's K_kept (the set of vertex
+//     digests that entered the previous subdag's G_r). It then discards those
+//     digests from its own active set before running Tarjan/anchor.
+//   - This preserves the single-graph property without hiding shaded txs from
+//     concurrent subdags, which fixes the cross-subdag visibility gap that the
+//     all-non-blank claim mechanism creates.
+//
+// IMPORTANT: this is exploratory. Correctness has NOT been formally verified.
+// Use for performance experimentation only.
 
 use crate::local_order_tracker::extract_tx_digest;
 use crate::worker::{FairProposeMessage, FairUpdateVote, WorkerMessage};
@@ -16,6 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 
 type TxDigest = u64;
 
@@ -233,47 +244,32 @@ fn hamiltonian_path(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
 }
 
 // =========================================================================
-// Graph construction result
+// Phase 1 result: support classification and weight matrix
 // =========================================================================
 
-enum GraphResult {
-    Empty { sub_dag_id: u64 },
-    Finalized { sub_dag_id: u64, tx_order: Vec<TxDigest> },
-    NeedsFairUpdate {
-        sub_dag_id: u64,
-        vertex_indices: Vec<u16>,
-        existing_edges: Vec<(u16, u16)>,
-        missing_edges: Vec<u32>,
-        missing_edge_vertices: Vec<u16>,
-        index_to_digest: Vec<TxDigest>,
-        is_solid: Vec<bool>,
-    },
-}
-
-struct FairUpdateResult {
+struct Phase1Result {
     sub_dag_id: u64,
-    tx_order: Vec<TxDigest>,
+    k: usize,
+    is_non_blank: Vec<bool>,
+    is_solid: Vec<bool>,
+    weight: Vec<u8>, // nibble-packed
+    index_to_digest: Vec<TxDigest>,
+    elapsed_ns: u128,
 }
 
-// =========================================================================
-// Stateless graph construction (runs on spawn_blocking)
-// =========================================================================
-
-fn build_graph(
+fn run_phase1(
     sub_dag_id: u64,
     indices_sets: Vec<Vec<usize>>,
     k: usize,
     index_to_digest: Vec<TxDigest>,
     non_blank_threshold: u8,
     solid_threshold: u8,
-) -> GraphResult {
+) -> Option<Phase1Result> {
     let start = Instant::now();
 
     if k == 0 || indices_sets.is_empty() {
-        return GraphResult::Empty { sub_dag_id };
+        return None;
     }
-
-    let t_edge = non_blank_threshold;
 
     let mut support = vec![0u8; k];
     for order in &indices_sets {
@@ -287,9 +283,8 @@ fn build_graph(
         if support[i] >= solid_threshold { is_solid[i] = true; }
     }
 
-    let active: Vec<usize> = (0..k).filter(|&u| is_non_blank[u]).collect();
-    if active.is_empty() {
-        return GraphResult::Empty { sub_dag_id };
+    if !is_non_blank.iter().any(|&b| b) {
+        return None;
     }
 
     let nibble_bytes = (k * k + 1) / 2;
@@ -309,6 +304,74 @@ fn build_graph(
                 inc_weight(&mut weight, w_idx(from, to, k));
             }
         }
+    }
+
+    Some(Phase1Result {
+        sub_dag_id,
+        k,
+        is_non_blank,
+        is_solid,
+        weight,
+        index_to_digest,
+        elapsed_ns: start.elapsed().as_nanos(),
+    })
+}
+
+// =========================================================================
+// Phase 2 + 3: Tarjan, anchor, truncation, missing-edge selection
+// (runs after sync barrier with prior subdag's K_kept)
+// =========================================================================
+
+enum GraphResult {
+    Empty { sub_dag_id: u64 },
+    Finalized { sub_dag_id: u64, tx_order: Vec<TxDigest>, k_kept: HashSet<TxDigest> },
+    NeedsFairUpdate {
+        sub_dag_id: u64,
+        vertex_indices: Vec<u16>,
+        existing_edges: Vec<(u16, u16)>,
+        missing_edges: Vec<u32>,
+        missing_edge_vertices: Vec<u16>,
+        index_to_digest: Vec<TxDigest>,
+        is_solid: Vec<bool>,
+        k_kept: HashSet<TxDigest>,
+    },
+}
+
+struct FairUpdateResult {
+    sub_dag_id: u64,
+    tx_order: Vec<TxDigest>,
+}
+
+fn run_phase23(
+    p1: Phase1Result,
+    discard: HashSet<TxDigest>,
+    non_blank_threshold: u8,
+    kkept_sender: oneshot::Sender<HashSet<TxDigest>>,
+) -> GraphResult {
+    let start = Instant::now();
+    let Phase1Result {
+        sub_dag_id,
+        k,
+        is_non_blank,
+        is_solid,
+        weight,
+        index_to_digest,
+        elapsed_ns: phase1_ns,
+    } = p1;
+
+    let t_edge = non_blank_threshold;
+
+    #[inline(always)]
+    fn w_idx(i: usize, j: usize, k: usize) -> usize { i * k + j }
+
+    // Build active set: non-blank AND not in discard.
+    let active: Vec<usize> = (0..k)
+        .filter(|&u| is_non_blank[u] && !discard.contains(&index_to_digest[u]))
+        .collect();
+
+    if active.is_empty() {
+        let _ = kkept_sender.send(HashSet::new());
+        return GraphResult::Empty { sub_dag_id };
     }
 
     let active_count = active.len();
@@ -332,7 +395,10 @@ fn build_graph(
     }
 
     let sccs = tarjan_scc_iterative(active_count, &edges);
-    if sccs.is_empty() { return GraphResult::Empty { sub_dag_id }; }
+    if sccs.is_empty() {
+        let _ = kkept_sender.send(HashSet::new());
+        return GraphResult::Empty { sub_dag_id };
+    }
 
     let topo = topological_sort_sccs(&sccs, &edges, active_count);
 
@@ -345,13 +411,27 @@ fn build_graph(
 
     let anchor = match anchor_idx {
         Some(a) => a,
-        None => return GraphResult::Empty { sub_dag_id },
+        None => {
+            let _ = kkept_sender.send(HashSet::new());
+            return GraphResult::Empty { sub_dag_id };
+        }
     };
 
     let mut in_graph = vec![false; active_count];
     for topo_pos in 0..=anchor {
         for &di in &sccs[topo[topo_pos]] { in_graph[di as usize] = true; }
     }
+
+    // K_kept: digests of vertices that entered G_r (i.e., in_graph).
+    // Compute and SIGNAL early so the next subdag's phase 2/3 can start
+    // running in parallel with this subdag's phase 3 (missing edges + output).
+    let mut k_kept: HashSet<TxDigest> = HashSet::new();
+    for di in 0..active_count {
+        if in_graph[di] {
+            k_kept.insert(index_to_digest[dense_to_orig[di]]);
+        }
+    }
+    let _ = kkept_sender.send(k_kept.clone());
 
     let shaded_in_graph: Vec<u16> = (0..active_count as u16)
         .filter(|&di| in_graph[di as usize] && !is_solid[dense_to_orig[di as usize]])
@@ -384,11 +464,13 @@ fn build_graph(
         }
 
         info!(
-            "FAIRDAG_TIMING: sub_dag_id={} FINALIZED: k={} active={} txs={} total={}ns",
-            sub_dag_id, k, active_count, finalized.len(), start.elapsed().as_nanos()
+            "FAIRDAG_TIMING: sub_dag_id={} FINALIZED: k={} active={} txs={} discarded={} \
+             phase1={}ns phase23={}ns",
+            sub_dag_id, k, active_count, finalized.len(), discard.len(),
+            phase1_ns, start.elapsed().as_nanos()
         );
 
-        GraphResult::Finalized { sub_dag_id, tx_order: finalized }
+        GraphResult::Finalized { sub_dag_id, tx_order: finalized, k_kept }
     } else {
         let mut vertex_indices: Vec<u16> = Vec::new();
         let mut existing_edges_list: Vec<(u16, u16)> = Vec::new();
@@ -416,9 +498,10 @@ fn build_graph(
 
         info!(
             "FAIRDAG_TIMING: sub_dag_id={} PARKED: k={} active={} vertices={} \
-             existing={} missing={} total={}ns",
+             existing={} missing={} discarded={} phase1={}ns phase23={}ns",
             sub_dag_id, k, active_count, vertex_indices.len(),
-            existing_edges_list.len(), missing_edges.len(), start.elapsed().as_nanos()
+            existing_edges_list.len(), missing_edges.len(), discard.len(),
+            phase1_ns, start.elapsed().as_nanos()
         );
 
         GraphResult::NeedsFairUpdate {
@@ -427,12 +510,14 @@ fn build_graph(
             missing_edges, missing_edge_vertices,
             index_to_digest: dense_to_digest,
             is_solid: is_solid_dense,
+            k_kept,
         }
     }
 }
 
 // =========================================================================
 // FairUpdate application (runs on spawn_blocking)
+// Unchanged from original — operates on already-determined parked vertex set.
 // =========================================================================
 
 fn apply_fair_update(
@@ -441,10 +526,10 @@ fn apply_fair_update(
     existing_edges: Vec<(u16, u16)>,
     missing_edges: Vec<u32>,
     index_to_digest: Vec<TxDigest>,
-    is_solid: Vec<bool>,
+    _is_solid: Vec<bool>,
     votes: HashMap<PublicKey, Vec<u32>>,
     non_blank_threshold: u8,
-    solid_threshold: u8,
+    _solid_threshold: u8,
 ) -> FairUpdateResult {
     let start = Instant::now();
     let k = index_to_digest.len();
@@ -452,20 +537,15 @@ fn apply_fair_update(
     let mut edge_set: HashSet<(u16, u16)> = existing_edges.into_iter().collect();
 
     let mut vote_weight: HashMap<(u16, u16), u16> = HashMap::new();
-    let mut tx_author_count: HashMap<u16, HashSet<usize>> = HashMap::new();
-
-    for (author_idx, (_author, directed_edges)) in votes.iter().enumerate() {
+    for (_author, directed_edges) in votes.iter() {
         for &packed in directed_edges {
             let from = (packed >> 16) as u16;
             let to = (packed & 0xFFFF) as u16;
             *vote_weight.entry((from, to)).or_insert(0) += 1;
-            tx_author_count.entry(from).or_default().insert(author_idx);
-            tx_author_count.entry(to).or_default().insert(author_idx);
         }
     }
 
     let t_edge = non_blank_threshold as u16;
-    let t_solid = solid_threshold as u16;
     let mut new_edges_count = 0;
 
     for &packed in &missing_edges {
@@ -531,7 +611,7 @@ struct ParkedGraph {
 }
 
 // =========================================================================
-// FairDagProcessor
+// FairDagProcessor (Option D)
 // =========================================================================
 
 pub struct FairDagProcessor {
@@ -559,30 +639,21 @@ pub struct FairDagProcessor {
     next_to_finalize: u64,
     ready_to_finalize: BTreeMap<u64, Vec<TxDigest>>,
 
-    /// Cumulative support: tx → set of replica indices that have committed it
-    /// in some subdag, restricted to txs that are still pending (not yet
-    /// permanently proposed in some G_r).
     pending_support: HashMap<TxDigest, HashSet<usize>>,
-
-    /// Per-replica cumulative ordering of pending txs, in OI order.
-    /// Indexed by replica_index. Updated deterministically in subdag-commit order.
     pending_orderings: Vec<Vec<TxDigest>>,
-
-    /// Permanently proposed: txs that have entered some G_r and been confirmed
-    /// (Finalized branch landed, or NeedsFairUpdate vertex was retained).
     proposed_txs: HashSet<TxDigest>,
 
-    /// Design B: tentatively claimed by some in-flight build_graph.
-    /// Maps sub_dag_id → set of txs claimed by that subdag's build_graph dispatch.
-    /// On result arrival: claimed-and-in-G_r → proposed_txs; claimed-and-not-in-G_r → released.
-    claimed_txs: HashMap<u64, HashSet<TxDigest>>,
+    /// Option D: only solids are claimed at dispatch.
+    /// Maps sub_dag_id → set of solid txs in that subdag's snapshot.
+    /// Released on result arrival (txs in K_kept move to proposed_txs).
+    claimed_solids: HashMap<u64, HashSet<TxDigest>>,
 
     finalized_txs: HashSet<TxDigest>,
 }
 
 impl FairDagProcessor {
     pub fn spawn(
-        mut committee: Committee,
+        committee: Committee,
         store: Store,
         rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
         fault_threshold: u64,
@@ -596,12 +667,14 @@ impl FairDagProcessor {
 
         let gamma = committee.get_gamma().unwrap();
 
+        // Paper formula: τ = n(1−γ) + f + 1.
+        // (Earlier code had a γ·f term that is incorrect for γ < 1.)
         let non_blank_threshold =
-            ((n as f64) * (1.0 - gamma) + gamma * (f as f64) + 1.0).floor() as u8;
+            ((n as f64) * (1.0 - gamma) + (f as f64) + 1.0).floor() as u8;
         let solid_threshold = (n - 2 * f) as u8;
 
         info!(
-            "FairDagProcessor: n={}, f={}, gamma={}, non_blank_threshold={}, solid_threshold={}",
+            "FairDagProcessor [Option D]: n={}, f={}, gamma={}, τ={}, τ_s={}",
             n, f, gamma, non_blank_threshold, solid_threshold
         );
 
@@ -630,7 +703,7 @@ impl FairDagProcessor {
                 pending_support: HashMap::new(),
                 pending_orderings: vec![Vec::new(); n],
                 proposed_txs: HashSet::new(),
-                claimed_txs: HashMap::new(),
+                claimed_solids: HashMap::new(),
                 finalized_txs: HashSet::new(),
             }
             .run()
@@ -650,9 +723,15 @@ impl FairDagProcessor {
     // =====================================================================
 
     async fn run(&mut self) {
+        // Genesis: pre-fired sender so subdag 1's task starts immediately
+        // with an empty discard set.
+        let (genesis_tx, mut prior_kkept_rx): (oneshot::Sender<HashSet<TxDigest>>, _) =
+            oneshot::channel();
+        let _ = genesis_tx.send(HashSet::new());
+
         loop {
             tokio::select! {
-                
+
                 Some((leader_round, certificates)) = self.rx_committed_subdags.recv() => {
                     self.sub_dag_count += 1;
                     let sub_dag_id = self.sub_dag_count;
@@ -668,7 +747,6 @@ impl FairDagProcessor {
                         k, indices_sets.len(), extracted_votes.len()
                     );
 
-                    // Route votes to their target subdags' pending pools.
                     for (author, vote) in extracted_votes {
                         let decompressed = unpack_and_decompress_edges(
                             &vote.directed_edges_compressed, vote.edge_count,
@@ -683,18 +761,47 @@ impl FairDagProcessor {
 
                     self.try_resolve_parked_graphs().await;
 
-                    // Design B: record the claim set BEFORE dispatching build_graph.
-                    // This is synchronous and runs on the main loop, so the next subdag's
-                    // extract_subdag_and_votes will see this claim and exclude it.
-                    let _claim = self.compute_and_record_claim(sub_dag_id, &indices_sets, &index_to_digest);
+                    // Option D: claim only SOLIDS in this snapshot.
+                    self.compute_and_record_solid_claim(sub_dag_id, &indices_sets, &index_to_digest);
+
+                    // Option D: prepare oneshot for THIS subdag's K_kept,
+                    // and take ownership of the previous subdag's receiver.
+                    let (kkept_tx, kkept_rx) = oneshot::channel::<HashSet<TxDigest>>();
+                    let current_prior_rx = std::mem::replace(&mut prior_kkept_rx, kkept_rx);
+                    // current_prior_rx now points to the PREVIOUS subdag's signal.
 
                     let tx = self.tx_graph_results.clone();
                     let nbt = self.non_blank_threshold;
                     let st = self.solid_threshold;
 
-                    tokio::task::spawn_blocking(move || {
-                        let result = build_graph(sub_dag_id, indices_sets, k, index_to_digest, nbt, st);
-                        let _ = tx.blocking_send(result);
+                    // Task: phase 1 (parallel) → await prior K_kept → phase 2/3
+                    // (which signals our own K_kept ASAP, before completing).
+                    tokio::spawn(async move {
+                        let p1_opt = tokio::task::spawn_blocking(move || {
+                            run_phase1(sub_dag_id, indices_sets, k, index_to_digest, nbt, st)
+                        }).await.expect("phase1 panicked");
+
+                        let prior_kkept = match current_prior_rx.await {
+                            Ok(set) => set,
+                            Err(_) => {
+                                warn!("sub_dag_id={}: prior K_kept sender dropped, falling back to empty discard", sub_dag_id);
+                                HashSet::new()
+                            }
+                        };
+
+                        let result = match p1_opt {
+                            Some(p1) => tokio::task::spawn_blocking(move || {
+                                run_phase23(p1, prior_kkept, nbt, kkept_tx)
+                            }).await.expect("phase23 panicked"),
+                            None => {
+                                // No phase 2/3 work; signal empty K_kept so the
+                                // next subdag's task isn't blocked.
+                                let _ = kkept_tx.send(HashSet::new());
+                                GraphResult::Empty { sub_dag_id }
+                            }
+                        };
+
+                        let _ = tx.send(result).await;
                     });
                 },
 
@@ -702,38 +809,30 @@ impl FairDagProcessor {
                     match result {
                         GraphResult::Empty { sub_dag_id } => {
                             debug!("sub_dag_id={}: empty graph", sub_dag_id);
-                            // Nothing entered any graph. Release all claimed txs back to pending.
-                            self.release_claim(sub_dag_id, &HashSet::new());
+                            self.release_solid_claim(sub_dag_id);
                             self.ready_to_finalize.insert(sub_dag_id, vec![]);
                         }
-                        GraphResult::Finalized { sub_dag_id, tx_order } => {
+                        GraphResult::Finalized { sub_dag_id, tx_order, k_kept } => {
                             info!(
                                 "sub_dag_id={}: finalized immediately, {} txs",
                                 sub_dag_id, tx_order.len()
                             );
-                            // tx_order is exactly the set that entered G_{r}.
-                            let included: HashSet<TxDigest> = tx_order.iter().copied().collect();
-                            self.confirm_proposed(&included);
-                            self.release_claim(sub_dag_id, &included);
+                            self.confirm_proposed(&k_kept);
+                            self.release_solid_claim(sub_dag_id);
                             self.ready_to_finalize.insert(sub_dag_id, tx_order);
                         }
                         GraphResult::NeedsFairUpdate {
                             sub_dag_id, vertex_indices, existing_edges,
                             missing_edges, missing_edge_vertices,
-                            index_to_digest, is_solid,
+                            index_to_digest, is_solid, k_kept,
                         } => {
                             info!(
                                 "sub_dag_id={}: parking, {} vertices, {} missing edges",
                                 sub_dag_id, vertex_indices.len(), missing_edges.len()
                             );
 
-                            // The vertices that ENTERED G_r are exactly vertex_indices.
-                            let included: HashSet<TxDigest> = vertex_indices
-                                .iter()
-                                .map(|&v| index_to_digest[v as usize])
-                                .collect();
-                            self.confirm_proposed(&included);
-                            self.release_claim(sub_dag_id, &included);
+                            self.confirm_proposed(&k_kept);
+                            self.release_solid_claim(sub_dag_id);
 
                             let vertices_with_digests: Vec<(u16, u64)> = missing_edge_vertices
                                 .iter()
@@ -771,12 +870,8 @@ impl FairDagProcessor {
         }
     }
 
-    /// Promote txs that entered some G_r to permanent. Removes them from
-    /// pending_support and from each replica's pending_orderings.
     fn confirm_proposed(&mut self, included: &HashSet<TxDigest>) {
-        if included.is_empty() {
-            return;
-        }
+        if included.is_empty() { return; }
         for tx in included {
             self.proposed_txs.insert(*tx);
             self.pending_support.remove(tx);
@@ -786,16 +881,8 @@ impl FairDagProcessor {
         }
     }
 
-    /// Close out the claim entry for `sub_dag_id`. Txs in the claim set that
-    /// are NOT in `included` are released back to pending (Case B: post-anchor
-    /// truncation, or never made the active set in build_graph).
-    ///
-    /// Released txs are not explicitly re-inserted anywhere — they are still
-    /// in pending_support and pending_orderings, and once we drop the claim
-    /// entry they no longer appear in the `excluded` union computed by
-    /// extract_subdag_and_votes for future subdags.
-    fn release_claim(&mut self, sub_dag_id: u64, _included: &HashSet<TxDigest>) {
-        self.claimed_txs.remove(&sub_dag_id);
+    fn release_solid_claim(&mut self, sub_dag_id: u64) {
+        self.claimed_solids.remove(&sub_dag_id);
     }
 
     // =====================================================================
@@ -807,7 +894,6 @@ impl FairDagProcessor {
         _leader_round: Round,
         certificates: &[Certificate],
     ) -> (Vec<Vec<usize>>, Vec<TxDigest>, Vec<(PublicKey, FairUpdateVote)>) {
-        // ----- Phase 1: ingest new (replica, tx, oi) triples into cumulative state. -----
         let mut new_per_replica: HashMap<usize, Vec<(TxDigest, u64)>> = HashMap::new();
         let mut extracted_votes: Vec<(PublicKey, FairUpdateVote)> = Vec::new();
 
@@ -826,9 +912,7 @@ impl FairDagProcessor {
                             Ok(WorkerMessage::Batch(direct_entries, indirect_entries, votes)) => {
                                 for (tx_bytes, oi) in direct_entries {
                                     let tx_id = extract_tx_digest(&tx_bytes);
-                                    if self.proposed_txs.contains(&tx_id) {
-                                        continue;
-                                    }
+                                    if self.proposed_txs.contains(&tx_id) { continue; }
                                     let supp = self.pending_support.entry(tx_id).or_default();
                                     if supp.insert(replica_index) {
                                         new_per_replica
@@ -837,11 +921,8 @@ impl FairDagProcessor {
                                             .push((tx_id, oi));
                                     }
                                 }
-
                                 for (tx_id, oi) in indirect_entries {
-                                    if self.proposed_txs.contains(&tx_id) {
-                                        continue;
-                                    }
+                                    if self.proposed_txs.contains(&tx_id) { continue; }
                                     let supp = self.pending_support.entry(tx_id).or_default();
                                     if supp.insert(replica_index) {
                                         new_per_replica
@@ -850,30 +931,20 @@ impl FairDagProcessor {
                                             .push((tx_id, oi));
                                     }
                                 }
-
                                 for v in votes {
                                     extracted_votes.push((author, v));
                                 }
                             }
-                            Ok(_) => {
-                                warn!("Unexpected WorkerMessage type for batch {:?}", batch_digest);
-                            }
-                            Err(e) => {
-                                error!("Deser fail batch {:?}: {}", batch_digest, e);
-                            }
+                            Ok(_) => warn!("Unexpected WorkerMessage type for batch {:?}", batch_digest),
+                            Err(e) => error!("Deser fail batch {:?}: {}", batch_digest, e),
                         }
                     }
-                    Ok(None) => {
-                        debug!("Batch {:?} not found in store", batch_digest);
-                    }
-                    Err(e) => {
-                        error!("Store read error batch {:?}: {}", batch_digest, e);
-                    }
+                    Ok(None) => debug!("Batch {:?} not found in store", batch_digest),
+                    Err(e) => error!("Store read error batch {:?}: {}", batch_digest, e),
                 }
             }
         }
 
-        // Append new entries to per-replica cumulative orderings, sorted by OI.
         for (replica_index, mut new_entries) in new_per_replica {
             new_entries.sort_by_key(|&(_, oi)| oi);
             for (tx_id, _) in new_entries {
@@ -881,13 +952,11 @@ impl FairDagProcessor {
             }
         }
 
-        // ----- Phase 2: build snapshot for build_graph, excluding proposed + claimed. -----
-        // Union of all currently-claimed tx sets across in-flight build_graph dispatches.
+        // Option D: snapshot exclusion = proposed ∪ claimed-solids.
+        // Shaded txs from in-flight subdags ARE included.
         let mut excluded: HashSet<TxDigest> = self.proposed_txs.clone();
-        for claim_set in self.claimed_txs.values() {
-            for tx in claim_set {
-                excluded.insert(*tx);
-            }
+        for claim_set in self.claimed_solids.values() {
+            for tx in claim_set { excluded.insert(*tx); }
         }
 
         let mut digest_to_index: HashMap<TxDigest, usize> = HashMap::new();
@@ -895,14 +964,10 @@ impl FairDagProcessor {
         let mut indices_sets: Vec<Vec<usize>> = Vec::new();
 
         for ordering in self.pending_orderings.iter() {
-            if ordering.is_empty() {
-                continue;
-            }
+            if ordering.is_empty() { continue; }
             let mut order: Vec<usize> = Vec::with_capacity(ordering.len());
             for &tx_digest in ordering {
-                if excluded.contains(&tx_digest) {
-                    continue;
-                }
+                if excluded.contains(&tx_digest) { continue; }
                 let idx = *digest_to_index.entry(tx_digest).or_insert_with(|| {
                     let i = index_to_digest.len();
                     index_to_digest.push(tx_digest);
@@ -910,46 +975,36 @@ impl FairDagProcessor {
                 });
                 order.push(idx);
             }
-            if !order.is_empty() {
-                indices_sets.push(order);
-            }
+            if !order.is_empty() { indices_sets.push(order); }
         }
 
         (indices_sets, index_to_digest, extracted_votes)
     }
 
-    /// Design B: mark every non-blank tx in the snapshot as tentatively claimed
-    /// by `sub_dag_id`. Called synchronously before dispatching build_graph,
-    /// so that the next subdag's extract_subdag_and_votes excludes these txs.
-    ///
-    /// Returns the claim set, which the caller stores in `self.claimed_txs`.
-    fn compute_and_record_claim(
+    /// Option D: claim only SOLID transactions in this subdag's snapshot.
+    /// Solids are guaranteed to enter G_r (anchor rule), so claiming them
+    /// eagerly preserves single_graph for the common case while leaving
+    /// shaded txs visible to concurrent subdags' tasks.
+    fn compute_and_record_solid_claim(
         &mut self,
         sub_dag_id: u64,
         indices_sets: &[Vec<usize>],
         index_to_digest: &[TxDigest],
-    ) -> HashSet<TxDigest> {
-        // Count cumulative support among the snapshot's vertices.
-        // (Equivalent to |pending_support[tx]| since the snapshot was built
-        // from pending_orderings; we recompute from indices_sets to stay
-        // consistent with what build_graph will see.)
+    ) {
         let k = index_to_digest.len();
         let mut support = vec![0u8; k];
         for order in indices_sets {
-            for &idx in order {
-                support[idx] = support[idx].saturating_add(1);
-            }
+            for &idx in order { support[idx] = support[idx].saturating_add(1); }
         }
 
         let mut claim: HashSet<TxDigest> = HashSet::new();
         for (idx, &cnt) in support.iter().enumerate() {
-            if cnt >= self.non_blank_threshold {
+            if cnt >= self.solid_threshold {
                 claim.insert(index_to_digest[idx]);
             }
         }
 
-        self.claimed_txs.insert(sub_dag_id, claim.clone());
-        claim
+        self.claimed_solids.insert(sub_dag_id, claim);
     }
 
     // =====================================================================
