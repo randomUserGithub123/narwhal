@@ -111,7 +111,6 @@ impl FairDagProcessor {
                     "FAIRDAG_TIMING: subdag #{} extract done: {}us, vertices={} total_entries={}",
                     subdag_count, sd_extract_us, subdag.vertices.len(), total_entries
                 );
-                // Per-task line for log aggregation.
                 info!("FAIRDAG_TASK: name=extract us={}", sd_extract_us);
 
                 subdags.push(subdag);
