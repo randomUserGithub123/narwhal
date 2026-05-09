@@ -370,6 +370,8 @@ class LogParser:
 
         f = self.faults if isinstance(self.faults, int) else 0
 
+        return None
+
         # Find the Rust binary
         binary = shutil.which('adv_reorder')
         if binary is None:
