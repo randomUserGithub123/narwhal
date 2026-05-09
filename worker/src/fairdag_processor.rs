@@ -99,7 +99,7 @@ impl FairDagProcessor {
 
                 let sd_extract_start = Instant::now();
                 let subdag = self.extract_subdag(*round, certs).await;
-                let sd_extract_ms = sd_extract_start.elapsed().as_millis();
+                let sd_extract_us = sd_extract_start.elapsed().as_micros();
 
                 let total_entries: usize = subdag
                     .vertices
@@ -108,14 +108,17 @@ impl FairDagProcessor {
                     .sum();
 
                 info!(
-                    "FAIRDAG_TIMING: subdag #{} extract done: {}ms, vertices={} total_entries={}",
-                    subdag_count, sd_extract_ms, subdag.vertices.len(), total_entries
+                    "FAIRDAG_TIMING: subdag #{} extract done: {}us, vertices={} total_entries={}",
+                    subdag_count, sd_extract_us, subdag.vertices.len(), total_entries
                 );
+                // Per-task line for log aggregation.
+                info!("FAIRDAG_TASK: name=extract us={}", sd_extract_us);
 
                 subdags.push(subdag);
             }
 
-            let extract_ms = extract_start.elapsed().as_millis();
+            let extract_us = extract_start.elapsed().as_micros();
+            let extract_ms = extract_us / 1000;
 
             // ─────────────────────────────────────────────────────────────────
             // Step 3: Process all subdags through the fairness layer.

@@ -76,11 +76,19 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_ordered_seqs_list, fair_graph_stats_list, arrival_times_list = zip(*results)
+        sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_ordered_seqs_list, fair_graph_stats_list, arrival_times_list, task_timings_list = zip(*results)
         self.sizes = {k: v for x in sizes for k, v in x.items() if k in self.commits}
         self.all_received_samples = self._merge_dicts(self.received_samples)
 
         self.fair_ordered_txs = self._merge_results([x.items() for x in fair_ordered_txs_list])
+
+        # Aggregate per-task CPU timings across all workers.
+        # Each worker contributes its own list of samples per task name.
+        self.task_timings = defaultdict(list)
+        for d in task_timings_list:
+            for name, samples in d.items():
+                self.task_timings[name].extend(samples)
+        self.task_timings = dict(self.task_timings)
 
         # Protocol's final ordering (position in log, not timestamp).
         # Take from first worker that has it (all workers finalize same order).
@@ -230,7 +238,15 @@ class LogParser:
 
         tmp = findall(r'\[(.*Z) .* fairness_arrival tx_uid=(\d+) oi=(\d+)', log)
         arrival_times = {int(tx_uid): _to_posix(t) for t, tx_uid, oi in tmp}
-        return sizes, samples, ip, fair_ordered_txs, fair_ordered_seqs, fair_graph_stats, arrival_times
+
+        # Per-task CPU timings: FAIRDAG_TASK: name=<task> us=<microseconds>
+        # Collect per-worker as a dict task_name -> list of microsecond samples.
+        task_timings = defaultdict(list)
+        for name, us in findall(r"FAIRDAG_TASK: name=(\w+) us=(\d+)", log):
+            task_timings[name].append(int(us))
+        task_timings = dict(task_timings)
+
+        return sizes, samples, ip, fair_ordered_txs, fair_ordered_seqs, fair_graph_stats, arrival_times, task_timings
 
     # ---- Attack results ----
 
@@ -313,6 +329,30 @@ class LogParser:
         return self._fairdag_throughput()
     def _end_to_end_latency(self):
         return self._fairdag_latency()
+
+    def _task_timings_summary(self):
+        """
+        Per-task CPU time aggregation across all workers.
+
+        Returns a list of (task_name, avg_us, p50_us, p99_us, count) tuples
+        sorted by descending mean. Times are in microseconds. Returns empty
+        list if no FAIRDAG_TASK lines were emitted.
+        """
+        if not self.task_timings:
+            return []
+        from statistics import median
+        rows = []
+        for name, samples in self.task_timings.items():
+            if not samples:
+                continue
+            n = len(samples)
+            samples_sorted = sorted(samples)
+            avg = sum(samples) / n
+            p50 = median(samples)
+            p99 = samples_sorted[min(n - 1, int(0.99 * n))]
+            rows.append((name, avg, p50, p99, n))
+        rows.sort(key=lambda r: -r[1])
+        return rows
 
     # ------------------------------------------------------------------
     # Adversarial reordering: Dist(tx,tx') vs fraction reversed
@@ -419,6 +459,14 @@ class LogParser:
             for d in sorted(reorder_results.keys()):
                 frac, count = reorder_results[d]
                 reorder_print += f'   Dist={d:3d}: {frac:.4f}  ({count:,} pairs)\n'
+
+        task_print = ""
+        task_rows = self._task_timings_summary()
+        if task_rows:
+            task_print = '\n + PER-TASK CPU TIME (microseconds, aggregated across workers):\n'
+            task_print += f'   {"task":<14} {"avg":>10} {"p50":>10} {"p99":>10} {"samples":>10}\n'
+            for name, avg, p50, p99, n in task_rows:
+                task_print += f'   {name:<14} {avg:>10.1f} {p50:>10.1f} {p99:>10.1f} {n:>10,}\n'
         return (
             '\n-----------------------------------------\n SUMMARY:\n-----------------------------------------\n'
             ' + CONFIG:\n'
@@ -451,6 +499,7 @@ class LogParser:
             f' Total fair-ordered (from logs): {total_fair_ordered:,}\n\n'
             f' + ATTACK:\n {attack_print} \n'
             f'{reorder_print}'
+            f'{task_print}'
             '-----------------------------------------\n')
 
     def print(self, filename):

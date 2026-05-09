@@ -567,6 +567,15 @@ impl FairnessLayer {
             missing_before, missing_after,
         );
 
+        // Per-task lines for aggregation. One per batch (not per subdag), so
+        // logs.py averages across batches. The fine-grained tarjan/topo/anchor/
+        // hamilton lines are emitted per-graph inside finalize_ordering.
+        info!("FAIRDAG_TASK: name=ingest us={}", t_ingest_done.as_micros());
+        info!("FAIRDAG_TASK: name=catchup us={}", t_catchup_done.as_micros());
+        info!("FAIRDAG_TASK: name=weights us={}", t_weights_done.as_micros());
+        info!("FAIRDAG_TASK: name=finalize us={}", t_finalize_done.as_micros());
+        info!("FAIRDAG_TASK: name=batch_total us={}", t_total.as_micros());
+
         result
     }
 
@@ -881,10 +890,16 @@ impl FairnessLayer {
     fn finalize_ordering(&mut self, graph_idx: usize) -> Vec<TxDigest> {
         let node_count = self.graphs[graph_idx].node_count;
 
+        let t_tarjan = Instant::now();
         let sccs = tarjan_scc_dense(node_count, &self.graphs[graph_idx].edges);
+        let tarjan_us = t_tarjan.elapsed().as_micros();
+
+        let t_topo = Instant::now();
         let topo_order =
             topological_sort_sccs_dense(&sccs, &self.graphs[graph_idx].edges, node_count);
+        let topo_us = t_topo.elapsed().as_micros();
 
+        let t_anchor = Instant::now();
         let mut last_solid_pos: Option<usize> = None;
         for (pos, &scc_idx) in topo_order.iter().enumerate() {
             let has_solid = sccs[scc_idx].iter().any(|&li| {
@@ -893,7 +908,9 @@ impl FairnessLayer {
             });
             if has_solid { last_solid_pos = Some(pos); }
         }
+        let anchor_us = t_anchor.elapsed().as_micros();
 
+        let t_hamilton = Instant::now();
         let mut ordered_digests: Vec<TxDigest> = Vec::new();
         let mut to_readd: Vec<u32> = Vec::new();
 
@@ -928,6 +945,13 @@ impl FairnessLayer {
                 return Vec::new();
             }
         }
+        let hamilton_us = t_hamilton.elapsed().as_micros();
+
+        // Per-task lines for aggregation.
+        info!("FAIRDAG_TASK: name=tarjan us={}", tarjan_us);
+        info!("FAIRDAG_TASK: name=topo us={}", topo_us);
+        info!("FAIRDAG_TASK: name=anchor us={}", anchor_us);
+        info!("FAIRDAG_TASK: name=hamilton us={}", hamilton_us);
 
         self.graphs[graph_idx].finalized = true;
         self.graphs[graph_idx].final_order = ordered_digests.clone();
