@@ -1,3 +1,31 @@
+// ===========================================================================
+// IMPLICIT MISSING-EDGE RESOLUTION VARIANT  (ablation build).
+//
+// This is Herring's processor with ONE thing changed: parked graphs are resolved
+// IMPLICITLY from a global ordering-indicator (OI) pool — exactly like FairDAG-RL's
+// update_weights_and_edges — instead of from explicit FairUpdate votes. The parallel
+// pipeline below (run_phase1 / run_phase23 / Tarjan) is UNCHANGED: the dominant
+// O(n·V^2) weight matrix still runs on the thread pool, fully parallel across
+// in-flight subdags. Only resolution changes. Purpose: measure the cost of the
+// implicit choice (paper W1/W2). It is expected to lose at high load / large N,
+// because implicit resolution is a SERIAL cross-graph sweep whose cost grows with
+// the parked backlog, whereas explicit resolution is per-graph-independent/parallel.
+//
+// Replace ONLY this file. The worker (batch_maker.rs), worker.rs, the channels, and
+// every spawn site are left untouched: the processor simply never sends FairPropose,
+// so the worker's pending_fair_proposals stay empty and it emits an empty votes vec,
+// which this processor ignores.
+//
+// Removed vs explicit: pending_votes, try_resolve_parked_graphs, apply_fair_update,
+// FairUpdateResult, the rx/tx_update_results channel, the FairPropose send.
+// Added: ImplicitResolver (OI pool + cross-graph sweep), finalize_edges, finalize_swept.
+//
+// The explicit-only vote codec (unpack_and_decompress_edges) and the lz4/FairUpdateVote
+// imports have been removed. The worker still SENDS the (now always-empty) votes field
+// in WorkerMessage::Batch; this processor matches and ignores it (no enum change needed).
+// NOTE: not compiled in this environment — review before building.
+// ===========================================================================
+//
 // FairDAG-RL with explicit FairUpdate (Themis-style) — Option D + cumulative-chain fix.
 //
 // === Why this file exists ===
@@ -40,11 +68,10 @@
 // IMPORTANT: this is exploratory. Correctness has NOT been formally verified.
 
 use crate::local_order_tracker::extract_tx_digest;
-use crate::worker::{FairProposeMessage, FairUpdateVote, WorkerMessage};
+use crate::worker::{FairProposeMessage, WorkerMessage};
 use config::Committee;
 use crypto::PublicKey;
 use log::{debug, error, info, warn};
-use lz4_flex::decompress_size_prepended;
 use primary::{Certificate, Round};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -57,53 +84,6 @@ type TxDigest = u64;
 
 /// Cumulative in-flight K_kept passed along the chain. Cheap to clone (Arc bump).
 type CumulativeKKept = Arc<HashSet<TxDigest>>;
-
-// =========================================================================
-// Edge compression helpers
-// =========================================================================
-
-fn unpack_and_decompress_edges(compressed: &[u8], expected_count: usize) -> Vec<u32> {
-    if compressed.is_empty() || expected_count == 0 {
-        return vec![];
-    }
-
-    let deltas = match decompress_size_prepended(compressed) {
-        Ok(d) => d,
-        Err(e) => {
-            error!("Failed to decompress edges: {}", e);
-            return vec![];
-        }
-    };
-
-    let mut edges: Vec<u32> = Vec::with_capacity(expected_count);
-    let mut prev = 0u32;
-    let mut i = 0;
-
-    while i < deltas.len() && edges.len() < expected_count {
-        let mut delta = 0u32;
-        let mut shift = 0;
-        loop {
-            if i >= deltas.len() {
-                break;
-            }
-            let b = deltas[i];
-            i += 1;
-            delta |= ((b & 0x7F) as u32) << shift;
-            if b < 0x80 {
-                break;
-            }
-            shift += 7;
-            if shift > 28 {
-                error!("Varint overflow during edge decoding");
-                return edges;
-            }
-        }
-        prev = prev.wrapping_add(delta);
-        edges.push(prev);
-    }
-
-    edges
-}
 
 // =========================================================================
 // Nibble-packed weight helpers
@@ -371,10 +351,7 @@ enum GraphResult {
     },
 }
 
-struct FairUpdateResult {
-    sub_dag_id: u64,
-    tx_order: Vec<TxDigest>,
-}
+// (FairUpdateResult removed — implicit resolution finalizes inline on the main task.)
 
 fn run_phase23(
     p1: Phase1Result,
@@ -560,53 +537,174 @@ fn run_phase23(
 }
 
 // =========================================================================
-// FairUpdate application (runs on spawn_blocking)
-// Unchanged from original — operates on already-determined parked vertex set.
+// Implicit missing-edge resolution  (replaces the explicit FairUpdate path)
+//
+// A parked graph's missing edge (u,v) is resolved using ordering indicators that
+// arrive in LATER committed subdags, pulled from a global, UNPRUNED OI pool. This is
+// the FairDAG-RL mechanism (update_weights_and_edges), but with Herring's threshold
+// τ = n(1-γ)+f+1 and Herring's correctness model (n >= 4f+1, no weak edges).
+//
+// Why this is the costly choice: resolution is a &mut sweep over ALL parked graphs
+// against one shared pool, re-paid every commit. The explicit path instead resolves
+// each parked graph independently and in parallel on its own thread. Holding the
+// parallel weight pipeline constant, this swap is the entire A/B of the ablation.
 // =========================================================================
 
-fn apply_fair_update(
-    sub_dag_id: u64,
-    vertex_indices: Vec<u16>,
-    existing_edges: Vec<(u16, u16)>,
-    missing_edges: Vec<u32>,
-    index_to_digest: Vec<TxDigest>,
-    _is_solid: Vec<bool>,
-    votes: HashMap<PublicKey, Vec<u32>>,
-    non_blank_threshold: u8,
-    _solid_threshold: u8,
-) -> FairUpdateResult {
-    let start = Instant::now();
-    let k = index_to_digest.len();
+/// A parked graph awaiting implicit resolution, in DENSE active-index space (exactly
+/// what run_phase23 emits for the NeedsFairUpdate case), plus incremental per-pair
+/// resolution state so a replica's OI is counted at most once across sweeps.
+struct ImplicitParkedGraph {
+    vertex_indices: Vec<u16>,        // in-graph dense indices (for the finalize remap)
+    existing_edges: Vec<(u16, u16)>, // directions fixed before parking (phase 2/3)
+    resolved_edges: Vec<(u16, u16)>, // directions discovered implicitly here
+    index_to_digest: Vec<TxDigest>,  // dense index -> tx digest
+    missing_pairs: Vec<(u16, u16)>,  // (li, lj) with li < lj, still unresolved
+    counted: Vec<u32>,               // per-pair replica bitmask (requires N <= 32)
+    w_fwd: Vec<u8>,                  // # replicas with oi(li) < oi(lj)
+    w_rev: Vec<u8>,                  // # replicas with oi(lj) < oi(li)
+}
 
-    let mut edge_set: HashSet<(u16, u16)> = existing_edges.into_iter().collect();
+impl ImplicitParkedGraph {
+    fn is_complete(&self) -> bool {
+        self.missing_pairs.is_empty()
+    }
+    /// Completed edge set = pre-park edges + implicitly resolved edges.
+    fn all_edges(&self) -> Vec<(u16, u16)> {
+        let mut e = self.existing_edges.clone();
+        e.extend_from_slice(&self.resolved_edges);
+        e
+    }
+}
 
-    let mut vote_weight: HashMap<(u16, u16), u16> = HashMap::new();
-    for (_author, directed_edges) in votes.iter() {
-        for &packed in directed_edges {
-            let from = (packed >> 16) as u16;
-            let to = (packed & 0xFFFF) as u16;
-            *vote_weight.entry((from, to)).or_insert(0) += 1;
+/// Owns the global OI pool and the parked-graph registry. Replaces pending_votes,
+/// try_resolve_parked_graphs, apply_fair_update, and the worker FairUpdate channel.
+struct ImplicitResolver {
+    n: usize,
+    tau: u8, // Herring's non-blank threshold τ = floor(n(1-γ)) + f + 1.
+    /// committed_ois[digest][replica] = Some(oi) once seen in SOME committed subdag.
+    /// UNPRUNED: every later commit may add the evidence that closes an old pair.
+    ois: HashMap<TxDigest, Vec<Option<u64>>>,
+    parked: HashMap<u64, ImplicitParkedGraph>,
+}
+
+impl ImplicitResolver {
+    fn new(n: usize, tau: u8) -> Self {
+        assert!(
+            n <= 32,
+            "ImplicitResolver uses a u32 replica bitmask; N must be <= 32"
+        );
+        Self { n, tau, ois: HashMap::new(), parked: HashMap::new() }
+    }
+
+    /// Feed one committed subdag's ordering evidence into the pool. First-observation
+    /// per (tx, replica) wins (OIs are monotone per replica under the LOI rule).
+    fn ingest_ois(&mut self, entries: &[(TxDigest, usize, u64)]) {
+        let n = self.n; // hoist so the or_insert_with closure captures a Copy local, not `self`
+        for &(digest, r, oi) in entries {
+            let slot = self.ois.entry(digest).or_insert_with(|| vec![None; n]);
+            if slot[r].is_none() {
+                slot[r] = Some(oi);
+            }
         }
     }
 
-    let t_edge = non_blank_threshold as u16;
-    let mut new_edges_count = 0;
+    fn park(&mut self, sub_dag_id: u64, g: ImplicitParkedGraph) {
+        self.parked.insert(sub_dag_id, g);
+    }
 
-    for &packed in &missing_edges {
-        let u = (packed >> 16) as u16;
-        let v = (packed & 0xFFFF) as u16;
+    /// Resolve missing pairs of ALL parked graphs from the current OI pool. Returns
+    /// sub_dag_ids that became complete this sweep. Cost O( sum_g |missing_g| * n ).
+    /// This is the serial cross-graph cost the explicit design avoids.
+    fn resolve_sweep(&mut self) -> Vec<u64> {
+        let n = self.n;
+        let tau = self.tau;
+        let mut completed: Vec<u64> = Vec::new();
 
-        if edge_set.contains(&(u, v)) || edge_set.contains(&(v, u)) { continue; }
+        for (sid, g) in self.parked.iter_mut() {
+            if g.missing_pairs.is_empty() {
+                continue;
+            }
+            let mut done: Vec<usize> = Vec::new();
 
-        let kuv = vote_weight.get(&(u, v)).copied().unwrap_or(0);
-        let kvu = vote_weight.get(&(v, u)).copied().unwrap_or(0);
+            for pos in 0..g.missing_pairs.len() {
+                let (li, lj) = g.missing_pairs[pos];
+                let di = g.index_to_digest[li as usize];
+                let dj = g.index_to_digest[lj as usize];
 
-        if kuv >= kvu {
-            if kuv >= t_edge { edge_set.insert((u, v)); new_edges_count += 1; }
+                let (oi_i, oi_j) = match (self.ois.get(&di), self.ois.get(&dj)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue,
+                };
+
+                let mut mask = g.counted[pos];
+                for r in 0..n {
+                    if mask & (1u32 << r) != 0 {
+                        continue;
+                    }
+                    if let (Some(a), Some(b)) = (oi_i[r], oi_j[r]) {
+                        mask |= 1u32 << r;
+                        if a < b {
+                            g.w_fwd[pos] += 1;
+                        } else {
+                            g.w_rev[pos] += 1;
+                        }
+                    }
+                }
+                g.counted[pos] = mask;
+
+                if g.w_fwd[pos] >= tau || g.w_rev[pos] >= tau {
+                    if g.w_fwd[pos] >= g.w_rev[pos] {
+                        g.resolved_edges.push((li, lj));
+                    } else {
+                        g.resolved_edges.push((lj, li));
+                    }
+                    done.push(pos);
+                }
+            }
+
+            done.sort_unstable();
+            for &pos in done.iter().rev() {
+                g.missing_pairs.swap_remove(pos);
+                g.counted.swap_remove(pos);
+                g.w_fwd.swap_remove(pos);
+                g.w_rev.swap_remove(pos);
+            }
+
+            if g.missing_pairs.is_empty() {
+                completed.push(*sid);
+            }
+        }
+
+        completed
+    }
+
+    fn take_completed(&mut self, sub_dag_id: u64) -> Option<ImplicitParkedGraph> {
+        let complete = self
+            .parked
+            .get(&sub_dag_id)
+            .map_or(false, |g| g.is_complete());
+        if complete {
+            self.parked.remove(&sub_dag_id)
         } else {
-            if kvu >= t_edge { edge_set.insert((v, u)); new_edges_count += 1; }
+            None
         }
     }
+
+    fn parked_len(&self) -> usize {
+        self.parked.len()
+    }
+}
+
+/// Finalize a completed parked graph: Tarjan -> topo -> Hamiltonian over the full
+/// edge set, mapped back to digests. This is exactly the tail of the old
+/// apply_fair_update, factored out so the implicit path reuses identical finalization.
+fn finalize_edges(
+    vertex_indices: &[u16],
+    edges: &[(u16, u16)],
+    index_to_digest: &[TxDigest],
+) -> Vec<TxDigest> {
+    let k = index_to_digest.len();
+    let edge_set: HashSet<(u16, u16)> = edges.iter().copied().collect();
 
     let active_count = vertex_indices.len();
     let mut remap = vec![u16::MAX; k];
@@ -620,7 +718,9 @@ fn apply_fair_update(
     for &(u, v) in &edge_set {
         let ru = remap[u as usize];
         let rv = remap[v as usize];
-        if ru != u16::MAX && rv != u16::MAX { scc_edges[ru as usize].push(rv); }
+        if ru != u16::MAX && rv != u16::MAX {
+            scc_edges[ru as usize].push(rv);
+        }
     }
 
     let sccs = tarjan_scc_iterative(active_count, &scc_edges);
@@ -633,51 +733,28 @@ fn apply_fair_update(
             finalized.push(index_to_digest[unmap[ri as usize] as usize]);
         }
     }
-
-    info!(
-        "FAIRDAG_TIMING: sub_dag_id={} FairUpdate: new_edges={} finalized={} {}ms",
-        sub_dag_id, new_edges_count, finalized.len(), start.elapsed().as_millis()
-    );
-
-    FairUpdateResult { sub_dag_id, tx_order: finalized }
+    finalized
 }
 
 // =========================================================================
-// Parked graph
-// =========================================================================
-
-struct ParkedGraph {
-    vertex_indices: Vec<u16>,
-    existing_edges: Vec<(u16, u16)>,
-    missing_edges: Vec<u32>,
-    index_to_digest: Vec<TxDigest>,
-    is_solid: Vec<bool>,
-}
-
-// =========================================================================
-// FairDagProcessor (Option D + cumulative chain)
+// FairDagProcessor (cumulative chain + implicit resolution)
 // =========================================================================
 
 pub struct FairDagProcessor {
     store: Store,
     sorted_keys: Vec<PublicKey>,
 
-    n: usize,
-    f: usize,
     non_blank_threshold: u8,
     solid_threshold: u8,
 
     rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
-    tx_fair_propose: Sender<FairProposeMessage>,
 
     rx_graph_results: tokio::sync::mpsc::Receiver<GraphResult>,
     tx_graph_results: tokio::sync::mpsc::Sender<GraphResult>,
 
-    rx_update_results: tokio::sync::mpsc::Receiver<FairUpdateResult>,
-    tx_update_results: tokio::sync::mpsc::Sender<FairUpdateResult>,
-
-    parked_graphs: HashMap<u64, ParkedGraph>,
-    pending_votes: HashMap<u64, HashMap<PublicKey, Vec<u32>>>,
+    /// OI pool + parked-graph registry. Implicit resolution lives entirely here;
+    /// there is no FairUpdate vote state and no worker round-trip.
+    resolver: ImplicitResolver,
 
     sub_dag_count: u64,
     next_to_finalize: u64,
@@ -702,7 +779,10 @@ impl FairDagProcessor {
         store: Store,
         rx_committed_subdags: Receiver<(Round, Vec<Certificate>)>,
         fault_threshold: u64,
-        tx_fair_propose: Sender<FairProposeMessage>,
+        // Kept in the signature so the call site is unchanged; dropped immediately.
+        // The implicit build never sends FairPropose, so the worker's receiver simply
+        // sees a closed channel and that select branch stays disabled.
+        _tx_fair_propose: Sender<FairProposeMessage>,
     ) {
         let n = committee.size();
         let f = fault_threshold as usize;
@@ -718,29 +798,22 @@ impl FairDagProcessor {
         let solid_threshold = (n - 2 * f) as u8;
 
         info!(
-            "FairDagProcessor [Option D + cumulative-chain]: n={}, f={}, gamma={}, τ={}, τ_s={}",
+            "FairDagProcessor [IMPLICIT resolution]: n={}, f={}, gamma={}, τ={}, τ_s={}",
             n, f, gamma, non_blank_threshold, solid_threshold
         );
 
         let (tx_graph_results, rx_graph_results) = tokio::sync::mpsc::channel(1024);
-        let (tx_update_results, rx_update_results) = tokio::sync::mpsc::channel(1024);
 
         let handle = tokio::spawn(async move {
             Self {
                 store,
                 sorted_keys,
-                n,
-                f,
                 non_blank_threshold,
                 solid_threshold,
                 rx_committed_subdags,
-                tx_fair_propose,
                 rx_graph_results,
                 tx_graph_results,
-                rx_update_results,
-                tx_update_results,
-                parked_graphs: HashMap::new(),
-                pending_votes: HashMap::new(),
+                resolver: ImplicitResolver::new(n, non_blank_threshold),
                 sub_dag_count: 0,
                 next_to_finalize: 1,
                 ready_to_finalize: BTreeMap::new(),
@@ -783,29 +856,21 @@ impl FairDagProcessor {
                     let sub_dag_id = self.sub_dag_count;
                     let extract_start = Instant::now();
 
-                    let (indices_sets, index_to_digest, extracted_votes) =
-                        self.extract_subdag_and_votes(leader_round, &certificates).await;
+                    let (indices_sets, index_to_digest, oi_entries) =
+                        self.extract_subdag(leader_round, &certificates).await;
 
                     let k = index_to_digest.len();
                     info!(
-                        "FAIRDAG_TIMING: sub_dag_id={} extract: {}ms k={} replicas={} votes={}",
+                        "FAIRDAG_TIMING: sub_dag_id={} extract: {}ms k={} replicas={} oi_entries={}",
                         sub_dag_id, extract_start.elapsed().as_millis(),
-                        k, indices_sets.len(), extracted_votes.len()
+                        k, indices_sets.len(), oi_entries.len()
                     );
 
-                    for (author, vote) in extracted_votes {
-                        let decompressed = unpack_and_decompress_edges(
-                            &vote.directed_edges_compressed, vote.edge_count,
-                        );
-                        if !decompressed.is_empty() {
-                            self.pending_votes
-                                .entry(vote.sub_dag_id)
-                                .or_default()
-                                .insert(author, decompressed);
-                        }
-                    }
-
-                    self.try_resolve_parked_graphs().await;
+                    // Implicit resolution: fold this subdag's OIs into the global pool,
+                    // then sweep ALL parked graphs (earlier subdags may now resolve from
+                    // this subdag's evidence). This sweep is the serial cross-graph cost.
+                    self.resolver.ingest_ois(&oi_entries);
+                    self.finalize_swept();
 
                     // Claim only solids in this snapshot. Shaded stays visible.
                     self.compute_and_record_solid_claim(sub_dag_id, &indices_sets, &index_to_digest);
@@ -875,47 +940,44 @@ impl FairDagProcessor {
                         }
                         GraphResult::NeedsFairUpdate {
                             sub_dag_id, vertex_indices, existing_edges,
-                            missing_edges, missing_edge_vertices,
-                            index_to_digest, is_solid, k_kept,
+                            missing_edges, missing_edge_vertices: _,
+                            index_to_digest, is_solid: _, k_kept,
                         } => {
                             info!(
-                                "sub_dag_id={}: parking, {} vertices, {} missing edges",
+                                "sub_dag_id={}: parking (implicit), {} vertices, {} missing edges",
                                 sub_dag_id, vertex_indices.len(), missing_edges.len()
                             );
 
                             self.confirm_proposed(&k_kept);
                             self.release_solid_claim(sub_dag_id);
 
-                            let vertices_with_digests: Vec<(u16, u64)> = missing_edge_vertices
-                                .iter()
-                                .map(|&v| (v, index_to_digest[v as usize]))
-                                .collect();
+                            // Unpack dense-index missing pairs. run_phase23 packs each as
+                            // ((a as u32) << 16) | (b as u32) with a < b.
+                            let mut missing_pairs: Vec<(u16, u16)> =
+                                Vec::with_capacity(missing_edges.len());
+                            for &p in &missing_edges {
+                                let a = (p >> 16) as u16;
+                                let b = (p & 0xFFFF) as u16;
+                                missing_pairs.push(if a < b { (a, b) } else { (b, a) });
+                            }
+                            let m = missing_pairs.len();
 
-                            self.parked_graphs.insert(sub_dag_id, ParkedGraph {
+                            self.resolver.park(sub_dag_id, ImplicitParkedGraph {
                                 vertex_indices,
                                 existing_edges,
-                                missing_edges: missing_edges.clone(),
+                                resolved_edges: Vec::new(),
                                 index_to_digest,
-                                is_solid,
+                                missing_pairs,
+                                counted: vec![0u32; m],
+                                w_fwd: vec![0u8; m],
+                                w_rev: vec![0u8; m],
                             });
 
-                            let _ = self.tx_fair_propose
-                                .send((sub_dag_id, vertices_with_digests, missing_edges))
-                                .await;
+                            // The just-parked graph may already be resolvable from the
+                            // pool accumulated so far.
+                            self.finalize_swept();
                         }
                     }
-                    self.try_finalize_sequential();
-                },
-
-                Some(result) = self.rx_update_results.recv() => {
-                    info!(
-                        "sub_dag_id={}: FairUpdate complete, {} txs",
-                        result.sub_dag_id, result.tx_order.len()
-                    );
-                    self.ready_to_finalize.insert(result.sub_dag_id, result.tx_order);
-                    let _ = self.tx_fair_propose
-                        .send((result.sub_dag_id, vec![], vec![]))
-                        .await;
                     self.try_finalize_sequential();
                 },
             }
@@ -937,17 +999,45 @@ impl FairDagProcessor {
         self.claimed_solids.remove(&sub_dag_id);
     }
 
+    /// Run one implicit resolution sweep and finalize any graphs that just completed.
+    /// Completed orders enter `ready_to_finalize`; `try_finalize_sequential` then drains
+    /// them in commit order, preserving the Emit serialization point.
+    fn finalize_swept(&mut self) {
+        let completed = self.resolver.resolve_sweep();
+        for sid in completed {
+            if let Some(g) = self.resolver.take_completed(sid) {
+                let order =
+                    finalize_edges(&g.vertex_indices, &g.all_edges(), &g.index_to_digest);
+                info!(
+                    "sub_dag_id={}: implicitly resolved, {} txs (parked_backlog={})",
+                    sid, order.len(), self.resolver.parked_len()
+                );
+                self.ready_to_finalize.insert(sid, order);
+            }
+        }
+        self.try_finalize_sequential();
+    }
+
     // =====================================================================
     // Subdag extraction
     // =====================================================================
 
-    async fn extract_subdag_and_votes(
+    /// Extract this subdag's per-replica orderings AND every (tx, replica, oi)
+    /// observation for the implicit OI pool.
+    ///
+    /// CRUCIAL DIFFERENCE vs the snapshot path: each observed OI is pushed into
+    /// `oi_entries` BEFORE the `proposed_txs` skip. The skip only governs the active
+    /// snapshot (which must exclude already-graphed txs); the OI pool must keep
+    /// accumulating evidence for already-parked txs, otherwise their missing edges
+    /// could never reach threshold. (This is exactly the trap behind the FairDAG-RL
+    /// B.1 liveness bug: OIs deposited while a tx is excluded must still be counted.)
+    async fn extract_subdag(
         &mut self,
         _leader_round: Round,
         certificates: &[Certificate],
-    ) -> (Vec<Vec<usize>>, Vec<TxDigest>, Vec<(PublicKey, FairUpdateVote)>) {
+    ) -> (Vec<Vec<usize>>, Vec<TxDigest>, Vec<(TxDigest, usize, u64)>) {
         let mut new_per_replica: HashMap<usize, Vec<(TxDigest, u64)>> = HashMap::new();
-        let mut extracted_votes: Vec<(PublicKey, FairUpdateVote)> = Vec::new();
+        let mut oi_entries: Vec<(TxDigest, usize, u64)> = Vec::new();
 
         for cert in certificates {
             let author = cert.origin();
@@ -961,9 +1051,12 @@ impl FairDagProcessor {
                 match self.store.clone().read(batch_digest.to_vec()).await {
                     Ok(Some(serialized_batch)) => {
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            Ok(WorkerMessage::Batch(direct_entries, indirect_entries, votes)) => {
+                            // Third field (FairUpdate votes) is ignored in the implicit build.
+                            Ok(WorkerMessage::Batch(direct_entries, indirect_entries, _votes)) => {
                                 for (tx_bytes, oi) in direct_entries {
                                     let tx_id = extract_tx_digest(&tx_bytes);
+                                    // Pool first — unconditionally, even if proposed/parked.
+                                    oi_entries.push((tx_id, replica_index, oi));
                                     if self.proposed_txs.contains(&tx_id) { continue; }
                                     let supp = self.pending_support.entry(tx_id).or_default();
                                     if supp.insert(replica_index) {
@@ -974,6 +1067,8 @@ impl FairDagProcessor {
                                     }
                                 }
                                 for (tx_id, oi) in indirect_entries {
+                                    // Pool first — unconditionally.
+                                    oi_entries.push((tx_id, replica_index, oi));
                                     if self.proposed_txs.contains(&tx_id) { continue; }
                                     let supp = self.pending_support.entry(tx_id).or_default();
                                     if supp.insert(replica_index) {
@@ -982,9 +1077,6 @@ impl FairDagProcessor {
                                             .or_default()
                                             .push((tx_id, oi));
                                     }
-                                }
-                                for v in votes {
-                                    extracted_votes.push((author, v));
                                 }
                             }
                             Ok(_) => warn!("Unexpected WorkerMessage type for batch {:?}", batch_digest),
@@ -1031,7 +1123,7 @@ impl FairDagProcessor {
             if !order.is_empty() { indices_sets.push(order); }
         }
 
-        (indices_sets, index_to_digest, extracted_votes)
+        (indices_sets, index_to_digest, oi_entries)
     }
 
     /// Claim only SOLID transactions in this subdag's snapshot.
@@ -1063,48 +1155,6 @@ impl FairDagProcessor {
     // =====================================================================
     // FairUpdate resolution
     // =====================================================================
-
-    async fn try_resolve_parked_graphs(&mut self) {
-        let quorum = self.n - self.f;
-
-        let ready_ids: Vec<u64> = self
-            .parked_graphs
-            .keys()
-            .filter(|id| {
-                self.pending_votes.get(id).map(|v| v.len() >= quorum).unwrap_or(false)
-            })
-            .copied()
-            .collect();
-
-        for sub_dag_id in ready_ids {
-            let parked = match self.parked_graphs.remove(&sub_dag_id) {
-                Some(p) => p,
-                None => continue,
-            };
-            let votes = match self.pending_votes.remove(&sub_dag_id) {
-                Some(v) => v,
-                None => { self.parked_graphs.insert(sub_dag_id, parked); continue; }
-            };
-
-            info!(
-                "sub_dag_id={}: spawning FairUpdate, {} votes, {} missing edges",
-                sub_dag_id, votes.len(), parked.missing_edges.len()
-            );
-
-            let tx = self.tx_update_results.clone();
-            let nbt = self.non_blank_threshold;
-            let st = self.solid_threshold;
-
-            tokio::task::spawn_blocking(move || {
-                let result = apply_fair_update(
-                    sub_dag_id, parked.vertex_indices, parked.existing_edges,
-                    parked.missing_edges, parked.index_to_digest, parked.is_solid,
-                    votes, nbt, st,
-                );
-                let _ = tx.blocking_send(result);
-            });
-        }
-    }
 
     // =====================================================================
     // Sequential finalization
